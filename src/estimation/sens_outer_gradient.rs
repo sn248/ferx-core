@@ -65,17 +65,16 @@ struct ErrTerms {
     censored: bool,
 }
 
-/// M3 censored-row scalars `(g1, g2) = (∂L/∂f, ∂²L/∂f²)` for the data term
-/// `L = −logΦ(z)`, `z = (y−f)/√R`, with `y` the LLOQ, `R(f)` the residual
-/// variance, `d = ∂R/∂f`, `d2 = ∂²R/∂f²`. Uses `∂z/∂f = −m` and
-/// `dh/dz = −h(h+z)`, where `(h, z, m)` come from the shared
-/// [`m3_censored_kernel`](crate::stats::special::m3_censored_kernel):
+/// All M3-censored-row coefficients from a **single** [`m3_censored_kernel`] eval:
+/// `(g1, g2, cz, cm)` = `(∂L/∂f, ∂²L/∂f², C·z, C·m)` for `L = −logΦ(z)`,
+/// `z = (y−f)/√R`, `(h, z, m)` the kernel, `C = h(z²+h·z−1)`:
 /// ```text
 ///   g1 = h·m
-///   g2 = h(h+z)·m² + h·∂m/∂f,
-///   ∂m/∂f = [−2d + (y−f)d2]/(2w³) − 3(y−f)d²/(4w⁵),  w = √R.
+///   g2 = h(h+z)·m² + h·∂m/∂f,   ∂m/∂f = [−2d + (y−f)d2]/(2w³) − 3(y−f)d²/(4w⁵)
+///   (cz, cm) = (C·z, C·m)       (residual-eta cross coefficients, `iiv_on_ruv`)
 /// ```
-fn m3_censored_scalars(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64) {
+/// One kernel (one `erfc`/`exp` pair) per censored row instead of two.
+fn m3_censored_outer(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64, f64, f64) {
     let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, r, d);
     let w = r.sqrt();
     let w3 = r * w; // w³
@@ -83,7 +82,26 @@ fn m3_censored_scalars(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64) {
     let g1 = h * m;
     let dm_df = (-2.0 * d + (y - f) * d2) / (2.0 * w3) - 3.0 * (y - f) * d * d / (4.0 * w5);
     let g2 = h * (h + z) * m * m + h * dm_df;
+    let c = h * (z * z + h * z - 1.0);
+    (g1, g2, c * z, c * m)
+}
+
+/// `(g1, g2) = (∂L/∂f, ∂²L/∂f²)` only — used by the reconverge test oracles
+/// (`precise_ebe` / `precise_ebe_ruv`); production reads all four via
+/// [`m3_censored_outer`]. Delegates so the formula stays single-sourced.
+#[cfg(test)]
+#[inline]
+fn m3_censored_scalars(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64) {
+    let (g1, g2, _, _) = m3_censored_outer(y, f, r, d, d2);
     (g1, g2)
+}
+
+/// `g1 = ∂L/∂f = h·m` only (one kernel, no `g2` `pow` work) — for the censored
+/// σ-block FD, which differences `g1` and never needs `g2`.
+#[inline]
+fn m3_censored_g1(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
+    let (h, _z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
+    h * m
 }
 
 fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
@@ -113,49 +131,49 @@ fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
     }
 }
 
-/// M3-censored × residual-eta cross coefficients `(C·z, C·m)` for an
-/// `iiv_on_ruv` censored row, where `r`/`d` already carry the `exp(2·η_ruv)`
-/// scale (so `z`/`h`/`m`/`C` are evaluated at the scaled variance). See
-/// [`ErrTerms`] for the role of each. `(0, 0)` for a quantified row.
-fn m3_censored_ruv_coeffs(y: f64, f: f64, r: f64, d: f64) -> (f64, f64) {
-    let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, r, d);
-    let c = h * (z * z + h * z - 1.0);
-    (c * z, c * m)
-}
-
-/// Censored-row σ-block EBE-response contributions for an M3 model, shared by
-/// `sigma_block` and `subject_eta_dx` so the two cannot drift. Returns
-/// `(dg1, ruv_sig)`: `dg1 = ∂g1/∂σ` (central FD of the censored df-coefficient `g1`)
-/// drives the structural `M[:,σ] += dg1·∂f/∂η`; `ruv_sig = ½·(C·z)·(∂v/∂σ)/v` is the
-/// censored residual-η × σ cross-term `M[ruv,σ]` (`0` when no `iiv_on_ruv`). The
-/// caller hoists the *unscaled* error-function values at σ±h (`vp`/`vm`, `dvp`/`dvm`,
-/// `d2p`/`d2m`) once and passes them in; `ruv_scale` applies the `exp(2·η_ruv)` factor.
+/// Censored-row σ-block contributions for an M3 model, shared by `sigma_block`
+/// and `subject_eta_dx` so the two cannot drift (it does the σ±h error-function
+/// evaluation internally, so neither caller hoists it). Returns `(dg1, ruv_sig,
+/// l_sig)`:
+/// - `dg1 = ∂g1/∂σ` (central FD of the censored df-coefficient `g1 = h·m`; `g2` is
+///   never needed here, so the `g1`-only kernel is used) → structural EBE-response
+///   `M[:,σ] += dg1·∂f/∂η`;
+/// - `ruv_sig = ½·(C·z)·(∂v/∂σ)/v` → the censored residual-η × σ cross-term
+///   `M[ruv,σ]` (`0` when no `iiv_on_ruv`);
+/// - `l_sig = ∂(−logΦ)/∂σ` → the data σ-term (`sigma_block`'s `fixed`; ignored by
+///   `subject_eta_dx`).
+///
+/// `ruv_scale` applies the `exp(2·η_ruv)` factor; `r` is the scaled variance at σ̂.
 #[allow(clippy::too_many_arguments)]
 fn censored_sigma_m_terms(
+    model: &CompiledModel,
+    cmt: usize,
     y: f64,
     f: f64,
+    sp: &[f64],
+    sm: &[f64],
+    h: f64,
     ruv_scale: f64,
     ruv_cz: f64,
     r: f64,
-    vp: f64,
-    vm: f64,
-    dvp: f64,
-    dvm: f64,
-    d2p: f64,
-    d2m: f64,
-    h: f64,
     has_ruv: bool,
-) -> (f64, f64) {
+) -> (f64, f64, f64) {
     let s = ruv_scale;
-    let (g1p, _) = m3_censored_scalars(y, f, vp * s, dvp * s, d2p * s);
-    let (g1m, _) = m3_censored_scalars(y, f, vm * s, dvm * s, d2m * s);
+    let es = &model.error_spec;
+    let vp = es.variance_at(cmt, f, sp);
+    let vm = es.variance_at(cmt, f, sm);
+    let g1p = m3_censored_g1(y, f, vp * s, es.dvar_df(cmt, f, sp) * s);
+    let g1m = m3_censored_g1(y, f, vm * s, es.dvar_df(cmt, f, sm) * s);
     let dg1 = (g1p - g1m) / (2.0 * h);
     let ruv_sig = if has_ruv {
         0.5 * ruv_cz * (s * (vp - vm) / (2.0 * h)) / r
     } else {
         0.0
     };
-    (dg1, ruv_sig)
+    let l_sig = (-crate::stats::special::log_normal_cdf((y - f) / (vp * s).sqrt())
+        + crate::stats::special::log_normal_cdf((y - f) / (vm * s).sqrt()))
+        / (2.0 * h);
+    (dg1, ruv_sig, l_sig)
 }
 
 /// Shared per-subject quantities the θ/Ω/Σ gradient blocks all consume, built
@@ -176,12 +194,10 @@ struct Prep {
     q: Vec<f64>,
     /// Exact `∂log|H̃|/∂η` (a-fixed part + `∂²f/∂η²` curvature).
     g_eta: Vec<f64>,
-    /// Per-observation M3-censored flag. Censored rows enter `H` (true inner
-    /// Hessian) and the data gradient but carry `p = β = 0`, so they are excluded
-    /// from `H̃` / `log|H̃|` — matching `gaussian_foce_accum`, which accumulates
-    /// `hrh`/`ctc` over quantified rows only and adds the censored `−logΦ` to the
-    /// data term. Empty `Vec` (all-false) when the subject has no censoring.
-    censored: Vec<bool>,
+    // Per-observation M3-censored flag lives on `et[j].censored` (single source).
+    // Censored rows enter `H` (true inner Hessian) and the data gradient but carry
+    // `p = β = 0`, so they are excluded from `H̃` / `log|H̃|` — matching
+    // `gaussian_foce_accum`, which accumulates `hrh`/`ctc` over quantified rows only.
     /// IIV-on-RUV (`Y = IPRED + EPS·EXP(η_ruv)`, #474): the random-effect index
     /// that scales the residual variance by `exp(2·η_ruv)`, or `None`. When set,
     /// the variance terms `r`/`d` in `et` already carry that factor, and the
@@ -287,8 +303,6 @@ fn prepare_stacked(
     };
 
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
-    let mut censored = vec![false; n_obs];
-    let mut any_cens = false;
     for obs in sens.obs.iter() {
         let f = obs.f;
         // obs index → cmt: provider obs are parallel to subject.obs_times.
@@ -306,20 +320,15 @@ fn prepare_stacked(
         // as `alpha = 2·g1`, `alpha_p = 2·g2` (so the assembly's `½α`, `½α'` recover
         // `∂L/∂f`, `∂²L/∂f²`) and force `p = β = 0` (excluded from `H̃` / `log|H̃|`).
         let t = if is_cens {
-            censored[j] = true;
-            any_cens = true;
             // `r`/`d`/`d2` carry `ruv_scale`, so the censored scalars are evaluated at
             // the scaled variance (#4c). M3 + `iiv_on_ruv` is now analytic: the
             // censored × residual-eta cross coefficients `(C·z, C·m)` are stored for the
             // true inner Hessian / mixed / σ blocks; the `H̃`/`log|H̃|` residual-eta
             // blocks still exclude censored rows (they exclude *all* censored rows,
             // matching `gaussian_foce_accum`).
-            let (g1, g2) = m3_censored_scalars(y, f, r, d, d2);
-            let (ruv_cz, ruv_cm) = if ruv.is_some() {
-                m3_censored_ruv_coeffs(y, f, r, d)
-            } else {
-                (0.0, 0.0)
-            };
+            // One kernel eval for all four censored coefficients.
+            let (g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2);
+            let (ruv_cz, ruv_cm) = if ruv.is_some() { (cz, cm) } else { (0.0, 0.0) };
             ErrTerms {
                 r,
                 d,
@@ -349,7 +358,7 @@ fn prepare_stacked(
         // and `H̃[ruv,l] += gⱼ a_{jl}` (`gⱼ = dⱼ/Rⱼ`); the true Hessian gets
         // `H[ruv,ruv] += 2ε²/R` and `H[ruv,l] += κⱼ a_{jl}`.
         if let Some(rr) = ruv {
-            if censored[j] {
+            if t.censored {
                 // Censored row: excluded from `H̃`/`log|H̃|` (so `g_ruv`/`gp_ruv` stay 0),
                 // but its residual-eta second derivatives DO enter the true inner Hessian:
                 // `H[ruv,ruv] += C·z`, `H[ruv,l] += C·m·a_l` (#4c).
@@ -382,7 +391,6 @@ fn prepare_stacked(
         }
         et.push(t);
     }
-    let censored = if any_cens { censored } else { Vec::new() };
 
     let htilde_inv = htilde.cholesky()?.inverse();
     let h_inner_inv = h_inner.cholesky()?.inverse();
@@ -431,7 +439,7 @@ fn prepare_stacked(
             // Censored rows carry no `c̃` residual-eta column in `H̃` (excluded, like
             // all censored rows), so they contribute nothing to its log-det derivative
             // either (#4c). `g`/`gp` are already 0 for them; gate the `∂p/∂η_ruv` term too.
-            if !censored.get(j).copied().unwrap_or(false) {
+            if !et[j].censored {
                 g_eta[rr] += -2.0 * q[j] / et[j].r;
             }
         }
@@ -447,7 +455,6 @@ fn prepare_stacked(
         w,
         q,
         g_eta,
-        censored,
         ruv,
         g_ruv,
         gp_ruv,
@@ -688,39 +695,26 @@ fn sigma_block(
         for (j, obs) in sens.obs.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
             let f = obs.f;
-            if prep.censored.get(j).copied().unwrap_or(false) {
+            if prep.et[j].censored {
                 // M3 censored row: data term `−logΦ((y−f)/√v(σ))` (excluded from `H̃`,
-                // so no `log|H̃|` σ-term). `∂L/∂σ` → `fixed`; the EBE-response structural
-                // `dg1` and residual-η × σ cross-term via `censored_sigma_m_terms`. Under
-                // `iiv_on_ruv` the variance carries `exp(2·η_ruv)` (`prep.ruv_scale`). The
-                // error functions at σ±h are hoisted once and reused (#4c review).
-                let s = prep.ruv_scale;
+                // so no `log|H̃|` σ-term). `l_sig` → `fixed`; the EBE-response structural
+                // `dg1` and residual-η × σ cross-term `ruv_sig` via the shared
+                // `censored_sigma_m_terms` (which evaluates the σ±h functions once).
                 let y = subject.observations[j];
-                let vp = model.error_spec.variance_at(cmt, f, &sp);
-                let vm = model.error_spec.variance_at(cmt, f, &sm);
-                let dvp = model.error_spec.dvar_df(cmt, f, &sp);
-                let dvm = model.error_spec.dvar_df(cmt, f, &sm);
-                let d2p = model.error_spec.d2var_df2(cmt, &sp);
-                let d2m = model.error_spec.d2var_df2(cmt, &sm);
-                let l_sig = (-crate::stats::special::log_normal_cdf((y - f) / (vp * s).sqrt())
-                    + crate::stats::special::log_normal_cdf((y - f) / (vm * s).sqrt()))
-                    / (2.0 * h);
-                fixed += l_sig;
-                let (dg1, ruv_sig) = censored_sigma_m_terms(
+                let (dg1, ruv_sig, l_sig) = censored_sigma_m_terms(
+                    model,
+                    cmt,
                     y,
                     f,
-                    s,
+                    &sp,
+                    &sm,
+                    h,
+                    prep.ruv_scale,
                     prep.et[j].ruv_cz,
                     prep.et[j].r,
-                    vp,
-                    vm,
-                    dvp,
-                    dvm,
-                    d2p,
-                    d2m,
-                    h,
                     prep.ruv.is_some(),
                 );
+                fixed += l_sig;
                 for m in 0..n_eta {
                     m_vec[m] += dg1 * obs.df_deta[m];
                 }
@@ -1031,8 +1025,17 @@ pub fn subject_packed_gradient(
 }
 
 /// The exact analytic population gradient `d(OFV)/dx = 2·Σᵢ dFᵢ/dx` in packed
-/// space, or `None` if any subject is unsupported (caller falls back to FD).
+/// space, or **`None` if any single subject is unsupported** (all-or-nothing).
 /// Fixed coordinates are zeroed. `eta_hats[i]` must be subject `i`'s EBE at `x`.
+///
+/// This all-or-nothing form is used by the **tests** and as a convenience.
+/// The production outer loop does **not** use it — it calls
+/// [`per_subject_packed_gradients`] / [`per_subject_packed_gradients_iov`] via
+/// `population_gradient_sens_mixed`, which keeps the exact analytic gradient for
+/// in-scope, finite subjects and fills only the `None`/non-finite ones with a
+/// per-subject reconverged FD. So a transiently non-PD inner Hessian (e.g. a
+/// degenerate near-LLOQ M3 + `iiv_on_ruv` subject whose `h_inner` cholesky fails)
+/// degrades **that subject** to FD, not the whole population.
 pub fn population_gradient_sens(
     model: &CompiledModel,
     population: &Population,
@@ -1851,34 +1854,22 @@ pub fn subject_eta_dx(
         for (j, obs) in sens.obs.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
             let f = obs.f;
-            // M3 censored inner term uses the conditional variance `v(f(η̂))`; its
-            // `½∂α/∂σ = ∂g1/∂σ` by central FD of the closed-form censored scalar.
-            // Under `iiv_on_ruv` the variance carries `exp(2·η_ruv)`, so scale every
-            // error-function value (#4c — was unscaled).
-            if prep.censored.get(j).copied().unwrap_or(false) {
-                // M3 censored row EBE-response: structural `dg1·∂f/∂η` plus the censored
-                // residual-η × σ cross-term, shared with `sigma_block` via
-                // `censored_sigma_m_terms` (error functions at σ±h hoisted once, #4c review).
+            // M3 censored row EBE-response: structural `dg1·∂f/∂η` plus the censored
+            // residual-η × σ cross-term, shared with `sigma_block` via
+            // `censored_sigma_m_terms` (`l_sig` is unused here — no `fixed` term).
+            if prep.et[j].censored {
                 let y = subject.observations[j];
-                let vp = model.error_spec.variance_at(cmt, f, &sp);
-                let vm = model.error_spec.variance_at(cmt, f, &sm);
-                let dvp = model.error_spec.dvar_df(cmt, f, &sp);
-                let dvm = model.error_spec.dvar_df(cmt, f, &sm);
-                let d2p = model.error_spec.d2var_df2(cmt, &sp);
-                let d2m = model.error_spec.d2var_df2(cmt, &sm);
-                let (dg1, ruv_sig) = censored_sigma_m_terms(
+                let (dg1, ruv_sig, _l_sig) = censored_sigma_m_terms(
+                    model,
+                    cmt,
                     y,
                     f,
+                    &sp,
+                    &sm,
+                    h,
                     prep.ruv_scale,
                     prep.et[j].ruv_cz,
                     prep.et[j].r,
-                    vp,
-                    vm,
-                    dvp,
-                    dvm,
-                    d2p,
-                    d2m,
-                    h,
                     prep.ruv.is_some(),
                 );
                 for m in 0..n_eta {
@@ -2839,6 +2830,241 @@ mod tests {
                 (analytic[k] - fd).abs() / fd.abs().max(1e-12)
             );
             approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// 2-cpt IV + **combined** residual error + IOV + `iiv_on_ruv` — coverage beyond
+    /// the 1-cpt/proportional base case (review #3: the analytic scope must be tested
+    /// across cpt/error combos, since a finite-but-wrong gradient has no FD fallback).
+    const IOV_RUV_2CPT_COMBINED: &str = r#"
+[parameters]
+  theta TVCL(0.22, 0.001, 10.0)
+  theta TVV1(11.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  omega ETA_RUV ~ 0.05
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.1
+  sigma ADD_ERR ~ 0.3
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+    /// Same structure, no IOV — for the non-IOV M3 + `iiv_on_ruv` 2-cpt/combined case.
+    const RUV_2CPT_COMBINED: &str = r#"
+[parameters]
+  theta TVCL(0.22, 0.001, 10.0)
+  theta TVV1(11.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  omega ETA_RUV ~ 0.05
+  sigma PROP_ERR ~ 0.1
+  sigma ADD_ERR ~ 0.3
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+  iiv_on_ruv = ETA_RUV
+"#;
+
+    /// Two-occasion 2-cpt IV IOV + `iiv_on_ruv` subject (n_eta = 3 incl. ETA_RUV).
+    fn iov_ruv_2cpt_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let obs_times = vec![0.5, 2.0, 6.0, 12.0, 25.0, 30.0, 36.0, 48.0];
+        let occasions = vec![1u32, 1, 1, 1, 2, 2, 2, 2];
+        let n = obs_times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::predict_iov(
+            model,
+            &subject,
+            theta,
+            &[0.12, -0.08, 0.1],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.9).collect();
+        subject
+    }
+
+    /// Non-IOV `iiv_on_ruv` subject with a caller-supplied `eta_ref` (length `n_eta`),
+    /// single IV bolus into the central compartment.
+    fn ruv_subject_eta(
+        model: &CompiledModel,
+        theta: &[f64],
+        times: &[f64],
+        eta_ref: &[f64],
+    ) -> Subject {
+        let n = times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, eta_ref);
+        subject.observations = preds.iter().map(|p| p * 0.9).collect();
+        subject
+    }
+
+    /// Coverage (#1): IOV + `iiv_on_ruv` on a 2-cpt IV + combined-error model through
+    /// the production `subject_packed_gradient_iov` path — analytic vs reconverged FD.
+    #[test]
+    fn iov_iiv_on_ruv_2cpt_combined_packed_gradient_matches_fd() {
+        let model = parse_model_string(IOV_RUV_2CPT_COMBINED)
+            .expect("parse 2cpt IOV + iiv_on_ruv combined");
+        assert_eq!(model.residual_error_eta, Some(2));
+        let theta = vec![0.22, 11.0, 0.5, 20.0];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_ruv_2cpt_subject(&model, &theta);
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+        let (stacked, _e, _k, _h) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            .expect("2cpt IOV + iiv_on_ruv packed gradient supported");
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov(&model, &subject, &p)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 4e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// Coverage (#1): non-IOV M3 BLOQ + `iiv_on_ruv` on a 2-cpt IV + combined-error
+    /// model through the production population packed gradient — analytic vs
+    /// reconverged FD of the censored FOCEI marginal.
+    #[test]
+    fn iiv_on_ruv_m3_2cpt_combined_packed_gradient_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+        let mut model = parse_model_string(RUV_2CPT_COMBINED).expect("parse 2cpt ruv combined");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert_eq!(model.residual_error_eta, Some(2));
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            &model
+        ));
+        let theta = vec![0.22, 11.0, 0.5, 20.0];
+        let mk = |times: &[f64]| -> Subject {
+            let mut s = ruv_subject_eta(&model, &theta, times, &[0.12, -0.08, 0.0]);
+            let n = s.obs_times.len();
+            for j in (n - 2)..n {
+                s.observations[j] *= 1.4;
+                s.cens[j] = 1;
+            }
+            s
+        };
+        let pop = Population {
+            subjects: vec![
+                mk(&[0.5, 2.0, 6.0, 12.0, 24.0, 48.0]),
+                mk(&[1.0, 3.0, 8.0, 16.0, 36.0, 72.0]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let mut template = model.default_params.clone();
+        template.theta = theta.clone();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_ruv(&model, s, &params)))
+            .collect();
+        let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            .expect("2cpt combined M3 + iiv_on_ruv analytic");
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_ruv(&model, s, &p);
+                    marginal_nll_at(&model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[k] += hh;
+                let mut xm = x.clone();
+                xm[k] -= hh;
+                (ofv(&xp) - ofv(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 4e-3, epsilon = 2e-5);
         }
     }
 

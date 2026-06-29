@@ -240,3 +240,77 @@ fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
         iov
     );
 }
+
+/// Estimate-level validation for **IOV + `iiv_on_ruv`** (#4b/#486): the new analytic
+/// FOCEI gradient must drive the optimizer to the *same MLE* as the finite-difference
+/// gradient — the FD path being the NONMEM-anchored one (warfarin_iov ≈307.8 vs NONMEM
+/// 308.83, see the module header and `tests/warfarin_iov_nonmem.rs`). Both gradients
+/// differentiate the identical FOCEI marginal, so the converged OFV and estimates must
+/// agree; this confirms the FD→analytic swap does not move the optimum, i.e. the
+/// analytic fit inherits the FD path's NONMEM anchoring at the estimate level (not just
+/// the per-point gradient agreement the `*_matches_fd` unit tests already pin).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_iiv_on_ruv_analytic_matches_fd_estimates() {
+    let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  covariance = false
+"#;
+    let model = ferx_core::parser::model_parser::parse_model_string(src)
+        .expect("IOV + iiv_on_ruv model parses");
+    assert_eq!(model.residual_error_eta, Some(3));
+    let pop = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+        .expect("warfarin_iov data loads");
+
+    let run = |gm: ferx_core::GradientMethod| -> FitResult {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::FoceI;
+        opts.interaction = true;
+        opts.optimizer = Optimizer::Slsqp;
+        opts.gradient_method = gm;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        fit(&model, &pop, &model.default_params, &opts).expect("IOV + iiv_on_ruv fit runs")
+    };
+    let analytic = run(ferx_core::GradientMethod::Auto);
+    let fd = run(ferx_core::GradientMethod::Fd);
+
+    // Same objective ⇒ same optimum (allowing for optimizer-path noise).
+    assert!(
+        (analytic.ofv - fd.ofv).abs() < 1.0,
+        "analytic OFV {:.4} vs FD OFV {:.4} should agree (same marginal)",
+        analytic.ofv,
+        fd.ofv
+    );
+    for k in 0..analytic.theta.len() {
+        let (a, f) = (analytic.theta[k], fd.theta[k]);
+        assert!(
+            (a - f).abs() <= 0.03 * f.abs().max(1e-3),
+            "theta[{k}]: analytic {a:.5} vs FD {f:.5} diverge beyond 3%"
+        );
+    }
+}

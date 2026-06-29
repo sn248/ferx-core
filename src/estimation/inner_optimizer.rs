@@ -1189,6 +1189,53 @@ pub(crate) fn ruv_data_dterm(eps: f64, v: f64) -> f64 {
     1.0 - eps * eps / v
 }
 
+/// Per-observation residual data-gradient pieces shared by the non-IOV
+/// ([`analytic_eta_nll_gradient_with_schedule`]) and IOV
+/// ([`analytic_eta_nll_gradient_iov`]) inner gradients, so the residual-eta
+/// convention (scaling + the M3-censored vs Gaussian branch) lives in one place.
+/// Returns `(coef, ruv_term)`: every η gets `∂nll/∂η_k += coef·∂f/∂η_k`, and (when
+/// `iiv_on_ruv` is active) the residual-eta axis gets `∂nll/∂η_ruv += ruv_term`. A
+/// quantified row uses the Gaussian coef + `1 − ε²/v`; an M3-censored row the single
+/// kernel eval's `h·m` (coef) + `h·z` (column). `None` on a non-positive variance.
+/// `ruv_scale` is applied only when `ruv_active`, so a plain model keeps its op count.
+#[inline]
+fn residual_inner_obs(
+    model: &CompiledModel,
+    cmt: usize,
+    y: f64,
+    f: f64,
+    sigma: &[f64],
+    ruv_scale: f64,
+    ruv_active: bool,
+    is_cens: bool,
+) -> Option<(f64, f64)> {
+    let mut v = model.residual_variance_at(cmt, f, sigma);
+    let mut dv_df = model.error_spec.dvar_df(cmt, f, sigma);
+    if ruv_active {
+        v *= ruv_scale;
+        dv_df *= ruv_scale;
+    }
+    if !(v > 0.0) {
+        return None;
+    }
+    let (coef, ruv_term) = if is_cens {
+        let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
+        (h * m, if ruv_active { h * z } else { 0.0 })
+    } else {
+        let ruv_term = if ruv_active {
+            ruv_data_dterm(y - f, v)
+        } else {
+            0.0
+        };
+        (obs_gaussian_dterm_coef(y, f, v, dv_df), ruv_term)
+    };
+    Some((coef, ruv_term))
+}
+
+/// Censored data-term f-coefficient `∂(−logΦ)/∂f = h·m`. Production computes it
+/// inline (sharing the one kernel eval with the `h·z` column); retained for the
+/// `m3_censored_dterm_df_matches_fd` unit test.
+#[cfg(test)]
 #[inline]
 fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
     let (h, _z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
@@ -1245,40 +1292,30 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // `coef·∂f/∂η` loop. (M3 censoring + `iiv_on_ruv` routes to FD upstream, so the
     // residual-eta column is only ever formed on quantified rows here.)
     let ruv_idx = model.residual_error_eta;
-    let ruv_scale = model.residual_var_scale(eta);
+    let ruv_active = ruv_idx.is_some();
+    let ruv_scale = if ruv_active {
+        model.residual_var_scale(eta)
+    } else {
+        1.0
+    };
     let mut grad = vec![0.0_f64; n_eta];
     let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
-        let y = subject.observations[j];
-        let cmt = subject.obs_cmts[j];
-        let f = obs.f;
-        let v = model.residual_variance_at(cmt, f, sigma) * ruv_scale;
-        if !(v > 0.0) {
-            return None;
-        }
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
         let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
-        let coef = if is_cens {
-            m3_censored_dterm_df(y, f, v, dv_df)
-        } else {
-            obs_gaussian_dterm_coef(y, f, v, dv_df)
-        };
+        let (coef, ruv_term) = residual_inner_obs(
+            model,
+            subject.obs_cmts[j],
+            subject.observations[j],
+            obs.f,
+            sigma,
+            ruv_scale,
+            ruv_active,
+            is_cens,
+        )?;
         for k in 0..n_eta {
             grad[k] += coef * obs.df_deta[k];
         }
-        if ruv_idx.is_some() {
-            // ∂/∂η_ruv of the per-obs data term. Quantified Gaussian row: `1 − ε²/v`
-            // (the `∂v/∂η_ruv = 2v` factor cancels the ½). M3-censored row (#4c): the
-            // term is `−logΦ(z)` with `z = (y−f)/√v`, and `∂z/∂η_ruv = −z`, so
-            // `∂(−logΦ)/∂η_ruv = h·z` (`h = φ(z)/Φ(z)`).
-            if is_cens {
-                // Censored row: `∂(−logΦ(z))/∂η_ruv = h·z` (shared kernel).
-                let (h, z, _m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
-                ruv_grad += h * z;
-            } else {
-                ruv_grad += ruv_data_dterm(y - f, v);
-            }
-        }
+        ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
@@ -1330,33 +1367,32 @@ fn analytic_eta_nll_gradient_iov(
     // active; a plain IOV model runs the original op count (no per-obs ×1.0 multiplies
     // and no residual-eta accumulation — #474 review).
     let ruv_idx = model.residual_error_eta;
-    let ruv_scale = ruv_idx.map_or(1.0, |_| model.residual_var_scale(stacked_true));
+    let ruv_active = ruv_idx.is_some();
+    let ruv_scale = if ruv_active {
+        model.residual_var_scale(stacked_true)
+    } else {
+        1.0
+    };
     let mut grad = vec![0.0_f64; n_stacked];
     let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
-        let y = subject.observations[j];
-        let cmt = subject.obs_cmts[j];
-        let f = obs.f;
-        let mut v = model.residual_variance_at(cmt, f, sigma);
-        let mut dv_df = model.error_spec.dvar_df(cmt, f, sigma);
-        if ruv_idx.is_some() {
-            v *= ruv_scale;
-            dv_df *= ruv_scale;
-        }
-        if !(v > 0.0) {
-            return None;
-        }
-        // NOTE: IOV currently has no M3 censored branch here (the IOV objective promotes
-        // M3 to the marginal elsewhere); the uncensored Gaussian coefficient is shared
-        // with the non-IOV inner via `obs_gaussian_dterm_coef` so they cannot drift.
-        let coef = obs_gaussian_dterm_coef(y, f, v, dv_df);
+        // IOV + M3 routes to FD upstream, so a censored row never reaches here
+        // (`is_cens = false`); the residual logic is otherwise shared with the
+        // non-IOV inner via `residual_inner_obs` so the two cannot drift.
+        let (coef, ruv_term) = residual_inner_obs(
+            model,
+            subject.obs_cmts[j],
+            subject.observations[j],
+            obs.f,
+            sigma,
+            ruv_scale,
+            ruv_active,
+            false,
+        )?;
         for (p, g) in grad.iter_mut().enumerate() {
             *g += coef * obs.df_deta[p];
         }
-        if ruv_idx.is_some() {
-            // ∂/∂η_ruv of the per-obs data term `1 − ε²/v`, matching the non-IOV inner.
-            ruv_grad += ruv_data_dterm(y - f, v);
-        }
+        ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;

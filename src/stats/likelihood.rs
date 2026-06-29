@@ -1448,8 +1448,18 @@ pub fn foce_subject_nll_iov(
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
     // integrated out through R̃ exactly like η, so no separate κ prior is
     // added (doing so would double-count the random-effect penalty).
+    // M3 no longer force-promotes IOV-FOCE subjects to interaction (#591, mirroring the
+    // non-IOV `foce_subject_nll` change in #367/8abadbb7): plain FOCE keeps a consistent
+    // FOCE (Sheiner–Beal) objective for the whole subject — the censored rows leave the
+    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as
+    // `−logΦ((LLOQ−f̂)/√R⁰)` data terms with the population (η=0, κ=0) variance. FOCEI still
+    // takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
+    // optima, matching NONMEM METHOD=1 LAPLACE with vs without INTER. (Previously a
+    // censored subject was silently evaluated with η-interaction even under FOCE, mixing a
+    // Sheiner–Beal marginal with a FOCEI censored term.)
     let m3_active =
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    let _ = m3_active;
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
     } else {
@@ -1463,7 +1473,7 @@ pub fn foce_subject_nll_iov(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    if interaction || m3_active {
+    if interaction {
         foce_subject_nll_interaction(
             subject,
             &ipreds,

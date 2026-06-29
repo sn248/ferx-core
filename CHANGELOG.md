@@ -55,16 +55,21 @@ section of the SDLC for the versioning policy).
   for these models — a drug-driven hazard can vanish and never fire, so there is no implicit
   observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
   supported and are rejected with a clear error.
-- **Exact analytic FOCEI gradients for M3 BLOQ + IOV models** (closed-form 1/2/3-cpt,
-  #580/#486). An inter-occasion-variability model with M3 below-limit handling now runs
-  FOCEI on exact analytic sensitivities instead of finite differences. The censored data
-  term `−logΦ((LLOQ−f)/√v)` and its `f`-derivatives ride the stacked `[η_bsv, κ]` layout:
-  censored rows enter the data gradient and the true inner Hessian but stay excluded from
-  the Laplace `H̃`/`log|H̃|` (matching `foce_subject_nll_iov`). The inner stacked-η gradient
-  matches central FD of the IOV inner objective, and the outer packed gradient matches
-  Richardson reconverged FD of the censored FOCEI marginal, both to ~1e-3. The
-  non-interaction **FOCE** IOV path and the triple **M3 + IOV + `iiv_on_ruv`** keep the FD
-  fallback (follow-up); non-IOV M3 and non-IOV M3 + `iiv_on_ruv` were already analytic.
+- **Exact analytic gradients for M3 BLOQ + IOV models — full FOCEI/FOCE matrix**
+  (closed-form 1/2/3-cpt, #580/#591/#486). An inter-occasion-variability model with M3
+  below-limit handling now runs on exact analytic sensitivities instead of finite
+  differences across the whole estimator matrix: **FOCEI**, **non-interaction FOCE**, and
+  the triple **M3 + IOV + `iiv_on_ruv`**. The censored data term `−logΦ((LLOQ−f)/√v)` and
+  its `f`-derivatives ride the stacked `[η_bsv, κ]` layout — censored rows enter the data
+  gradient and the true inner Hessian but stay excluded from the Laplace `H̃`/`log|H̃|`
+  (matching `foce_subject_nll_iov`); for `iiv_on_ruv` the censored residual-eta cross
+  coefficients `(C·z, C·m)` enter the true inner Hessian and the `h·z` residual-eta column
+  enters the inner gradient. The FOCE path differentiates the augmented Sheiner–Beal
+  marginal with censored rows re-entering as `−logΦ` at the population (η=0, κ=0) variance.
+  Inner stacked-η gradients match central FD of the IOV inner objective and outer packed
+  gradients match Richardson reconverged FD of the corresponding marginal, all to ~1e-3;
+  estimate-level tests confirm the analytic fits land on the FD (NONMEM-anchored) optima.
+  Only the **ODE** M3 + IOV + `iiv_on_ruv` triple still routes to FD.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
@@ -300,6 +305,16 @@ section of the SDLC for the versioning policy).
   data clock everywhere — the model `TIME`/`T` builtin, `[derived]` columns,
   sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
   report the value in the data file; no per-subject time shift is applied.
+
+### Changed
+- **FOCE + M3 BLOQ + IOV no longer silently promotes censored subjects to interaction**
+  (#591). Under `method = foce` (non-interaction), an IOV subject with `CENS != 0` rows is
+  now scored with a consistent Sheiner–Beal objective for the whole subject — the censored
+  rows leave the linearized marginal and re-enter as `−logΦ((LLOQ−f)/√R⁰)` at the
+  population (η=0, κ=0) variance — instead of being evaluated with η-interaction. This
+  mirrors the non-IOV FOCE-M3 change (#367) and matches NONMEM `METHOD=1 LAPLACE` with vs
+  without `INTER`: FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different optima. **Fits that
+  relied on the old auto-promotion should set `method = focei` explicitly.**
 
 ### Fixed
 - **Estimation-method chains now run the covariance step only once, at the end of

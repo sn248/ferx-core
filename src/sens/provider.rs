@@ -619,25 +619,28 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // censored rows carry `p = β = 0`, so they leave `H̃`/`log|H̃|` exactly as in the
     // non-IOV assembly and as `foce_subject_nll_iov` builds it) and the IOV inner
     // gradient `analytic_eta_nll_gradient_iov` (censored `h·m` coefficient over the
-    // stacked Jacobian). The one holdout is the triple **M3 + IOV + `iiv_on_ruv`**:
-    // the censored residual-eta second derivatives over the stacked layout are not yet
-    // validated, so that combination still routes to FD. (Non-IOV M3, and non-IOV
-    // M3 + `iiv_on_ruv`, are fully analytic — #547 / #581.)
-    if matches!(model.bloq_method, crate::types::BloqMethod::M3)
-        && model.residual_error_eta.is_some()
-    {
-        return false;
-    }
+    // stacked Jacobian).
+    //
+    // The triple **M3 + IOV + `iiv_on_ruv`** is analytic too as of #591. The closed-form
+    // assembly already carried the censored residual-eta cross coefficients `(C·z, C·m)`
+    // generically (#4c added them to `prepare_stacked` over any random-effect dimension):
+    // the censored row's `H[η_ruv,η_ruv] += C·z`, `H[η_ruv,l] += C·m·a_l` enter the true
+    // inner Hessian, `mixed_eta_theta`/`sigma_block` read the `C·m`/`C·z` cross-terms, and
+    // the IOV inner gradient's `residual_inner_obs` emits the `h·z` residual-eta column —
+    // all keyed on the residual-eta index, which lives in the BSV block of the stacked
+    // layout. So opening the gate lights up both loops; the censored rows still leave
+    // `H̃`/`log|H̃|` (no `c̃` residual-eta column), matching the objective. Only the
+    // **ODE** M3 + `iiv_on_ruv` triple stays FD (via `iiv_on_ruv_forces_fd`, which is
+    // `ode_spec`-gated).
+    //
     // IIV on residual error (`iiv_on_ruv`) IS analytic for closed-form IOV models:
     // `η_ruv` enters only through the variance (`v = R(f)·exp(2·η_ruv)`, `∂f/∂η_ruv = 0`),
     // and both halves now carry that scaling — the IOV inner gradient
     // (`analytic_eta_nll_gradient_iov`) scales `v`/`dv_df` and adds the `η_ruv` variance
     // column, and the IOV outer assembly threads `ruv = residual_error_eta` into
     // `prepare_stacked` (the residual-eta `c̃` column rides the stacked `[η_bsv, κ]`
-    // layout). Mirrors the non-IOV `iiv_on_ruv` path (#474). Only IOV + M3-BLOQ still
-    // forces FD — the censored residual-eta second derivatives are not assembled (gated by
-    // the M3 check above, and by `iiv_on_ruv_forces_fd`). (ODE IOV + `iiv_on_ruv` stays FD
-    // via `ode_iov_supported`, which is unchanged.)
+    // layout). Mirrors the non-IOV `iiv_on_ruv` path (#474). (ODE IOV + `iiv_on_ruv`
+    // stays FD via `ode_iov_supported`, which is unchanged.)
     // FREM + IOV: the analytic IOV inner gradient uses the ordinary residual variance for
     // every observation row, never the FREM covariate pseudo-obs variance the objective
     // (`individual_nll_iov`) uses for those rows; and the IOV objective returns a `1e18`
@@ -5841,11 +5844,13 @@ mod tests {
   iov_column = OCC
 "#;
 
-    /// M3 BLOQ + IOV scope (#580): a closed-form IOV model with M3 BLOQ is now
-    /// analytic (the censored coefficients ride the stacked `[η_bsv, κ]` layout). The
-    /// one holdout is the triple **M3 + IOV + `iiv_on_ruv`**, which must still route to
-    /// FD — `iov_analytical_supported` declines it (and `analytic_outer_gradient_available`
-    /// follows). Plain IOV and IOV + `iiv_on_ruv` (no M3) stay analytic.
+    /// M3 BLOQ + IOV scope (#580): a closed-form IOV model with M3 BLOQ is analytic
+    /// (the censored coefficients ride the stacked `[η_bsv, κ]` layout). The triple
+    /// **M3 + IOV + `iiv_on_ruv`** is analytic too as of #591 — the closed-form assembly
+    /// already carried the censored residual-eta cross coefficients `(C·z, C·m)`, so
+    /// `iov_analytical_supported` admits it (and `analytic_outer_gradient_available`
+    /// follows). Only the *ODE* triple stays FD (via `iiv_on_ruv_forces_fd`). Plain IOV
+    /// and IOV + `iiv_on_ruv` (no M3) stay analytic.
     #[test]
     fn iov_analytical_supported_admits_m3_but_not_the_ruv_triple() {
         let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
@@ -5855,10 +5860,14 @@ mod tests {
         model.bloq_method = crate::types::BloqMethod::M3;
         assert!(iov_analytical_supported(&model));
         assert!(analytic_outer_gradient_available(&model));
-        // M3 + IOV + iiv_on_ruv (the triple): still FD.
+        // M3 + IOV + iiv_on_ruv (the triple): analytic as of #591 (the closed-form
+        // assembly carried the censored residual-eta cross coefficients all along).
         model.residual_error_eta = Some(0);
-        assert!(!iov_analytical_supported(&model));
-        assert!(!analytic_outer_gradient_available(&model));
+        assert!(iov_analytical_supported(&model));
+        assert!(analytic_outer_gradient_available(&model));
+        // Only the *ODE* triple stays FD, gated by `iiv_on_ruv_forces_fd` (ode_spec-only);
+        // the closed-form triple here does not trip it.
+        assert!(!model.iiv_on_ruv_forces_fd());
         // IOV + iiv_on_ruv without M3: analytic (#4b).
         model.bloq_method = crate::types::BloqMethod::Drop;
         assert!(iov_analytical_supported(&model));

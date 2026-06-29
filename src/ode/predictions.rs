@@ -7,7 +7,7 @@
 //! infusion's end time and adding `+rate` to the corresponding compartment's
 //! derivative for the duration of the infusion via an RHS wrapper.
 
-use crate::ode::solver::{solve_ode, OdeSolverOptions};
+use crate::ode::solver::{solve_ode, solve_ode_with_stats, OdeSolverOptions, OdeSolverStats};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
     assay_standard_normal, AdaptiveRun, AssayNoise, ControllerCtx, DecisionLogEntry,
@@ -1069,6 +1069,7 @@ fn integrate_segment(
     eta: &[f64],
     obs_map: &HashMap<u64, Vec<usize>>,
     predictions: &mut [f64],
+    stats: Option<&mut OdeSolverStats>,
 ) {
     let opts = ode.solver_opts;
 
@@ -1152,13 +1153,14 @@ fn integrate_segment(
         InfusionInput::Spanning(active),
         &zero_order,
     );
-    let sol = solve_ode(
+    let sol = solve_ode_with_stats(
         &wrapped_rhs,
         u,
         (t_start, t_end),
         ext_params,
         &saveat,
         &opts,
+        stats,
     );
 
     // Extract predictions and update state
@@ -1193,7 +1195,35 @@ pub fn ode_predictions(
     eta: &[f64],
     subject: &Subject,
 ) -> Vec<f64> {
-    ode_predictions_with_extra_breaks(ode, pk_params_flat, theta, eta, subject, &[])
+    ode_predictions_with_extra_breaks_and_stats(ode, pk_params_flat, theta, eta, subject, &[], None)
+}
+
+/// [`ode_predictions`] plus aggregate RK45 step counters across all integration
+/// segments in this subject.
+///
+/// This is an opt-in diagnostic path: production predictions call
+/// [`ode_predictions`] and pay no stats plumbing. The integration segmentation,
+/// dose handling, forcing wrapper, and readout logic are otherwise identical,
+/// so the returned counters classify the same RK45 work the production
+/// predictor performs.
+pub fn ode_predictions_with_solver_stats(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+) -> (Vec<f64>, OdeSolverStats) {
+    let mut stats = OdeSolverStats::default();
+    let predictions = ode_predictions_with_extra_breaks_and_stats(
+        ode,
+        pk_params_flat,
+        theta,
+        eta,
+        subject,
+        &[],
+        Some(&mut stats),
+    );
+    (predictions, stats)
 }
 
 /// [`ode_predictions`] with additional, dose-free segment break points seeded
@@ -1218,6 +1248,26 @@ pub(crate) fn ode_predictions_with_extra_breaks(
     eta: &[f64],
     subject: &Subject,
     extra_breaks: &[f64],
+) -> Vec<f64> {
+    ode_predictions_with_extra_breaks_and_stats(
+        ode,
+        pk_params_flat,
+        theta,
+        eta,
+        subject,
+        extra_breaks,
+        None,
+    )
+}
+
+fn ode_predictions_with_extra_breaks_and_stats(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    extra_breaks: &[f64],
+    mut stats: Option<&mut OdeSolverStats>,
 ) -> Vec<f64> {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
@@ -1402,6 +1452,7 @@ pub(crate) fn ode_predictions_with_extra_breaks(
             eta,
             &obs_map,
             &mut predictions,
+            stats.as_deref_mut(),
         );
     }
 
@@ -1921,6 +1972,7 @@ pub(crate) fn ode_predictions_adaptive(
                 eta,
                 &obs_map,
                 &mut predictions,
+                None,
             );
         }
 
@@ -3232,6 +3284,7 @@ mod tests {
             &[],
             &obs_map,
             &mut predictions,
+            None,
         );
 
         assert_eq!(u, vec![10.0], "zero-length segment must not change state");
@@ -3269,6 +3322,7 @@ mod tests {
             &[],
             &obs_map,
             &mut predictions,
+            None,
         );
 
         let expected = 10.0 * (-1.0f64).exp(); // 10·e^{-ke·10}, ke = 0.1
@@ -5008,6 +5062,7 @@ mod tests {
             &[],
             &obs_map,
             &mut predictions,
+            None,
         );
 
         // TAD anchor must be the dose time (0.0), not NaN.

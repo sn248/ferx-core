@@ -6280,6 +6280,42 @@ mod tests {
   ode_abstol = 1e-12
 "#;
 
+    /// Same as `WARFARIN_IOV_TVCOV_ODE`, but with the readout expressed as a
+    /// post-walk divisor instead of Form C. The subject has time-varying covariates
+    /// in the event walk, and the `obs_scale = CL` quotient references **both** the
+    /// TV covariate `WT` and `KAPPA_CL` — so the scale jet would *differ* if it read
+    /// per-event covariates (it must use the subject-static snapshot, like production
+    /// `predict_iov`'s `apply_scaling`) and *differs per occasion group* via κ. A
+    /// covariate- and κ-free scale (`obs_scale = V`) could not distinguish those (#590).
+    const WARFARIN_IOV_TVCOV_ODE_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = CL
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
     #[test]
     fn ode_iov_tvcov_provider_matches_fd_of_predict_iov() {
         let model = parse_model_string(WARFARIN_IOV_TVCOV_ODE).expect("parse ODE IOV+TV-cov");
@@ -6298,6 +6334,45 @@ mod tests {
         check_iov_provider_vs_fd(
             &model,
             &subject,
+            &[0.2, 10.0, 0.75],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn ode_iov_tvcov_expr_scale_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_TVCOV_ODE_EXPRSCALE)
+            .expect("parse ODE IOV+TV-cov+expr-scale");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some());
+        assert!(
+            matches!(model.scaling, ScalingSpec::ExpressionScale { .. }),
+            "fixture must use an expression obs_scale"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + TV covariates + ExpressionScale must stay analytic (#590)"
+        );
+        let subject = iov_tvcov_subject(false);
+        assert!(
+            subject.has_tv_covariates(),
+            "subject must carry TV covariates"
+        );
+        // θ = [TVCL, TVV, THETA_WT]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn ode_iov_tvcov_expr_scale_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_TVCOV_ODE_EXPRSCALE)
+                .expect("parse ODE IOV+TV-cov+expr-scale"),
+            &iov_tvcov_subject(false),
             &[0.2, 10.0, 0.75],
             &[0.12, -0.08, 0.05, -0.10],
         );

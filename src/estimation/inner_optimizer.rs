@@ -199,11 +199,6 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if !subject.all_doses_fixed() {
             return "modeled RATE/DURATION dose";
         }
-        if matches!(model.scaling, ScalingSpec::ExpressionScale { .. })
-            && subject.has_tv_covariates()
-        {
-            return "ODE IOV expression obs_scale + time-varying covariates";
-        }
         // Mirror the SS gates of `ode_iov_subject_supported`, in the same order
         // (they are checked *before* the occasion/axis gates below, so omitting
         // them would misattribute an SS bail to a later reason). #590 review.
@@ -3984,7 +3979,7 @@ mod iov_tests {
     /// variance, and `gradient = fd` would silently fail to disable the analytic inner.
     /// (`ExpressionScale` is no longer a common bail — the non-IOV analytical inner serves
     /// it via the quotient rule. The **ODE** IOV path now serves an η-dependent `obs_scale`
-    /// too via the per-occasion-group post-walk quotient (#575); the **closed-form** IOV
+    /// too via the post-walk quotient (#575/#590); the **closed-form** IOV
     /// path still declines it (`iov_analytical_supported` requires `ScalingSpec::None`) —
     /// both pinned by the `iov_sens_supported` assertions below.)
     #[test]
@@ -4032,10 +4027,10 @@ mod iov_tests {
         model.residual_error_eta = None;
         assert!(crate::sens::provider::iov_sens_supported(&model));
 
-        // ODE IOV + η-dependent `ExpressionScale` `obs_scale` is now analytic (#575): the
-        // per-occasion-group post-walk quotient carries `d(obs_scale)/d(stacked-η)`, so
-        // `ode_iov_supported` (and hence `iov_sens_supported`) admits it. LTBS still
-        // declines — pinned in `sens::provider::tests::ode_iov_expr_scale_supported_and_gated`.
+        // ODE IOV + η-dependent `ExpressionScale` `obs_scale` is analytic (#575/#590):
+        // the post-walk quotient carries `d(obs_scale)/d(stacked-η)`, so `ode_iov_supported`
+        // (and hence `iov_sens_supported`) admits it. LTBS still declines — pinned in
+        // `sens::provider::tests::ode_iov_expr_scale_supported_and_gated`.
         let iov_scaled = parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
@@ -4049,7 +4044,7 @@ mod iov_tests {
         );
         assert!(
             crate::sens::provider::iov_sens_supported(&iov_scaled),
-            "ODE IOV + η-dependent obs_scale is analytic via the per-group quotient (#575)"
+            "ODE IOV + η-dependent obs_scale is analytic via the post-walk quotient (#575/#590)"
         );
 
         // Same for the CLOSED-FORM IOV path (`iov_analytical_supported`, provider.rs:638,

@@ -58,6 +58,40 @@ pub(crate) fn fit_thread_pool_builder() -> rayon::ThreadPoolBuilder {
     rayon::ThreadPoolBuilder::new().stack_size(FIT_RAYON_STACK_SIZE)
 }
 
+/// Build a fit-scoped Rayon pool with the ferx worker stack and an explicit thread
+/// count. Used only when the caller pins `options.threads` to a positive value; the
+/// common (unpinned) path reuses the shared [`default_fit_pool`] instead.
+pub(crate) fn build_fit_pool(n_threads: usize) -> Result<rayon::ThreadPool, String> {
+    fit_thread_pool_builder()
+        .num_threads(n_threads)
+        .build()
+        .map_err(|e| format!("failed to build rayon pool with {n_threads} threads: {e}"))
+}
+
+/// The process-wide fit pool, built once with the ferx worker stack (32 MiB) so wide
+/// ODE+IOV analytic gradients do not overflow the platform-default worker stack. Shared
+/// across every default-threads `fit()` call so batch / concurrent callers do not each
+/// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
+/// exhaust address space). Sized to `rayon::current_num_threads()` at first use, so a
+/// CLI `--threads N` (which sets the global pool count before the first fit) is honored.
+///
+/// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
+/// run on the ambient pool rather than aborting the fit.
+pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        // Pin to the ambient worker count (the global pool size, which a CLI `--threads N`
+        // sets via `build_global` before the first fit). A bare `build()` would instead
+        // default to *all* logical CPUs and ignore `--threads`. Evaluated outside any fit
+        // pool, so it reads the global pool's configured size.
+        fit_thread_pool_builder()
+            .num_threads(rayon::current_num_threads())
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Route predictions through analytical PK or ODE solver, then apply
 /// `model.scaling` so simulate / predict / post-fit IPRED see the same
 /// scaled output as the estimation dispatcher in `pk::compute_predictions_with_tv_into_with_schedule`.
@@ -2017,19 +2051,18 @@ pub fn fit(
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
-        let mut pool_builder = fit_thread_pool_builder();
-        let n_threads = options
-            .threads
-            .filter(|&n| n > 0)
-            .unwrap_or_else(rayon::current_num_threads);
-        pool_builder = pool_builder.num_threads(n_threads);
-        let pool = pool_builder.build().map_err(|e| match options.threads {
-            Some(n) if n > 0 => {
-                format!("failed to build rayon pool with {} threads: {}", n, e)
-            }
-            _ => format!("failed to build rayon pool: {e}"),
-        })?;
-        let res = { pool.install(|| fit_inner(model, pop_ref, init_params, options)) };
+        let run = || fit_inner(model, pop_ref, init_params, options);
+        // A pinned positive `threads` builds a fit-scoped pool sized to it (and surfaces a
+        // build failure as `Err`, as before). The unpinned default reuses the shared
+        // big-stack pool; if that one-time build ever failed we run on the ambient pool
+        // rather than turning a previously-successful default fit into an `Err`.
+        let res = match options.threads.filter(|&n| n > 0) {
+            Some(n) => build_fit_pool(n)?.install(run),
+            None => match default_fit_pool() {
+                Some(pool) => pool.install(run),
+                None => run(),
+            },
+        };
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
             rebuild_warnings_structured(&mut result);
@@ -2038,9 +2071,12 @@ pub fn fit(
     }
 
     // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
-    // Use one fit-scoped pool for both the outer start loop and inner per-subject work.
-    // Creating a new ThreadPool per start inside an outer into_par_iter() spawns n_starts
-    // independent pools that all compete on the same CPUs, causing oversubscription.
+    // `threads` controls per-subject parallelism inside a single-start fit; in multi-start
+    // mode the shared fit pool handles both levels (outer start × inner per-subject), so we
+    // do not narrow it to `threads` here — that would cap the combined fan-out below the
+    // available cores. Running one shared pool (rather than a fresh ThreadPool per start
+    // inside the outer into_par_iter()) also avoids spawning n_starts independent pools that
+    // all compete on the same CPUs, causing oversubscription.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
     let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
@@ -2057,18 +2093,7 @@ pub fn fit(
         ));
     }
 
-    let mut pool_builder = fit_thread_pool_builder();
-    let n_threads = options
-        .threads
-        .filter(|&n| n > 0)
-        .unwrap_or_else(rayon::current_num_threads);
-    pool_builder = pool_builder.num_threads(n_threads);
-    let pool = pool_builder.build().map_err(|e| match options.threads {
-        Some(n) if n > 0 => format!("failed to build rayon pool with {} threads: {}", n, e),
-        _ => format!("failed to build rayon pool: {e}"),
-    })?;
-
-    let results: Vec<(usize, Result<FitResult, String>)> = pool.install(|| {
+    let par_starts = || -> Vec<(usize, Result<FitResult, String>)> {
         (0..n)
             .into_par_iter()
             .map(|k| {
@@ -2097,7 +2122,14 @@ pub fn fit(
                 (k, fit_inner(model, pop_ref, &init_k, opts_ref))
             })
             .collect()
-    });
+    };
+
+    // Run the start fan-out on the shared big-stack pool; fall back to the ambient pool
+    // only if its one-time build failed.
+    let results: Vec<(usize, Result<FitResult, String>)> = match default_fit_pool() {
+        Some(pool) => pool.install(par_starts),
+        None => par_starts(),
+    };
 
     // Pick best converged result; fall back to best unconverged if none converged.
     let mut best: Option<(usize, FitResult)> = None;

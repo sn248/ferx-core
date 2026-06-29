@@ -73,6 +73,24 @@ pub struct SolPoint {
     pub u: Vec<f64>,
 }
 
+/// Adaptive-step counters for diagnosing whether an integration is
+/// rejection-dominated, accepted-small-step-dominated, or hitting the solver's
+/// minimum-step escape hatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OdeSolverStats {
+    /// Total RK attempts: `accepted_steps + rejected_steps`.
+    pub attempted_steps: usize,
+    /// Attempts that advanced `(t, u)`.
+    ///
+    /// Includes [`min_step_clamped_steps`](Self::min_step_clamped_steps), because
+    /// the current RK45 policy accepts at `min_dt` to guarantee progress.
+    pub accepted_steps: usize,
+    /// Attempts rejected by the local-error test.
+    pub rejected_steps: usize,
+    /// Accepted attempts where `err_norm > 1` but `dt_eff <= min_dt`.
+    pub min_step_clamped_steps: usize,
+}
+
 /// Integrate an ODE system from t_start to t_end, saving at specified times.
 ///
 /// Returns solution at each saveat time.
@@ -83,6 +101,23 @@ pub fn solve_ode(
     params: &[f64],
     saveat: &[f64],
     opts: &OdeSolverOptions,
+) -> Vec<SolPoint> {
+    solve_ode_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+}
+
+/// [`solve_ode`] with optional adaptive-step instrumentation.
+///
+/// The counters are intentionally local to this integration segment. Higher
+/// layers that split by dose/observation boundaries can aggregate across calls
+/// to classify a full subject or fit.
+pub fn solve_ode_with_stats(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+    mut stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPoint> {
     let n = u0.len();
     let (t0, tf) = t_span;
@@ -194,8 +229,17 @@ pub fn solve_ode(
         }
         err_norm = (err_norm / n as f64).sqrt();
 
+        if let Some(s) = stats.as_deref_mut() {
+            s.attempted_steps += 1;
+        }
         if err_norm <= 1.0 || dt_eff <= opts.min_dt {
             // Accept step
+            if let Some(s) = stats.as_deref_mut() {
+                s.accepted_steps += 1;
+                if err_norm > 1.0 && dt_eff <= opts.min_dt {
+                    s.min_step_clamped_steps += 1;
+                }
+            }
             t += dt_eff;
             u.copy_from_slice(&u5);
 
@@ -214,6 +258,9 @@ pub fn solve_ode(
         }
         // On reject: (u, t) is unchanged, so the existing k1 is still rhs(u, t)
         // for the next attempt; nothing to do.
+        else if let Some(s) = stats.as_deref_mut() {
+            s.rejected_steps += 1;
+        }
 
         // Adapt step size (memoryless I-controller — see note above).
         let safety = 0.9;
@@ -263,6 +310,23 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
     params: &[T],
     saveat: &[f64],
     opts: &OdeSolverOptions,
+) -> Vec<SolPointG<T>> {
+    solve_ode_g_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+}
+
+/// [`solve_ode_g`] with optional adaptive-step instrumentation.
+///
+/// Stats are computed from value-only error control, matching the production
+/// sensitivity path: derivative components never influence accept/reject or
+/// step-size decisions.
+pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+    mut stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPointG<T>> {
     let n = u0.len();
     let (t0, tf) = t_span;
@@ -388,7 +452,16 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
         }
         err_norm = (err_norm / n as f64).sqrt();
 
+        if let Some(s) = stats.as_deref_mut() {
+            s.attempted_steps += 1;
+        }
         if err_norm <= 1.0 || dt_eff <= opts.min_dt {
+            if let Some(s) = stats.as_deref_mut() {
+                s.accepted_steps += 1;
+                if err_norm > 1.0 && dt_eff <= opts.min_dt {
+                    s.min_step_clamped_steps += 1;
+                }
+            }
             t += dt_eff;
             u.copy_from_slice(&u5);
             std::mem::swap(&mut k1, &mut k7);
@@ -399,6 +472,8 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
                 });
                 save_idx += 1;
             }
+        } else if let Some(s) = stats.as_deref_mut() {
+            s.rejected_steps += 1;
         }
 
         let safety = 0.9;
@@ -541,6 +616,108 @@ mod tests {
         for (a, b) in rd.iter().zip(rf.iter()) {
             assert_relative_eq!(a.u[0].value, b.u[0], max_relative = 1e-9, epsilon = 1e-12);
         }
+    }
+
+    #[test]
+    fn solve_ode_with_stats_counts_attempts() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -10.0 * u[0];
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1.0,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            ..OdeSolverOptions::default()
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            stats.attempted_steps,
+            stats.accepted_steps + stats.rejected_steps
+        );
+        assert!(stats.accepted_steps > 0, "stats = {stats:?}");
+        assert!(stats.rejected_steps > 0, "stats = {stats:?}");
+        assert_eq!(stats.min_step_clamped_steps, 0);
+    }
+
+    #[test]
+    fn solve_ode_with_stats_counts_min_step_clamped_accepts() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -100.0 * u[0];
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1.0,
+            min_dt: 1.0,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            ..OdeSolverOptions::default()
+        };
+        let mut stats = OdeSolverStats::default();
+        let _ = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(stats.attempted_steps, 1);
+        assert_eq!(stats.accepted_steps, 1);
+        assert_eq!(stats.rejected_steps, 0);
+        assert_eq!(stats.min_step_clamped_steps, 1);
+    }
+
+    #[test]
+    fn solve_ode_g_with_stats_matches_scalar_step_pattern() {
+        use crate::sens::dual2::Dual2;
+        let rhs_f = |u: &[f64], p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -p[0] * u[0];
+        };
+        let rhs_d = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+            du[0] = -(p[0] * u[0]);
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1.0,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            ..OdeSolverOptions::default()
+        };
+        let saveat = [1.0];
+        let mut stats_f = OdeSolverStats::default();
+        let mut stats_d = OdeSolverStats::default();
+
+        let _ = solve_ode_with_stats(
+            &rhs_f,
+            &[1.0],
+            (0.0, 1.0),
+            &[10.0],
+            &saveat,
+            &opts,
+            Some(&mut stats_f),
+        );
+        let _ = solve_ode_g_with_stats(
+            &rhs_d,
+            &[Dual2::<1>::constant(1.0)],
+            (0.0, 1.0),
+            &[Dual2::<1>::var(10.0, 0)],
+            &saveat,
+            &opts,
+            Some(&mut stats_d),
+        );
+
+        assert_eq!(stats_d, stats_f);
     }
 
     #[test]

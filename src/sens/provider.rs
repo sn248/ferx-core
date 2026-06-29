@@ -611,12 +611,21 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
         return false;
     }
-    // M3 BLOQ: the IOV objective promotes M3 to the interaction (censored) marginal
-    // (`foce_subject_nll_iov`), but the IOV analytic gradient assembly carries no
-    // censored-row term — it would differentiate a different function than it
-    // minimises. Route IOV+M3 to the FD/Laplace path until the censored IOV
-    // gradient lands. (Non-IOV M3 is fully analytic.)
-    if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
+    // M3 BLOQ + IOV is analytic as of #580. The IOV objective promotes M3 to the
+    // censored marginal (`foce_subject_nll_iov` / `individual_nll_iov`, data term
+    // `−logΦ(z)`), and the analytic gradient now differentiates that same function:
+    // the censored-row coefficients ride the stacked `[η_bsv, κ]` layout via the
+    // shared `prepare_stacked` (true inner Hessian + `mixed_eta_theta` + `sigma_block`;
+    // censored rows carry `p = β = 0`, so they leave `H̃`/`log|H̃|` exactly as in the
+    // non-IOV assembly and as `foce_subject_nll_iov` builds it) and the IOV inner
+    // gradient `analytic_eta_nll_gradient_iov` (censored `h·m` coefficient over the
+    // stacked Jacobian). The one holdout is the triple **M3 + IOV + `iiv_on_ruv`**:
+    // the censored residual-eta second derivatives over the stacked layout are not yet
+    // validated, so that combination still routes to FD. (Non-IOV M3, and non-IOV
+    // M3 + `iiv_on_ruv`, are fully analytic — #547 / #581.)
+    if matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        && model.residual_error_eta.is_some()
+    {
         return false;
     }
     // IIV on residual error (`iiv_on_ruv`) IS analytic for closed-form IOV models:
@@ -5831,6 +5840,29 @@ mod tests {
   method     = foce
   iov_column = OCC
 "#;
+
+    /// M3 BLOQ + IOV scope (#580): a closed-form IOV model with M3 BLOQ is now
+    /// analytic (the censored coefficients ride the stacked `[η_bsv, κ]` layout). The
+    /// one holdout is the triple **M3 + IOV + `iiv_on_ruv`**, which must still route to
+    /// FD — `iov_analytical_supported` declines it (and `analytic_outer_gradient_available`
+    /// follows). Plain IOV and IOV + `iiv_on_ruv` (no M3) stay analytic.
+    #[test]
+    fn iov_analytical_supported_admits_m3_but_not_the_ruv_triple() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        // Plain IOV: analytic.
+        assert!(iov_analytical_supported(&model));
+        // M3 + IOV (no iiv_on_ruv): analytic as of #580.
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(iov_analytical_supported(&model));
+        assert!(analytic_outer_gradient_available(&model));
+        // M3 + IOV + iiv_on_ruv (the triple): still FD.
+        model.residual_error_eta = Some(0);
+        assert!(!iov_analytical_supported(&model));
+        assert!(!analytic_outer_gradient_available(&model));
+        // IOV + iiv_on_ruv without M3: analytic (#4b).
+        model.bloq_method = crate::types::BloqMethod::Drop;
+        assert!(iov_analytical_supported(&model));
+    }
 
     /// Two-occasion IOV subject: a dose + observations in occasion 1, then a dose +
     /// observations in occasion 2 (no washout — carryover spans the boundary).

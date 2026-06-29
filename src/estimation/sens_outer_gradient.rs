@@ -565,7 +565,10 @@ pub fn subject_theta_gradient_iov(
         // stacked `[η_bsv, κ]` assembly (η_ruv ∈ the BSV block, so `rr < n_eta_bsv` is a
         // valid stacked index; the residual-eta loops already span all stacked axes incl.
         // κ). `None` for plain IOV models (`residual_var_scale` then defaults to 1.0).
-        // IOV + M3 stays gated out upstream, so censoring and `ruv` never co-occur here.
+        // M3 + IOV is analytic (#580) but the triple M3 + IOV + `iiv_on_ruv` is gated
+        // out upstream (`iov_analytical_supported`), so censoring and `ruv` never
+        // co-occur here — the censored-row residual-eta blocks of `prepare_stacked`
+        // stay unreachable on this path.
         model.residual_error_eta,
     )?;
     Some(theta_block(&prep, &sens, params.theta.len()))
@@ -1626,6 +1629,20 @@ pub fn subject_packed_gradient_foce_iov(
     }
     let n_obs = subject.observations.len();
     if n_obs == 0 {
+        return None;
+    }
+    // M3 BLOQ + IOV is analytic only on the FOCEI (interaction) path (#580): the
+    // censored `−logΦ` coefficients ride the stacked layout through `prepare_stacked`
+    // (used by `subject_packed_gradient_iov`). This FOCE (Sheiner–Beal) IOV marginal
+    // builds R̃ over **all** rows and has no censored term, so a censored subject would
+    // differentiate the wrong (Gaussian) function. Decline so the outer loop falls back
+    // to per-subject reconverged FD of the M3-aware IOV marginal (`foce_subject_nll_iov`).
+    // (Quantified-only subjects of an M3 model are unaffected — they take the analytic
+    // SB gradient. The non-IOV FOCE path `subject_packed_gradient_foce` does carry the
+    // censored SB term; the stacked-layout derivation for IOV is left as follow-up.)
+    if matches!(model.bloq_method, crate::types::BloqMethod::M3)
+        && subject.cens.iter().any(|&c| c != 0)
+    {
         return None;
     }
     let zeros = vec![0.0f64; n_st];
@@ -4677,6 +4694,7 @@ mod tests {
         // FD built on it) would be wrong. `ruv_idx` is `None` and `residual_var_scale`
         // returns `1.0` for non-`iiv_on_ruv` models, so this is a no-op there.
         let ruv_idx = model.residual_error_eta;
+        let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
         for _ in 0..50 {
             let ruv_scale = model.residual_var_scale(&stacked);
             let sens = crate::sens::provider::subject_sensitivities_iov(
@@ -4694,19 +4712,30 @@ mod tests {
                 let r = model.error_spec.variance_at(cmt, f, sigma) * ruv_scale;
                 let d = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
                 let d2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
-                let eps = subject.observations[j] - f;
-                let t = err_terms(r, d, d2, eps);
+                let y = subject.observations[j];
+                let eps = y - f;
+                // (g1, g2) = (∂L/∂f, ∂²L/∂f²): the censored `−logΦ` scalars for an M3 BLOQ
+                // row (#580), else the Gaussian `½α`, `½α'`. The inner Newton must minimise
+                // the SAME censored objective `individual_nll_iov` uses, else the
+                // reconverged EBE (and the marginal FD built on it) would be wrong.
+                let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
+                let (g1, g2) = if is_cens {
+                    m3_censored_scalars(y, f, r, d, d2)
+                } else {
+                    let t = err_terms(r, d, d2, eps);
+                    (0.5 * t.alpha, 0.5 * t.alpha_p)
+                };
                 let a = &obs.df_deta;
                 for kk in 0..n_st {
-                    g[kk] += 0.5 * t.alpha * a[kk];
+                    g[kk] += g1 * a[kk];
                     for ll in 0..n_st {
-                        h[(kk, ll)] += 0.5
-                            * (t.alpha_p * a[kk] * a[ll] + t.alpha * obs.d2f_deta2[kk * n_st + ll]);
+                        h[(kk, ll)] += g2 * a[kk] * a[ll] + g1 * obs.d2f_deta2[kk * n_st + ll];
                     }
                 }
                 // Residual-eta row/col (`a_{ruv} = 0`): data-term gradient `1 − ε²/v`, true
                 // Hessian `H[ruv,ruv] += 2ε²/v`, `H[ruv,l] += κ_j a_{jl}` — mirrors the
-                // `h_inner` residual-eta block in `prepare_stacked`.
+                // `h_inner` residual-eta block in `prepare_stacked`. (M3 + IOV + `iiv_on_ruv`
+                // is FD-gated, so a censored row never co-occurs with `ruv_idx` here.)
                 if let Some(rr) = ruv_idx {
                     g[rr] += 1.0 - eps * eps / r;
                     h[(rr, rr)] += 2.0 * eps * eps / r;
@@ -4999,6 +5028,148 @@ mod tests {
             );
             approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
         }
+    }
+
+    /// Two-occasion IOV subject with M3-censored rows (#580): the same geometry as
+    /// [`iov_subject_outer`], but occasion 2's two tail observations are flagged
+    /// `CENS = 1` (left-censored at their synthesized value ≈ 0.85·f, so the
+    /// prediction sits just above the limit and the inverse Mills ratio is well-scaled).
+    fn iov_m3_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let mut subject = iov_subject_outer(model, theta);
+        let n = subject.observations.len();
+        subject.cens[n - 2] = 1;
+        subject.cens[n - 1] = 1;
+        subject
+    }
+
+    /// M3 BLOQ + IOV (#580): the analytic IOV FOCEI θ-gradient (censored rows carry
+    /// `p = β = 0` so they leave `H̃`/`log|H̃|` exactly as `foce_subject_nll_iov`
+    /// builds it, and re-enter via the `−logΦ` data term + true inner Hessian over the
+    /// stacked `[η_bsv, κ]` layout) must match the Richardson reconverged FD of the
+    /// FOCEI IOV marginal — the same objective `precise_ebe_iov` now reconverges
+    /// against (its Newton loop uses the censored `m3_censored_scalars` on flagged rows).
+    /// Proves the gate flip ships a correct censored θ-gradient.
+    #[test]
+    fn iov_m3_theta_gradient_matches_reconverged_fd() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(crate::sens::provider::iov_analytical_supported(&model));
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_m3_subject(&model, &theta);
+        assert!(
+            subject.cens.iter().any(|&c| c != 0),
+            "subject must be censored"
+        );
+
+        // Joint EBE [η_bsv (3), κ_g0 (1), κ_g1 (1)] reconverged against the M3-aware
+        // inner objective.
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+
+        let analytic = subject_theta_gradient_iov(&model, &subject, &params, &stacked)
+            .expect("IOV + M3 θ-gradient supported");
+
+        let fd_at = |m: usize, h: f64| -> f64 {
+            let mut pp = params.clone();
+            pp.theta[m] += h;
+            let mut pm = params.clone();
+            pm.theta[m] -= h;
+            (marginal_nll_iov(&model, &subject, &pp) - marginal_nll_iov(&model, &subject, &pm))
+                / (2.0 * h)
+        };
+        for m in 0..theta.len() {
+            let h = 1e-4 * (1.0 + theta[m].abs());
+            let f1 = fd_at(m, h);
+            let f2 = fd_at(m, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "iov+m3 theta[{m}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[m],
+                fd,
+                (analytic[m] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[m], fd, max_relative = 3e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// M3 BLOQ + IOV (#580) through the **production** FOCEI packed-gradient path
+    /// (`subject_packed_gradient_iov`): the full `[θ, Ω_bsv, σ, Ω_iov]` analytic
+    /// gradient must match Richardson reconverged FD of the FOCEI IOV marginal over
+    /// every packed coordinate — exercising the censored σ-block (`censored_sigma_m_terms`)
+    /// and the Ω blocks (incl. the shared κ-variance) with censored rows present.
+    #[test]
+    fn iov_m3_packed_gradient_matches_reconverged_fd() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_m3_subject(&model, &theta);
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            .expect("IOV + M3 packed gradient supported");
+
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov(&model, &subject, &p)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "iov+m3 packed x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[i],
+                fd,
+                (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+            );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// M3 BLOQ + IOV is analytic only on the FOCEI (interaction) path. The FOCE
+    /// (Sheiner–Beal) IOV packed gradient must **decline** (return `None`) on a
+    /// censored subject so the outer loop falls back to the M3-aware reconverged FD —
+    /// the analytic SB-IOV marginal has no censored `−logΦ` term yet. A quantified-only
+    /// subject of the same M3 model still takes the analytic SB gradient.
+    #[test]
+    fn iov_m3_foce_packed_gradient_declines_on_censored() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let cens_subject = iov_m3_subject(&model, &theta);
+        let (stacked_c, _e, _k, _h) = precise_ebe_iov(&model, &cens_subject, &params);
+        assert!(
+            subject_packed_gradient_foce_iov(&model, &cens_subject, &template, &x, &stacked_c)
+                .is_none(),
+            "FOCE IOV packed gradient must decline a censored M3 subject"
+        );
+
+        // A quantified-only subject of the same M3 model still takes the analytic SB path.
+        let quant_subject = iov_subject_outer(&model, &theta);
+        let (stacked_q, _e, _k, _h) = precise_ebe_iov(&model, &quant_subject, &params);
+        assert!(
+            subject_packed_gradient_foce_iov(&model, &quant_subject, &template, &x, &stacked_q)
+                .is_some(),
+            "FOCE IOV packed gradient must still serve a quantified-only M3 subject"
+        );
     }
 
     /// The full analytic IOV **FOCE** (non-interaction) packed gradient must match

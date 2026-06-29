@@ -55,6 +55,16 @@ section of the SDLC for the versioning policy).
   for these models — a drug-driven hazard can vanish and never fire, so there is no implicit
   observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
   supported and are rejected with a clear error.
+- **Exact analytic FOCEI gradients for M3 BLOQ + IOV models** (closed-form 1/2/3-cpt,
+  #580/#486). An inter-occasion-variability model with M3 below-limit handling now runs
+  FOCEI on exact analytic sensitivities instead of finite differences. The censored data
+  term `−logΦ((LLOQ−f)/√v)` and its `f`-derivatives ride the stacked `[η_bsv, κ]` layout:
+  censored rows enter the data gradient and the true inner Hessian but stay excluded from
+  the Laplace `H̃`/`log|H̃|` (matching `foce_subject_nll_iov`). The inner stacked-η gradient
+  matches central FD of the IOV inner objective, and the outer packed gradient matches
+  Richardson reconverged FD of the censored FOCEI marginal, both to ~1e-3. The
+  non-interaction **FOCE** IOV path and the triple **M3 + IOV + `iiv_on_ruv`** keep the FD
+  fallback (follow-up); non-IOV M3 and non-IOV M3 + `iiv_on_ruv` were already analytic.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose

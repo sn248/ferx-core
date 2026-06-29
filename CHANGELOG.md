@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Drug-driven event-time simulation for joint PK-TTE** (#564). `simulate()` /
+  `simulate_with_options()` now sample event times for an ODE-accumulated hazard
+  (`hazard =` in `[event_model]`), not just analytic families: the augmented ODE is
+  integrated until the cumulative hazard reaches `−log u`, with the crossing located by a
+  root-finder. A finite `[simulation] horizon` (or `SimulateOptions.horizon`) is **required**
+  for these models — a drug-driven hazard can vanish and never fire, so there is no implicit
+  observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
+  supported and are rejected with a clear error.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
@@ -257,6 +265,13 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
+- **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).
+  A drug-driven `hazard =` expression is unconstrained, so a sign-flipped hazard could make
+  the cumulative hazard *decrease* — implying a survival `S(t) > 1`. The right-censored and
+  exact-event likelihood terms previously accepted this silently (a finite, spuriously low
+  objective that could pull the optimizer into the ill-posed region); they now return the
+  same `1e20` sentinel as the other ill-defined cases. This matches the simulation path,
+  which already hard-errors on a non-monotone cumulative hazard.
 - ODE+IOV fits now report their actual analytic-vs-finite-difference inner-gradient route,
   including subject-level fallback reasons, instead of using the non-IOV gradient probe
   for diagnostics (#590).

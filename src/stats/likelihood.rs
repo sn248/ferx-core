@@ -1723,6 +1723,18 @@ pub fn iov_combined_effect(
     c
 }
 
+/// The combined effect vector `[η_bsv, 0…0]` for an **EVID=2 pk-only** event — the κ=0
+/// counterpart of [`iov_combined_effect`]. Pk-only breakpoints carry no occasion, so their
+/// IOV κ block is held at zero (matching production `predict_iov`'s `combined_for(u32::MAX)`
+/// branch). Shares the stacked-η layout with [`iov_combined_effect`] so the closed-form and
+/// ODE IOV providers cannot seed the κ=0 block differently (#598 review).
+pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -> Vec<f64> {
+    let mut c = Vec::with_capacity(n_eta + n_kappa);
+    c.extend_from_slice(&stacked_eta[..n_eta]);
+    c.extend(std::iter::repeat(0.0).take(n_kappa));
+    c
+}
+
 /// Build a block-diagonal omega from BSV omega and K copies of IOV omega.
 /// Used for the extended H-matrix in the FOCE outer loop with IOV.
 pub fn build_block_diag_omega(

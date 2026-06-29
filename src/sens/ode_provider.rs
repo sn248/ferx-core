@@ -2078,13 +2078,13 @@ fn run_subject_iov<const M: usize>(
                 n_theta,
             ))
         };
-    let combined_pk_only: Vec<f64> = {
-        let mut c = Vec::with_capacity(n_eff);
-        c.extend_from_slice(&stacked_eta[..n_eta]);
-        c.extend(std::iter::repeat(0.0).take(n_kappa));
-        c
-    };
+    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
+    // closed-form provider, #598 review). Built lazily inside the closure so the common
+    // IOV subject with no EVID=2 records pays no allocation — the closure is only invoked
+    // when `seed_iov_events` actually has pk-only records to seed.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual2<M>>> {
+        let combined_pk_only =
+            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
         let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
@@ -2355,13 +2355,12 @@ fn run_subject_iov_eta<const N: usize>(
                 n_kappa,
             ))
         };
-    let combined_pk_only: Vec<f64> = {
-        let mut c = Vec::with_capacity(n_eff);
-        c.extend_from_slice(&stacked_eta[..n_eta]);
-        c.extend(std::iter::repeat(0.0).take(n_kappa));
-        c
-    };
+    // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
+    // closed-form provider, #598 review). Built lazily inside the closure so the common
+    // IOV subject with no EVID=2 records pays no allocation.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
+        let combined_pk_only =
+            crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
         let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,

@@ -3814,13 +3814,13 @@ fn fit_inner(
         ));
     }
 
-    // NOTE (stale message — see #599): the text below claims censored FOCE subjects
-    // are "evaluated with η-interaction"/promoted to FOCEI internally. That is no longer
-    // true on either path — plain FOCE keeps a consistent Sheiner–Beal objective (non-IOV
-    // since #367, IOV since #591). The advice ("set method=focei for interaction
-    // semantics; FOCE-M3 and FOCEI-M3 are different optima") still holds; only the
-    // mechanism claim is wrong. Rewording is deferred to #599 (it must update the
-    // warning-taxonomy fixture in `types.rs` in lockstep).
+    // M3 censoring under non-interaction FOCE is a consistent Sheiner–Beal fit (the
+    // censored rows leave the linearized marginal and re-enter as `−logΦ` at the
+    // population variance; plain FOCE no longer promotes censored subjects to interaction
+    // — non-IOV since #367, IOV since #591). It is a *different optimum* from FOCEI-M3,
+    // mirroring NONMEM `METHOD=1 LAPLACE` with vs without `INTER`. Since M3 is run with
+    // interaction in most practice, surface the non-interaction choice so a user does not
+    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599).
     if matches!(model.bloq_method, BloqMethod::M3)
         && matches!(
             options.method,
@@ -3833,9 +3833,9 @@ fn fit_inner(
             .any(|s| s.has_censored_observation())
     {
         warnings.push(
-            "M3 censoring handling requires FOCEI semantics; subjects with CENS!=0 \
-             rows were evaluated with η-interaction. Set method=focei explicitly \
-             to silence this notice."
+            "M3 censoring under FOCE uses non-interaction (Sheiner–Beal) semantics; \
+             FOCE-M3 and FOCEI-M3 are different optima (as in NONMEM METHOD=1 LAPLACE \
+             with vs without INTER). Set method=focei for interaction semantics."
                 .to_string(),
         );
     }

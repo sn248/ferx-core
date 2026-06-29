@@ -314,7 +314,9 @@ section of the SDLC for the versioning policy).
   population (η=0, κ=0) variance — instead of being evaluated with η-interaction. This
   mirrors the non-IOV FOCE-M3 change (#367) and matches NONMEM `METHOD=1 LAPLACE` with vs
   without `INTER`: FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different optima. **Fits that
-  relied on the old auto-promotion should set `method = focei` explicitly.**
+  relied on the old auto-promotion should set `method = focei` explicitly.** The FOCE-M3
+  notice — which described the now-removed promotion ("evaluated with η-interaction") — is
+  reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
 
 ### Fixed
 - **Estimation-method chains now run the covariance step only once, at the end of

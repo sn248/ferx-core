@@ -40,6 +40,15 @@ const E5: f64 = -17253.0 / 339200.0;
 const E6: f64 = 22.0 / 525.0;
 const E7: f64 = -1.0 / 40.0;
 
+/// Consecutive force-accepted minimum-step attempts before an integration
+/// segment is treated as unrecoverably pathological.
+///
+/// A few min-step clamps are the intended escape hatch for roundoff at a hard
+/// event boundary. Long runs of them mean RK45 has reached a singular or
+/// rejection-dominated region; continuing to `max_steps` just spends time on a
+/// trajectory the likelihood will reject anyway.
+const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
+
 /// ODE right-hand side function type.
 /// `rhs(u, params, t) -> du/dt`  where u and du are `&[f64]` of length n_states.
 pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
@@ -188,6 +197,7 @@ pub fn solve_ode_with_stats(
     // Any future revisit should condition PI on a non-FD gradient route
     // (analytical / analytic-sensitivity).
     const I_EXP: f64 = 1.0 / 5.0; // 0.20 — I-controller exponent for order p=5
+    let mut consecutive_min_step_clamps = 0usize;
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
@@ -251,6 +261,7 @@ pub fn solve_ode_with_stats(
         err_norm = (err_norm / n as f64).sqrt();
 
         let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
+        let min_step_clamped = accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt;
         if let Some(s) = stats.as_deref_mut() {
             s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
@@ -271,13 +282,24 @@ pub fn solve_ode_with_stats(
                 });
                 save_idx += 1;
             }
+
+            if min_step_clamped {
+                consecutive_min_step_clamps += 1;
+                if consecutive_min_step_clamps >= MAX_CONSECUTIVE_MIN_STEP_CLAMPS {
+                    break;
+                }
+            } else {
+                consecutive_min_step_clamps = 0;
+            }
         }
         // On reject: (u, t) is unchanged, so the existing k1 is still rhs(u, t)
         // for the next attempt; nothing to do.
 
         // Adapt step size (memoryless I-controller — see note above).
         let safety = 0.9;
-        let factor = if err_norm > 1e-15 {
+        let factor = if !err_norm.is_finite() {
+            0.2
+        } else if err_norm > 1e-15 {
             safety * err_norm.powf(-I_EXP)
         } else {
             5.0
@@ -370,6 +392,7 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     let mut save_idx = 0;
     let mut have_k1 = false;
     const I_EXP: f64 = 1.0 / 5.0;
+    let mut consecutive_min_step_clamps = 0usize;
 
     // Scalar-weighted combination `u[i] + dt·Σ wⱼ·kⱼ[i]` lifted to `T`.
     let comb = |base: T, dt_eff: f64, terms: &[(f64, T)]| -> T {
@@ -466,6 +489,7 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
         err_norm = (err_norm / n as f64).sqrt();
 
         let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
+        let min_step_clamped = accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt;
         if let Some(s) = stats.as_deref_mut() {
             s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
@@ -480,10 +504,21 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
                 });
                 save_idx += 1;
             }
+
+            if min_step_clamped {
+                consecutive_min_step_clamps += 1;
+                if consecutive_min_step_clamps >= MAX_CONSECUTIVE_MIN_STEP_CLAMPS {
+                    break;
+                }
+            } else {
+                consecutive_min_step_clamps = 0;
+            }
         }
 
         let safety = 0.9;
-        let factor = if err_norm > 1e-15 {
+        let factor = if !err_norm.is_finite() {
+            0.2
+        } else if err_norm > 1e-15 {
             safety * err_norm.powf(-I_EXP)
         } else {
             5.0
@@ -716,6 +751,69 @@ mod tests {
         assert_eq!(stats.accepted_steps, 1);
         assert_eq!(stats.rejected_steps, 0);
         assert_eq!(stats.min_step_clamped_steps, 1);
+    }
+
+    #[test]
+    fn solve_ode_breaks_repeated_min_step_clamps_before_max_steps() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = f64::NAN;
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-6,
+            min_dt: 1e-6,
+            max_steps: 10_000,
+            abstol: 1e-12,
+            reltol: 1e-12,
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(stats.attempted_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
+        assert_eq!(
+            stats.min_step_clamped_steps,
+            MAX_CONSECUTIVE_MIN_STEP_CLAMPS
+        );
+    }
+
+    #[test]
+    fn solve_ode_g_breaks_repeated_min_step_clamps_like_scalar() {
+        use crate::sens::dual2::Dual2;
+        let rhs = |_u: &[Dual2<1>], _p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+            du[0] = Dual2::constant(f64::NAN);
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-6,
+            min_dt: 1e-6,
+            max_steps: 10_000,
+            abstol: 1e-12,
+            reltol: 1e-12,
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_g_with_stats(
+            &rhs,
+            &[Dual2::<1>::constant(1.0)],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(stats.attempted_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
+        assert_eq!(
+            stats.min_step_clamped_steps,
+            MAX_CONSECUTIVE_MIN_STEP_CLAMPS
+        );
     }
 
     #[test]

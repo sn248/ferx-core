@@ -272,6 +272,9 @@ section of the SDLC for the versioning policy).
 - Wide ODE+IOV analytic gradients now run on larger Rayon worker stacks, avoiding
   native stack-overflow crashes in R/CLI release builds for PNA-scale occasion counts
   (#590).
+- ODE+IOV fits no longer launch Nelder-Mead EBE fallback searches for bad outer
+  trial points, and RK45 now exits repeated minimum-step clamps early, avoiding
+  apparent stalls after rejected LBFGS steps in PNA-scale models (#590).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to

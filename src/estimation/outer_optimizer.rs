@@ -980,9 +980,10 @@ fn optimize_nlopt(
         // Compute gradient if requested (central FD with fixed EBEs)
         let mut grad_norm_for_trace: Option<f64> = None;
         if let Some(g) = grad {
-            // If OFV is non-finite, gradient is meaningless — use steepest ascent
-            // toward center of bounds to nudge optimizer back
-            if !raw_ofv.is_finite() {
+            // If OFV is non-finite or the EBE guard rejected this trial, the gradient is
+            // meaningless — use steepest ascent toward center of bounds to nudge optimizer
+            // back without spending time on a population gradient at a point we will reject.
+            if ebe_guard_triggered || !raw_ofv.is_finite() {
                 for i in 0..g.len() {
                     let center_s = (lower_s[i] + upper_s[i]) / 2.0;
                     g[i] = 100.0 * (xs[i] - center_s);

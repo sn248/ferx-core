@@ -453,6 +453,30 @@ fn argmin_inner_fallback(
     (best, nm_ok)
 }
 
+/// Nelder-Mead is a useful last-resort recovery for low-dimensional closed-form EBEs, but
+/// it is not a practical recovery strategy for ODE+IOV. A single bad outer line-search
+/// point can otherwise launch simplex searches where each vertex is a full ODE and
+/// steady-state prediction. Keep the BFGS partial and report the subject unconverged
+/// instead; the outer EBE guard can then reject the trial.
+fn skip_ode_iov_nm_fallback(model: &CompiledModel) -> bool {
+    model.ode_spec.is_some() && model.n_kappa > 0
+}
+
+const ODE_IOV_START_REJECT_NLL_PER_OBS: f64 = 250.0;
+const ODE_IOV_START_REJECT_NLL_MIN: f64 = 1_000.0;
+
+fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> bool {
+    if !(model.ode_spec.is_some() && model.n_kappa > 0) {
+        return false;
+    }
+    if !nll.is_finite() {
+        return true;
+    }
+    let threshold =
+        ODE_IOV_START_REJECT_NLL_MIN.max(ODE_IOV_START_REJECT_NLL_PER_OBS * n_obs.max(1) as f64);
+    nll > threshold
+}
+
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
 ///
 /// When `mu_k` is provided (mu-referencing active), the inner optimizer works
@@ -884,6 +908,33 @@ fn find_ebe_iov(
             None => gradient_fd(&obj, p, n_flat),
         }
     };
+
+    let start_nll = obj(&x);
+    let has_informative_warm_start = eta_init
+        .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
+        .unwrap_or(false);
+    if has_informative_warm_start
+        && reject_ode_iov_inner_start(model, subject.obs_times.len(), start_nll)
+    {
+        let bsv_eta: Vec<f64> = x[..n_eta]
+            .iter()
+            .zip(mu.iter())
+            .map(|(p, m)| p - m)
+            .collect();
+        let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
+            .map(|k| DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa]))
+            .collect();
+        return EbeResult {
+            eta: DVector::from_column_slice(&bsv_eta),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
+            converged: false,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: start_nll,
+            kappas: kappas_vec,
+        };
+    }
+
     let bfgs_converged = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -904,7 +955,9 @@ fn find_ebe_iov(
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
-        if enable_stall {
+        if skip_ode_iov_nm_fallback(model) {
+            (false, false)
+        } else if enable_stall {
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
             x = best;
             (ok, true)
@@ -3864,6 +3917,40 @@ mod iov_tests {
             "warm seed held the deep well, got {eta4:?}"
         );
         set_ebe_warm_start(false);
+    }
+
+    #[test]
+    fn ode_iov_skips_nelder_mead_inner_fallback() {
+        use crate::parser::model_parser::parse_model_string;
+        let ode_iov = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        assert!(skip_ode_iov_nm_fallback(&ode_iov));
+
+        let closed_form_iov = make_iov_model();
+        assert!(!skip_ode_iov_nm_fallback(&closed_form_iov));
+    }
+
+    #[test]
+    fn ode_iov_start_rejects_only_pathological_ode_iov_nll() {
+        use crate::parser::model_parser::parse_model_string;
+        let ode_iov = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        let closed_form_iov = make_iov_model();
+
+        assert!(!reject_ode_iov_inner_start(&ode_iov, 4, 999.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 4, 1_001.0));
+        assert!(!reject_ode_iov_inner_start(&ode_iov, 20, 4_999.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 20, 5_001.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 20, f64::NAN));
+        assert!(!reject_ode_iov_inner_start(
+            &closed_form_iov,
+            4,
+            1_000_000.0
+        ));
     }
 
     /// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient

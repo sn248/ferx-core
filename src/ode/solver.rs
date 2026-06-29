@@ -87,8 +87,29 @@ pub struct OdeSolverStats {
     pub accepted_steps: usize,
     /// Attempts rejected by the local-error test.
     pub rejected_steps: usize,
-    /// Accepted attempts where `err_norm > 1` but `dt_eff <= min_dt`.
+    /// Accepted attempts that failed the local-error test (`!(err_norm <= 1)`,
+    /// which also catches a non-finite `err_norm`) yet advanced because
+    /// `dt_eff <= min_dt`.
     pub min_step_clamped_steps: usize,
+}
+
+impl OdeSolverStats {
+    /// Record one RK attempt. `accepted` is the stepper's accept decision
+    /// (`err_norm <= 1.0 || dt_eff <= min_dt`); the clamp test mirrors it with
+    /// `!(err_norm <= 1.0)` so a non-finite `err_norm` (a diverging RHS pinned
+    /// at `min_dt`) still counts as a min-step clamp rather than a clean accept.
+    #[inline]
+    fn record(&mut self, accepted: bool, err_norm: f64, dt_eff: f64, min_dt: f64) {
+        self.attempted_steps += 1;
+        if accepted {
+            self.accepted_steps += 1;
+            if !(err_norm <= 1.0) && dt_eff <= min_dt {
+                self.min_step_clamped_steps += 1;
+            }
+        } else {
+            self.rejected_steps += 1;
+        }
+    }
 }
 
 /// Integrate an ODE system from t_start to t_end, saving at specified times.
@@ -229,17 +250,12 @@ pub fn solve_ode_with_stats(
         }
         err_norm = (err_norm / n as f64).sqrt();
 
+        let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
         if let Some(s) = stats.as_deref_mut() {
-            s.attempted_steps += 1;
+            s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
-        if err_norm <= 1.0 || dt_eff <= opts.min_dt {
+        if accepted {
             // Accept step
-            if let Some(s) = stats.as_deref_mut() {
-                s.accepted_steps += 1;
-                if err_norm > 1.0 && dt_eff <= opts.min_dt {
-                    s.min_step_clamped_steps += 1;
-                }
-            }
             t += dt_eff;
             u.copy_from_slice(&u5);
 
@@ -258,9 +274,6 @@ pub fn solve_ode_with_stats(
         }
         // On reject: (u, t) is unchanged, so the existing k1 is still rhs(u, t)
         // for the next attempt; nothing to do.
-        else if let Some(s) = stats.as_deref_mut() {
-            s.rejected_steps += 1;
-        }
 
         // Adapt step size (memoryless I-controller — see note above).
         let safety = 0.9;
@@ -452,16 +465,11 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
         }
         err_norm = (err_norm / n as f64).sqrt();
 
+        let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
         if let Some(s) = stats.as_deref_mut() {
-            s.attempted_steps += 1;
+            s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
-        if err_norm <= 1.0 || dt_eff <= opts.min_dt {
-            if let Some(s) = stats.as_deref_mut() {
-                s.accepted_steps += 1;
-                if err_norm > 1.0 && dt_eff <= opts.min_dt {
-                    s.min_step_clamped_steps += 1;
-                }
-            }
+        if accepted {
             t += dt_eff;
             u.copy_from_slice(&u5);
             std::mem::swap(&mut k1, &mut k7);
@@ -472,8 +480,6 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
                 });
                 save_idx += 1;
             }
-        } else if let Some(s) = stats.as_deref_mut() {
-            s.rejected_steps += 1;
         }
 
         let safety = 0.9;
@@ -654,6 +660,39 @@ mod tests {
     fn solve_ode_with_stats_counts_min_step_clamped_accepts() {
         let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
             du[0] = -100.0 * u[0];
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1.0,
+            min_dt: 1.0,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            ..OdeSolverOptions::default()
+        };
+        let mut stats = OdeSolverStats::default();
+        let _ = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(stats.attempted_steps, 1);
+        assert_eq!(stats.accepted_steps, 1);
+        assert_eq!(stats.rejected_steps, 0);
+        assert_eq!(stats.min_step_clamped_steps, 1);
+    }
+
+    #[test]
+    fn solve_ode_with_stats_counts_nan_blowup_as_min_step_clamped() {
+        // A diverging RHS produces a non-finite err_norm. Pinned at min_dt the
+        // step is force-accepted to guarantee progress; the clamp counter must
+        // still flag it (`!(err_norm <= 1.0)` catches NaN, where `err_norm > 1.0`
+        // would not), so a NaN-diverging integration is not mistaken for clean.
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = f64::NAN;
         };
         let opts = OdeSolverOptions {
             initial_dt: 1.0,

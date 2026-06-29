@@ -45,6 +45,53 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::time::Instant;
 
+/// Worker-stack size for ferx-managed Rayon pools.
+///
+/// Wide ODE+IOV analytic sensitivities instantiate `Dual2<M>` with `M` close to 100.
+/// Each dual carries an `M x M` Hessian, and the ODE/event-walk frames hold several
+/// of them at once. Rayon/default pthread stacks can be as small as 2 MiB on macOS,
+/// which overflows before Rust can unwind. Use a larger fit-scoped stack for Rayon
+/// workers that may evaluate these gradients.
+pub(crate) const FIT_RAYON_STACK_SIZE: usize = 32 * 1024 * 1024;
+
+pub(crate) fn fit_thread_pool_builder() -> rayon::ThreadPoolBuilder {
+    rayon::ThreadPoolBuilder::new().stack_size(FIT_RAYON_STACK_SIZE)
+}
+
+/// Build a fit-scoped Rayon pool with the ferx worker stack and an explicit thread
+/// count. Used only when the caller pins `options.threads` to a positive value; the
+/// common (unpinned) path reuses the shared [`default_fit_pool`] instead.
+pub(crate) fn build_fit_pool(n_threads: usize) -> Result<rayon::ThreadPool, String> {
+    fit_thread_pool_builder()
+        .num_threads(n_threads)
+        .build()
+        .map_err(|e| format!("failed to build rayon pool with {n_threads} threads: {e}"))
+}
+
+/// The process-wide fit pool, built once with the ferx worker stack (32 MiB) so wide
+/// ODE+IOV analytic gradients do not overflow the platform-default worker stack. Shared
+/// across every default-threads `fit()` call so batch / concurrent callers do not each
+/// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
+/// exhaust address space). Sized to `rayon::current_num_threads()` at first use, so a
+/// CLI `--threads N` (which sets the global pool count before the first fit) is honored.
+///
+/// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
+/// run on the ambient pool rather than aborting the fit.
+pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        // Pin to the ambient worker count (the global pool size, which a CLI `--threads N`
+        // sets via `build_global` before the first fit). A bare `build()` would instead
+        // default to *all* logical CPUs and ignore `--threads`. Evaluated outside any fit
+        // pool, so it reads the global pool's configured size.
+        fit_thread_pool_builder()
+            .num_threads(rayon::current_num_threads())
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Route predictions through analytical PK or ODE solver, then apply
 /// `model.scaling` so simulate / predict / post-fit IPRED see the same
 /// scaled output as the estimation dispatcher in `pk::compute_predictions_with_tv_into_with_schedule`.
@@ -2004,15 +2051,17 @@ pub fn fit(
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
-        let res = match options.threads {
-            Some(n) if n > 0 => {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .build()
-                    .map_err(|e| format!("failed to build rayon pool with {} threads: {}", n, e))?;
-                pool.install(|| fit_inner(model, pop_ref, init_params, options))
-            }
-            _ => fit_inner(model, pop_ref, init_params, options),
+        let run = || fit_inner(model, pop_ref, init_params, options);
+        // A pinned positive `threads` builds a fit-scoped pool sized to it (and surfaces a
+        // build failure as `Err`, as before). The unpinned default reuses the shared
+        // big-stack pool; if that one-time build ever failed we run on the ambient pool
+        // rather than turning a previously-successful default fit into an `Err`.
+        let res = match options.threads.filter(|&n| n > 0) {
+            Some(n) => build_fit_pool(n)?.install(run),
+            None => match default_fit_pool() {
+                Some(pool) => pool.install(run),
+                None => run(),
+            },
         };
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
@@ -2022,12 +2071,12 @@ pub fn fit(
     }
 
     // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
-    // `threads` controls per-subject parallelism inside each start; in multi-start mode
-    // we let the global rayon pool handle both levels (outer start × inner per-subject).
-    // Creating a new ThreadPool per start inside an outer into_par_iter() spawns n_starts
-    // independent pools that all compete on the same CPUs, causing oversubscription —
-    // so we only honour `threads` when the global pool hasn't been entered yet (single-start
-    // path above). Here we always use the global pool for the outer par_iter.
+    // `threads` controls per-subject parallelism inside a single-start fit; in multi-start
+    // mode the shared fit pool handles both levels (outer start × inner per-subject), so we
+    // do not narrow it to `threads` here — that would cap the combined fan-out below the
+    // available cores. Running one shared pool (rather than a fresh ThreadPool per start
+    // inside the outer into_par_iter()) also avoids spawning n_starts independent pools that
+    // all compete on the same CPUs, causing oversubscription.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
     let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
@@ -2044,34 +2093,43 @@ pub fn fit(
         ));
     }
 
-    let results: Vec<(usize, Result<FitResult, String>)> = (0..n)
-        .into_par_iter()
-        .map(|k| {
-            let init_k = perturb_init(init_params, k, sigma, base_seed);
-            // Per-start option overrides for k > 0:
-            // - saem_seed / bayes_seed: derive from base so each start gets a different
-            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
-            //   perturbing it every start runs an identical RNG trajectory (differing
-            //   only by the perturbed init) — wasted compute and false multi-start
-            //   robustness. Start 0 keeps the user's seeds for reproducibility.
-            // - global_search: CRS2-LM ignores the starting point and samples freely in
-            //   [lower, upper], so running it on starts 1..n overrides the perturbation
-            //   and makes multi-start a no-op for those starts. Only run it on start 0.
-            let opts_k_storage;
-            let opts_ref: &FitOptions = if k == 0 {
-                options
-            } else {
-                opts_k_storage = FitOptions {
-                    saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
-                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
-                    global_search: false,
-                    ..options.clone()
+    let par_starts = || -> Vec<(usize, Result<FitResult, String>)> {
+        (0..n)
+            .into_par_iter()
+            .map(|k| {
+                let init_k = perturb_init(init_params, k, sigma, base_seed);
+                // Per-start option overrides for k > 0:
+                // - saem_seed / bayes_seed: derive from base so each start gets a different
+                //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
+                //   perturbing it every start runs an identical RNG trajectory (differing
+                //   only by the perturbed init) — wasted compute and false multi-start
+                //   robustness. Start 0 keeps the user's seeds for reproducibility.
+                // - global_search: CRS2-LM ignores the starting point and samples freely in
+                //   [lower, upper], so running it on starts 1..n overrides the perturbation
+                //   and makes multi-start a no-op for those starts. Only run it on start 0.
+                let opts_k_storage;
+                let opts_ref: &FitOptions = if k == 0 {
+                    options
+                } else {
+                    opts_k_storage = FitOptions {
+                        saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                        bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
+                        global_search: false,
+                        ..options.clone()
+                    };
+                    &opts_k_storage
                 };
-                &opts_k_storage
-            };
-            (k, fit_inner(model, pop_ref, &init_k, opts_ref))
-        })
-        .collect();
+                (k, fit_inner(model, pop_ref, &init_k, opts_ref))
+            })
+            .collect()
+    };
+
+    // Run the start fan-out on the shared big-stack pool; fall back to the ambient pool
+    // only if its one-time build failed.
+    let results: Vec<(usize, Result<FitResult, String>)> = match default_fit_pool() {
+        Some(pool) => pool.install(par_starts),
+        None => par_starts(),
+    };
 
     // Pick best converged result; fall back to best unconverged if none converged.
     let mut best: Option<(usize, FitResult)> = None;

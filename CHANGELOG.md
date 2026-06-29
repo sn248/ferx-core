@@ -259,6 +259,9 @@ section of the SDLC for the versioning policy).
 - ODE+IOV models with many occasion blocks or dose-only occasions now keep analytic
   inner/outer gradients when otherwise in scope, covering per-subject stacks up to 96
   axes (#590).
+- Wide ODE+IOV analytic gradients now run on larger Rayon worker stacks, avoiding
+  native stack-overflow crashes in R/CLI release builds for PNA-scale occasion counts
+  (#590).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to

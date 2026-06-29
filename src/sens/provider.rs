@@ -6000,6 +6000,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fit_rayon_stack_handles_pna_scale_ode_iov_gradient() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        let n_occ = 86;
+        let obs_times: Vec<f64> = (0..n_occ).map(|i| i as f64 * 24.0 + 1.0).collect();
+        let occasions: Vec<u32> = (1..=n_occ as u32).collect();
+        let doses: Vec<DoseEvent> = (0..n_occ)
+            .map(|i| DoseEvent::new(i as f64 * 24.0, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let n = obs_times.len();
+        let subject = Subject {
+            id: "pna-scale-iov".to_string(),
+            doses,
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: (1..=n_occ as u32).collect(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let theta = vec![0.2, 10.0];
+        let stacked = vec![0.0; model.n_eta + n_occ * model.n_kappa];
+        let m_dim = model.n_theta + stacked.len();
+        assert_eq!(m_dim, 90, "fixture mirrors the PNA-scale occasion width");
+
+        let pool = crate::api::fit_thread_pool_builder()
+            .num_threads(1)
+            .build()
+            .expect("fit-scoped rayon pool");
+        pool.install(|| {
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked,
+            )
+            .expect("PNA-scale ODE IOV gradient should fit on ferx worker stack");
+        });
+    }
+
     /// A dose in an occasion that carries no sampled observations still gets its own κ
     /// axis. That kappa can affect later observations through carryover, so the ODE IOV
     /// provider must keep the subject on the analytic path rather than falling back to FD.

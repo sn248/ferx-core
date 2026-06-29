@@ -2,6 +2,8 @@ use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
 
+const FIT_RAYON_STACK_SIZE: usize = 32 * 1024 * 1024;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -57,13 +59,15 @@ fn main() {
     }
 
     // Configure rayon's global pool before any parallel work starts. build_global()
-    // is once-per-process — correct for a CLI binary. Without a --threads flag we
-    // leave rayon's default (one worker per logical CPU) in place.
+    // is once-per-process — correct for a CLI binary. Even without a --threads flag,
+    // use ferx's larger worker stack so wide ODE+IOV analytic gradients do not overflow
+    // the platform default worker stack.
+    let mut pool_builder = rayon::ThreadPoolBuilder::new().stack_size(FIT_RAYON_STACK_SIZE);
     if let Some(n) = threads {
-        if let Err(e) = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-        {
+        pool_builder = pool_builder.num_threads(n);
+    }
+    if let Err(e) = pool_builder.build_global() {
+        if let Some(n) = threads {
             eprintln!(
                 "Warning: failed to configure thread pool with {} threads: {}",
                 n, e

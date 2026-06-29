@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
+  built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
+  absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
+  fraction: `parallel` (dual first-order, `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)`) and
+  `mixed` (zero-order + first-order, `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)`). A pathway
+  fraction on `zero_order(...)` (`FR*zero_order(...)`) is now accepted (previously rejected), so the
+  per-segment zero-order channel carries the fraction; the fractions must partition the dose
+  (each `0 < FR ≤ 1`, `Σ FR ≈ 1`). `parallel` keeps exact analytic FOCEI gradients (including
+  ∂/∂fraction); `mixed` differentiates the zero-order duration/fraction by finite differences (the
+  moving-boundary case, #530). Standalone first-order absorption still uses the analytical
+  `pk *_oral` path. See [Absorption models](model-file/absorption.qmd).
 - **Joint PK-TTE — drug-driven hazard via `[event_model] hazard = <expr>`** (#564). On an ODE
   model, a `hazard` expression that references the PK state (e.g. `H0 * exp(BETA * (central / V))`)
   is accumulated as a cumulative-hazard ODE compartment and estimated jointly with the PK by
@@ -393,6 +404,26 @@ section of the SDLC for the versioning policy).
   re-enables the HMC SAEM E-step (`n_leapfrog > 0`) for baseline models. The
   analytic gradient matches Richardson finite differences of the (NONMEM-validated)
   FOCEI marginal to ~1e-3. IOV init models keep the FD fallback (follow-up).
+- **Exact analytic gradients for IOV + `iiv_on_ruv` models** (closed-form
+  1/2/3-cpt, #486). An inter-occasion-variability model that also puts IIV on the
+  residual error (`iiv_on_ruv`) now runs FOCEI on exact analytic sensitivities
+  instead of finite differences: both the stacked-η inner gradient and the outer
+  θ/Ω/σ assembly carry the `exp(2·η_ruv)` residual-variance scaling and the
+  `η_ruv` variance column (the same treatment the non-IOV `iiv_on_ruv` path
+  already used, #474). Faster (no per-parameter FD probe) and exact — the analytic
+  inner gradient matches central FD of the IOV inner objective and the outer
+  θ-gradient matches Richardson FD of the FOCEI marginal to ~1e-3. ODE IOV +
+  `iiv_on_ruv` keeps the FD fallback (follow-up).
+- **Exact analytic gradients for closed-form `iiv_on_ruv` + M3 BLOQ models**
+  (#486). A model with IIV on the residual error *and* M3 below-quantification-
+  limit handling now runs FOCEI on exact analytic sensitivities. The censored
+  data term `−logΦ((LLOQ−f)/√v)` (with `v = R·exp(2·η_ruv)`) contributes the
+  residual-eta column `h·z` and the cross-curvature `∂²L/∂η_ruv²`, `∂²L/∂η_l∂η_ruv`,
+  `∂²L/∂η_ruv∂θ`, `∂²L/∂η_ruv∂σ` to the true inner Hessian and the mixed blocks,
+  while censored rows stay excluded from the Laplace `H̃`/`log|H̃|` (matching the
+  objective). Inner η-gradient vs central FD and the outer packed gradient vs
+  Richardson reconverged FD of the censored FOCEI marginal both match to ~1e-3.
+  **ODE** M3 + `iiv_on_ruv` keeps the FD fallback (not yet regression-tested).
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
   now initialises its inverse-Hessian (the search `H0`) to the prior conditional
   scale `diag(1/Ω⁻¹ᵢᵢ)` for every model, not just FREM. A correlated or

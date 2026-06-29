@@ -2782,17 +2782,32 @@ impl CompiledModel {
     /// `exp(2*eta_k)` is exactly equivalent to scaling the residual SD by
     /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
     /// combined alike.
-    /// Whether `iiv_on_ruv` combines with a feature that forces the analytic
-    /// gradient off and FD on for this model: IOV (`n_kappa > 0`, whose inner
-    /// gradient does not carry the residual-variance scaling) or M3 BLOQ (whose
-    /// censored residual-eta second derivatives are not assembled). Single source
-    /// of truth shared by the outer gradient gate
-    /// ([`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available))
-    /// and the inner η-gradient gates, so the two halves stay matched (#474).
+    /// One predicate in the `iiv_on_ruv` × {plain | IOV | M3} × {closed-form | ODE}
+    /// routing decision: `true` only for **ODE M3 BLOQ + `iiv_on_ruv`** (the censored
+    /// × residual-eta cross-terms are implemented in the shared assembly, #4c, but the
+    /// ODE path is not yet regression-tested for that combo, so it stays on FD).
+    ///
+    /// **This is NOT the single source of truth for the full routing** — the decision
+    /// is spread across several predicates that must move together, so a future scope
+    /// change has to touch all the relevant ones in lockstep or the inner and outer
+    /// loops desync:
+    /// - this gate (consulted by [`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available)
+    ///   and the inner bails [`analytic_inner_common_bail`] / the ODE inner gate);
+    /// - [`iov_analytical_supported`](crate::sens::provider::iov_analytical_supported)
+    ///   (closed-form IOV: declines M3, served for plain/`iiv_on_ruv`);
+    /// - [`ode_iov_supported`](crate::sens::ode_provider::ode_iov_supported)
+    ///   (ODE IOV + `iiv_on_ruv` routes to FD here, not via this gate);
+    /// - [`analytical_supported`](crate::sens::provider::analytical_supported)
+    ///   (closed-form M3 + `iiv_on_ruv`, #4c).
+    ///
+    /// Net effect today: analytic for **closed-form M3 + `iiv_on_ruv`** (#4c) and
+    /// **closed-form IOV + `iiv_on_ruv`** (#4b/#474); FD for ODE M3 + `iiv_on_ruv`
+    /// (here) and ODE IOV + `iiv_on_ruv` (via `ode_iov_supported`).
     #[inline]
     pub fn iiv_on_ruv_forces_fd(&self) -> bool {
         self.residual_error_eta.is_some()
-            && (self.n_kappa > 0 || matches!(self.bloq_method, BloqMethod::M3))
+            && matches!(self.bloq_method, BloqMethod::M3)
+            && self.ode_spec.is_some()
     }
 
     /// Whether a custom residual-error magnitude (#484) is active. The

@@ -850,6 +850,11 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // a fractioned one (or two bare terms) would deliver the full `F·Dose` more than
     // once. A fraction is only meaningful across ≥2 partitioning terms, so a *lone*
     // fractioned term is rejected too (a single pathway is written bare).
+    //
+    // (The companion structural rule — **at most one zero-order forcing per
+    // compartment** — is enforced earlier, in the parser's `build_ode_spec`, so it
+    // also guards the `simulate()` / `predict()` paths that never reach this
+    // data-level check; #505.)
     use std::collections::BTreeMap;
     let mut frac_count: BTreeMap<usize, (usize, usize)> = BTreeMap::new(); // cmt -> (total, fractioned)
     for f in &ode.input_rate {
@@ -859,6 +864,7 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             e.1 += 1;
         }
     }
+
     for (&cmt, &(total, fractioned)) in &frac_count {
         if total >= 2 && fractioned != total {
             diags.push(

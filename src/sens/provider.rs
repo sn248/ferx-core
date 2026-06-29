@@ -500,7 +500,7 @@ fn lognormal_param_derivatives(
 //
 // The inner/outer "η" for an IOV subject is the **stacked** random-effects vector
 //   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
-// with `K = split_obs_by_occasion(subject).len()`. The returned [`SubjectSens`]
+// with `K = iov_occasion_groups(subject).len()`. The returned [`SubjectSens`]
 // is over that stacked vector (plus the usual θ block), so the caller's block-Ω
 // (BSV ⊕ K·IOV) assembly consumes it directly.
 
@@ -809,7 +809,7 @@ fn build_iov_sources(
     let n_theta = model.n_theta;
     let n_eff = n_eta + n_kappa;
 
-    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
     let k_groups = occ_groups.len();
     if k_groups == 0 {
         return None;
@@ -819,17 +819,6 @@ fn build_iov_sources(
         return None;
     }
     let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
-    // A dose in an occasion with no sampled observations has no κ group in the stacked
-    // `[η_bsv, κ₁..κ_K]` vector (`K` = obs-occasions), so its source build would `?`-abort
-    // mid-routine. Decline up front for an explicit FD route — symmetric with the ODE
-    // path's `ode_iov_subject_supported` (#466 review round 3 #1 / round-4 sweep).
-    if subject
-        .dose_occasions
-        .iter()
-        .any(|d_occ| !occ_to_k.contains_key(d_occ))
-    {
-        return None;
-    }
     // Combined effect vector for group `k`: `[η_bsv, κ_k]` (shared κ-axis layout).
     let combined_for =
         |k: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, k);
@@ -5744,13 +5733,25 @@ mod tests {
         stacked: &[f64],
     ) {
         let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
         let n_theta = theta.len();
+        let k_groups = crate::stats::likelihood::iov_occasion_groups(subject).len();
+        assert_eq!(
+            stacked.len(),
+            n_eta + k_groups * n_kappa,
+            "stacked vector must match IOV occasion groups"
+        );
         let sens = subject_sensitivities_iov(model, subject, theta, stacked).expect("supported");
 
         // Map a stacked-η vector to predict_iov's (η_bsv, kappas-per-group) form.
         let pred = |st: &[f64], th: &[f64], j: usize| -> f64 {
             let eta_bsv = st[..n_eta].to_vec();
-            let kappas: Vec<Vec<f64>> = vec![vec![st[n_eta]], vec![st[n_eta + 1]]];
+            let kappas: Vec<Vec<f64>> = (0..k_groups)
+                .map(|g| {
+                    let base = n_eta + g * n_kappa;
+                    st[base..base + n_kappa].to_vec()
+                })
+                .collect();
             crate::pk::predict_iov(model, subject, th, &eta_bsv, &kappas)[j]
         };
 
@@ -5932,28 +5933,91 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
-    /// A dose in an occasion that carries no sampled observations has no κ axis in the
-    /// stacked `[η_bsv, κ₁..κ_K]` vector (`K` counts observation occasions), so the ODE IOV
-    /// provider must decline the subject **up front** — routing it to FD explicitly rather
-    /// than aborting mid-walk on `occ_to_k.get(dose_occ) == None` (#466 review round 3 #1).
     #[test]
-    fn ode_iov_dose_in_obs_free_occasion_declines_to_fd() {
+    fn ode_iov_above_legacy_axis_cap_stays_analytic() {
+        let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        let n_occ = 15;
+        let obs_times: Vec<f64> = (0..n_occ).map(|i| i as f64 * 24.0 + 1.0).collect();
+        let occasions: Vec<u32> = (1..=n_occ as u32).collect();
+        let doses: Vec<DoseEvent> = (0..n_occ)
+            .map(|i| DoseEvent::new(i as f64 * 24.0, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let n = obs_times.len();
+        let subject = Subject {
+            id: "wide-iov".to_string(),
+            doses,
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions,
+            dose_occasions: (1..=n_occ as u32).collect(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let theta = vec![0.2, 10.0];
+        let mut stacked = vec![0.0; model.n_eta + n_occ * model.n_kappa];
+        stacked[0] = 0.12;
+        stacked[1] = -0.08;
+        for g in 0..n_occ {
+            stacked[model.n_eta + g] = 0.02 * (g as f64 - 7.0);
+        }
+        let m_dim = model.n_theta + stacked.len();
+        assert!(
+            m_dim > crate::sens::ode_provider::MAX_ODE_AXES,
+            "fixture must exceed the legacy 16-axis cap"
+        );
+        assert!(
+            m_dim <= crate::sens::ode_provider::MAX_ODE_IOV_AXES,
+            "fixture must stay within the widened IOV cap"
+        );
+        let full = crate::sens::ode_provider::ode_subject_sensitivities_iov(
+            &model, &subject, &theta, &stacked,
+        )
+        .expect("wide ODE IOV outer gradient should be analytic");
+        let light =
+            crate::sens::ode_provider::ode_subject_eta_grad_iov(&model, &subject, &theta, &stacked)
+                .expect("wide ODE IOV inner gradient should be analytic");
+        assert_eq!(full.obs.len(), light.len());
+        for (outer, inner) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(outer.f, inner.f, max_relative = 1e-10, epsilon = 1e-12);
+            for k in 0..stacked.len() {
+                approx::assert_relative_eq!(
+                    outer.df_deta[k],
+                    inner.df_deta[k],
+                    max_relative = 1e-8,
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+
+    /// A dose in an occasion that carries no sampled observations still gets its own κ
+    /// axis. That kappa can affect later observations through carryover, so the ODE IOV
+    /// provider must keep the subject on the analytic path rather than falling back to FD.
+    #[test]
+    fn ode_iov_dose_only_occasion_matches_fd_of_predict_iov() {
         let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
         let mut subject = iov_subject();
-        // Add a dose in occasion 3, which has no observations (obs occasions are {1, 2}).
+        // Add a dose between the two observed occasions. Occasion 3 has no observations, but
+        // its CL kappa affects the post-dose amount that carries into occasion 2.
         subject
             .doses
-            .push(DoseEvent::new(48.0, 100.0, 1, 0.0, false, 0.0));
+            .push(DoseEvent::new(18.0, 100.0, 1, 0.0, false, 0.0));
         subject.dose_occasions.push(3);
-        assert!(
-            crate::sens::ode_provider::ode_subject_sensitivities_iov(
-                &model,
-                &subject,
-                &[0.2, 10.0],
-                &[0.12, -0.08, 0.05, -0.10]
-            )
-            .is_none(),
-            "dose in an obs-free occasion must decline (→ FD), not abort mid-walk"
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0],
+            &[0.12, -0.08, 0.05, -0.10, 0.08],
         );
     }
 

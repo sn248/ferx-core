@@ -2347,7 +2347,7 @@ pub(crate) fn compute_extra_output_columns(
             .get(si)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+        let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
         let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
         for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
             occ_to_k.insert(*occ_id, k);

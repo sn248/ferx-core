@@ -68,25 +68,28 @@ const _: () = assert!(
 /// individual-parameter program over `Dual2<M>`) is monomorphised.
 pub(crate) const MAX_ODE_AXES: usize = 16;
 
-// SIX `disp!`/`dispatch_tv!(1, 2, …, 16)` dispatch tables are keyed on `MAX_ODE_AXES` and
+/// Largest stacked `(θ, η_bsv, κ_1..κ_K)` axis count for ODE IOV subjects.
+/// Kept separate from [`MAX_ODE_AXES`] because high-occasion IOV subjects are wide
+/// only in the kappa stack; the per-event individual-parameter derivative program
+/// still runs over `(θ, η_bsv, κ_current)` and stays under the normal ODE axis cap.
+pub(crate) const MAX_ODE_IOV_AXES: usize = 96;
+
+// Four `disp!`/`dispatch_tv!(1, 2, …, 16)` dispatch tables are keyed on `MAX_ODE_AXES` and
 // enumerate `1..=16` explicitly with a silent `_ => None` — they live in the **entry-point
 // callers** (the `run_subject_*<const M>` workers are const-generic and carry no table):
 //   1. `ode_subject_sensitivities`     (TV-cov outer, `dispatch_tv!`)
 //   2. `ode_subject_eta_grad`          (TV-cov inner, `dispatch_tv!`)
 //   3. `param_eta_derivatives`         (`disp!`)
-//   4. `ode_subject_sensitivities_iov` (IOV outer, `disp!`)
-//   5. `ode_subject_eta_grad_iov`      (IOV inner, `disp!`)
-//   6. `param_derivatives_at_cov`      (`disp!`)
-// Keep all six in lockstep with the const: bumping `MAX_ODE_AXES` without widening every
+//   4. `param_derivatives_at_cov`      (`disp!`)
+// Keep all four in lockstep with the const: bumping `MAX_ODE_AXES` without widening every
 // arm would let an in-scope wider model pass the gate, hit `_ => None`, and silently fall
 // back to FD with no error. This compile-time tripwire forces an edit here — and a look at
-// all six tables — before the const can change (#438 / #466 review round 1 #13 + round 2).
+// all four tables — before the const can change (#438 / #466 review round 1 #13 + round 2).
 const _: () = assert!(
     MAX_ODE_AXES == 16,
     "MAX_ODE_AXES changed: widen the disp!(1..=16) / dispatch_tv!(1..=16) tables in \
      ode_subject_sensitivities, ode_subject_eta_grad, param_eta_derivatives, \
-     ode_subject_sensitivities_iov, ode_subject_eta_grad_iov, and param_derivatives_at_cov \
-     to match, then update this assert"
+     and param_derivatives_at_cov to match, then update this assert"
 );
 
 // An η-dependent `ExpressionScale` admitted by `ode_analytical_supported` (bounded by
@@ -105,6 +108,115 @@ const _: () = assert!(
      arm of dispatch_init_impulse! and silently drops the obs_scale quotient. Widen \
      MAX_SCALE_AXES (and its dispatch_init_impulse! table) to at least MAX_ODE_AXES."
 );
+
+const _: () = assert!(
+    MAX_ODE_IOV_AXES == 96,
+    "MAX_ODE_IOV_AXES changed: update dispatch_ode_iov_axes! to enumerate the same range"
+);
+
+macro_rules! dispatch_ode_iov_axes {
+    ($dim:expr, $worker:ident, $($arg:expr),+ $(,)?) => {
+        match $dim {
+            1 => $worker::<1>($($arg),+),
+            2 => $worker::<2>($($arg),+),
+            3 => $worker::<3>($($arg),+),
+            4 => $worker::<4>($($arg),+),
+            5 => $worker::<5>($($arg),+),
+            6 => $worker::<6>($($arg),+),
+            7 => $worker::<7>($($arg),+),
+            8 => $worker::<8>($($arg),+),
+            9 => $worker::<9>($($arg),+),
+            10 => $worker::<10>($($arg),+),
+            11 => $worker::<11>($($arg),+),
+            12 => $worker::<12>($($arg),+),
+            13 => $worker::<13>($($arg),+),
+            14 => $worker::<14>($($arg),+),
+            15 => $worker::<15>($($arg),+),
+            16 => $worker::<16>($($arg),+),
+            17 => $worker::<17>($($arg),+),
+            18 => $worker::<18>($($arg),+),
+            19 => $worker::<19>($($arg),+),
+            20 => $worker::<20>($($arg),+),
+            21 => $worker::<21>($($arg),+),
+            22 => $worker::<22>($($arg),+),
+            23 => $worker::<23>($($arg),+),
+            24 => $worker::<24>($($arg),+),
+            25 => $worker::<25>($($arg),+),
+            26 => $worker::<26>($($arg),+),
+            27 => $worker::<27>($($arg),+),
+            28 => $worker::<28>($($arg),+),
+            29 => $worker::<29>($($arg),+),
+            30 => $worker::<30>($($arg),+),
+            31 => $worker::<31>($($arg),+),
+            32 => $worker::<32>($($arg),+),
+            33 => $worker::<33>($($arg),+),
+            34 => $worker::<34>($($arg),+),
+            35 => $worker::<35>($($arg),+),
+            36 => $worker::<36>($($arg),+),
+            37 => $worker::<37>($($arg),+),
+            38 => $worker::<38>($($arg),+),
+            39 => $worker::<39>($($arg),+),
+            40 => $worker::<40>($($arg),+),
+            41 => $worker::<41>($($arg),+),
+            42 => $worker::<42>($($arg),+),
+            43 => $worker::<43>($($arg),+),
+            44 => $worker::<44>($($arg),+),
+            45 => $worker::<45>($($arg),+),
+            46 => $worker::<46>($($arg),+),
+            47 => $worker::<47>($($arg),+),
+            48 => $worker::<48>($($arg),+),
+            49 => $worker::<49>($($arg),+),
+            50 => $worker::<50>($($arg),+),
+            51 => $worker::<51>($($arg),+),
+            52 => $worker::<52>($($arg),+),
+            53 => $worker::<53>($($arg),+),
+            54 => $worker::<54>($($arg),+),
+            55 => $worker::<55>($($arg),+),
+            56 => $worker::<56>($($arg),+),
+            57 => $worker::<57>($($arg),+),
+            58 => $worker::<58>($($arg),+),
+            59 => $worker::<59>($($arg),+),
+            60 => $worker::<60>($($arg),+),
+            61 => $worker::<61>($($arg),+),
+            62 => $worker::<62>($($arg),+),
+            63 => $worker::<63>($($arg),+),
+            64 => $worker::<64>($($arg),+),
+            65 => $worker::<65>($($arg),+),
+            66 => $worker::<66>($($arg),+),
+            67 => $worker::<67>($($arg),+),
+            68 => $worker::<68>($($arg),+),
+            69 => $worker::<69>($($arg),+),
+            70 => $worker::<70>($($arg),+),
+            71 => $worker::<71>($($arg),+),
+            72 => $worker::<72>($($arg),+),
+            73 => $worker::<73>($($arg),+),
+            74 => $worker::<74>($($arg),+),
+            75 => $worker::<75>($($arg),+),
+            76 => $worker::<76>($($arg),+),
+            77 => $worker::<77>($($arg),+),
+            78 => $worker::<78>($($arg),+),
+            79 => $worker::<79>($($arg),+),
+            80 => $worker::<80>($($arg),+),
+            81 => $worker::<81>($($arg),+),
+            82 => $worker::<82>($($arg),+),
+            83 => $worker::<83>($($arg),+),
+            84 => $worker::<84>($($arg),+),
+            85 => $worker::<85>($($arg),+),
+            86 => $worker::<86>($($arg),+),
+            87 => $worker::<87>($($arg),+),
+            88 => $worker::<88>($($arg),+),
+            89 => $worker::<89>($($arg),+),
+            90 => $worker::<90>($($arg),+),
+            91 => $worker::<91>($($arg),+),
+            92 => $worker::<92>($($arg),+),
+            93 => $worker::<93>($($arg),+),
+            94 => $worker::<94>($($arg),+),
+            95 => $worker::<95>($($arg),+),
+            96 => $worker::<96>($($arg),+),
+            _ => None,
+        }
+    };
+}
 
 /// Whether an `ExpressionScale` `obs_scale` divisor is admissible on an analytic ODE
 /// walk: non-LTBS (the in-walk log can't compose with the post-walk quotient), program
@@ -1839,31 +1951,17 @@ fn ode_iov_subject_supported(
     }
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
-    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
     let k_groups = occ_groups.len();
     if k_groups == 0 {
         return None;
     }
-    // Every dose's occasion must have a κ group, i.e. appear among the observation
-    // occasions. The stacked vector is `[η_bsv, κ₁..κ_K]` with `K = obs-occasions`, so a
-    // dose in an occasion with no sampled observations has no κ axis — `seed_iov_events`
-    // would `occ_to_k.get(dose_occ) == None` and abort the subject mid-walk. Decline up
-    // front so the subject routes to FD *explicitly* (honest scope, accurate
-    // `gradient_method`) rather than via a silent inner `?` (#466 review round 3 #1).
-    if subject
-        .dose_occasions
-        .iter()
-        .any(|d_occ| !occ_groups.iter().any(|(occ, _)| occ == d_occ))
-    {
-        return None;
-    }
     let n_stacked = model.n_eta + k_groups * model.n_kappa;
     // Stacked dual width `M = n_theta + n_eta + K·n_kappa`. Bounded here (per subject,
-    // since `K` is per subject) so a many-occasion subject routes to FD rather than a
-    // silent `_ => None` downgrade — the whole population then falls back, matching the
-    // analytical IOV `disp!` cap behaviour.
+    // since `K` is per subject) so an extremely many-occasion subject routes to FD rather
+    // than a silent `_ => None` downgrade.
     let m_dim = model.n_theta + n_stacked;
-    if !(1..=MAX_ODE_AXES).contains(&m_dim) {
+    if !(1..=MAX_ODE_IOV_AXES).contains(&m_dim) {
         return None;
     }
     Some((occ_groups, n_stacked, m_dim))
@@ -1878,7 +1976,7 @@ fn ode_iov_subject_supported(
 /// ([`ode_subject_eta_grad_iov`]), on the matched per-subject scope.
 ///
 /// `stacked_eta` must have length `n_eta + K·n_kappa` with
-/// `K = split_obs_by_occasion(subject).len()` (#439 ODE IOV).
+/// `K = iov_occasion_groups(subject).len()` (#439 ODE IOV).
 pub fn ode_subject_sensitivities_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -1889,15 +1987,15 @@ pub fn ode_subject_sensitivities_iov(
     if stacked_eta.len() != n_stacked {
         return None;
     }
-    macro_rules! disp {
-        ($($m:literal),+) => {
-            match m_dim {
-                $($m => run_subject_iov::<$m>(model, subject, theta, stacked_eta, &occ_groups),)+
-                _ => None,
-            }
-        };
-    }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    dispatch_ode_iov_axes!(
+        m_dim,
+        run_subject_iov,
+        model,
+        subject,
+        theta,
+        stacked_eta,
+        &occ_groups,
+    )
 }
 
 /// Light **inner** η-gradient (`Dual1<N>`, `N = n_stacked = n_eta + K·n_kappa`) for an
@@ -1916,15 +2014,15 @@ pub fn ode_subject_eta_grad_iov(
     if stacked_eta.len() != n_stacked {
         return None;
     }
-    macro_rules! disp {
-        ($($n:literal),+) => {
-            match n_stacked {
-                $($n => run_subject_iov_eta::<$n>(model, subject, theta, stacked_eta, &occ_groups),)+
-                _ => None,
-            }
-        };
-    }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    dispatch_ode_iov_axes!(
+        n_stacked,
+        run_subject_iov_eta,
+        model,
+        subject,
+        theta,
+        stacked_eta,
+        &occ_groups,
+    )
 }
 
 /// Seed an occasion group's per-event PK-slot duals on the **stacked**

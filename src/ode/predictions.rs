@@ -96,6 +96,37 @@ pub(crate) fn resolve_subject_doses<'a>(
     resolve_subject_doses_with(subject, attr_map, |_| params)
 }
 
+/// The time at which a subject's integration begins: the earliest event on the
+/// subject's timeline (first dose, observation, PK-only sample, or reset).
+///
+/// The dense/static drivers seed their `break_times` here rather than at a fixed
+/// `t = 0`. This mirrors NONMEM (and the event-driven walk, which already starts
+/// at `timeline[0]`): the initial state is applied at the first record, so a
+/// dataset whose TIME column starts off-zero is *not* integrated over a phantom
+/// `[0, first_record]` window. TIME stays on the raw data clock everywhere — no
+/// per-subject origin shift (#573).
+pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
+    let mut t0 = f64::INFINITY;
+    for &t in &subject.obs_times {
+        t0 = t0.min(t);
+    }
+    for d in &subject.doses {
+        t0 = t0.min(d.time);
+    }
+    for &t in &subject.pk_only_times {
+        t0 = t0.min(t);
+    }
+    for &t in &subject.reset_times {
+        t0 = t0.min(t);
+    }
+    // No events at all → fall back to the historical t = 0 start.
+    if t0.is_finite() {
+        t0
+    } else {
+        0.0
+    }
+}
+
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
 /// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
 /// this is comfortably past saturation — each additional cycle adds
@@ -1284,7 +1315,7 @@ pub(crate) fn ode_predictions_with_extra_breaks(
     // at lagtime-shifted infusion-end times too, so each segment is
     // either fully inside or fully outside every infusion window.
     let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
-    let mut break_times: Vec<f64> = vec![0.0];
+    let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
     for (i, dose) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
         break_times.push(dose.time + lag);
@@ -1322,6 +1353,14 @@ pub(crate) fn ode_predictions_with_extra_breaks(
     );
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    // Degenerate single-instant timeline (e.g. one observation, no dose, off
+    // zero): keep a second identical break so the loop runs once and records
+    // observations at the first record from the initial (post-dose) state,
+    // rather than leaving them at NaN. Integration over the zero-length segment
+    // is a no-op.
+    if break_times.len() < 2 {
+        break_times.push(break_times[0]);
+    }
 
     for k in 0..(break_times.len() - 1) {
         let t_start = break_times[k];
@@ -2607,7 +2646,7 @@ pub fn ode_predictions_with_states(
     }
 
     let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
-    let mut break_times: Vec<f64> = vec![0.0];
+    let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
     for (i, dose) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
         break_times.push(dose.time + lag);
@@ -2935,7 +2974,7 @@ pub fn ode_dense_solve_states(
     }
 
     let t_last = saveat.iter().cloned().fold(0.0f64, f64::max);
-    let mut break_times: Vec<f64> = vec![0.0];
+    let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
     for (i, dose) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
         break_times.push(dose.time + lag);

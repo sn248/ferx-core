@@ -3238,7 +3238,12 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // infusion-end time, so each segment is fully inside or outside every
     // infusion window (the rate forcing is then constant over a segment).
     let t_last = subject.obs_times.iter().cloned().fold(0.0_f64, f64::max);
-    let mut break_times: Vec<f64> = vec![0.0];
+    // Start integration at the subject's first event (NONMEM semantics), not at a
+    // fixed t = 0 — so an off-zero TIME column is not integrated over a phantom
+    // `[0, first_record]` window. Mirrors the production dense walk and the
+    // event-driven `cur_t = timeline[0]` start (#573).
+    let mut break_times: Vec<f64> =
+        vec![crate::ode::predictions::subject_integration_start(subject)];
     for dose in &subject.doses {
         break_times.push(dose.time);
         if dose.is_infusion() {
@@ -3256,6 +3261,12 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // f64 walk (`pk::event_driven`) (PR #381 review #13).
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    // Degenerate single-instant timeline (one observation, no dose, off zero):
+    // keep a second identical break so the loop runs once and `record_at(t_start)`
+    // captures the observation at the first record from the initial state.
+    if break_times.len() < 2 {
+        break_times.push(break_times[0]);
+    }
 
     // Reusable scratch for the RHS evaluation across all stages.
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());

@@ -238,6 +238,13 @@ section of the SDLC for the versioning policy).
   combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
+- **Datasets whose TIME column does not start at zero** (#573). ODE models now
+  begin integration at each subject's first record (matching NONMEM) instead of
+  at a fixed `t = 0`, so a subject whose first TIME is off-zero is no longer
+  integrated over a phantom `[0, first_record]` window. TIME stays on the raw
+  data clock everywhere — the model `TIME`/`T` builtin, `[derived]` columns,
+  sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
+  report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on

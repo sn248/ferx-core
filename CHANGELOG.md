@@ -385,6 +385,26 @@ section of the SDLC for the versioning policy).
   re-enables the HMC SAEM E-step (`n_leapfrog > 0`) for baseline models. The
   analytic gradient matches Richardson finite differences of the (NONMEM-validated)
   FOCEI marginal to ~1e-3. IOV init models keep the FD fallback (follow-up).
+- **Exact analytic gradients for IOV + `iiv_on_ruv` models** (closed-form
+  1/2/3-cpt, #486). An inter-occasion-variability model that also puts IIV on the
+  residual error (`iiv_on_ruv`) now runs FOCEI on exact analytic sensitivities
+  instead of finite differences: both the stacked-η inner gradient and the outer
+  θ/Ω/σ assembly carry the `exp(2·η_ruv)` residual-variance scaling and the
+  `η_ruv` variance column (the same treatment the non-IOV `iiv_on_ruv` path
+  already used, #474). Faster (no per-parameter FD probe) and exact — the analytic
+  inner gradient matches central FD of the IOV inner objective and the outer
+  θ-gradient matches Richardson FD of the FOCEI marginal to ~1e-3. ODE IOV +
+  `iiv_on_ruv` keeps the FD fallback (follow-up).
+- **Exact analytic gradients for closed-form `iiv_on_ruv` + M3 BLOQ models**
+  (#486). A model with IIV on the residual error *and* M3 below-quantification-
+  limit handling now runs FOCEI on exact analytic sensitivities. The censored
+  data term `−logΦ((LLOQ−f)/√v)` (with `v = R·exp(2·η_ruv)`) contributes the
+  residual-eta column `h·z` and the cross-curvature `∂²L/∂η_ruv²`, `∂²L/∂η_l∂η_ruv`,
+  `∂²L/∂η_ruv∂θ`, `∂²L/∂η_ruv∂σ` to the true inner Hessian and the mixed blocks,
+  while censored rows stay excluded from the Laplace `H̃`/`log|H̃|` (matching the
+  objective). Inner η-gradient vs central FD and the outer packed gradient vs
+  Richardson reconverged FD of the censored FOCEI marginal both match to ~1e-3.
+  **ODE** M3 + `iiv_on_ruv` keeps the FD fallback (not yet regression-tested).
 - **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
   now initialises its inverse-Hessian (the search `H0`) to the prior conditional
   scale `diag(1/Ω⁻¹ᵢᵢ)` for every model, not just FREM. A correlated or

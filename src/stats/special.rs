@@ -88,6 +88,34 @@ pub fn log_normal_cdf(z: f64) -> f64 {
     }
 }
 
+/// Inverse Mills ratio `h = φ(z)/Φ(z)`, evaluated through logs (via
+/// [`log_normal_cdf`]) so it stays finite in the far tail where `Φ(z) → 0`.
+/// Single source for the M3-censored kernels (the closed-form and ODE inner
+/// df-coefficients, the residual-η column, and the cross-curvature terms).
+#[inline]
+pub fn inv_mills(z: f64) -> f64 {
+    let ln_phi = -0.5 * z * z - 0.5 * std::f64::consts::TAU.ln();
+    (ln_phi - log_normal_cdf(z)).exp()
+}
+
+/// Shared M3-censored kernel at a censored row with limit `y`, prediction `f`,
+/// residual variance `v` and `dv_df = ∂v/∂f`: returns `(h, z, m)` where
+/// `z = (y − f)/√v`, `h = φ(z)/Φ(z)` ([`inv_mills`]), and
+/// `m = 1/√v + (y − f)·dv_df / (2·v^{3/2})`.
+///
+/// These three feed every censored derivative so they cannot drift:
+/// the data-term f-coefficient `∂(−logΦ)/∂f = h·m`; the `iiv_on_ruv` residual-η
+/// column `∂(−logΦ)/∂η_ruv = h·z`; and the censored × residual-η cross
+/// coefficients via `C = h·(z² + h·z − 1)` (`C·z`, `C·m`).
+#[inline]
+pub fn m3_censored_kernel(y: f64, f: f64, v: f64, dv_df: f64) -> (f64, f64, f64) {
+    let w = v.sqrt();
+    let z = (y - f) / w;
+    let h = inv_mills(z);
+    let m = 1.0 / w + (y - f) * dv_df / (2.0 * v * w);
+    (h, z, m)
+}
+
 /// Inverse standard normal CDF (quantile / probit function): the `z` such that
 /// `Φ(z) = p`, for `p ∈ (0, 1)`. Peter Acklam's rational approximation, with a
 /// maximum relative error of ~1.15e-9 over the open interval. Returns `-∞` at

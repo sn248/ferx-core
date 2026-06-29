@@ -6282,8 +6282,11 @@ mod tests {
 
     /// Same as `WARFARIN_IOV_TVCOV_ODE`, but with the readout expressed as a
     /// post-walk divisor instead of Form C. The subject has time-varying covariates
-    /// in the event walk (CL changes by WT), while the `obs_scale = V` quotient follows
-    /// production `predict_iov`'s subject-static expression-scale materialisation (#590).
+    /// in the event walk, and the `obs_scale = CL` quotient references **both** the
+    /// TV covariate `WT` and `KAPPA_CL` — so the scale jet would *differ* if it read
+    /// per-event covariates (it must use the subject-static snapshot, like production
+    /// `predict_iov`'s `apply_scaling`) and *differs per occasion group* via κ. A
+    /// covariate- and κ-free scale (`obs_scale = V`) could not distinguish those (#590).
     const WARFARIN_IOV_TVCOV_ODE_EXPRSCALE: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -6301,7 +6304,7 @@ mod tests {
 [odes]
   d/dt(central) = -(CL/V) * central
 [scaling]
-  obs_scale = V
+  obs_scale = CL
 [covariates]
   WT continuous
 [error_model]

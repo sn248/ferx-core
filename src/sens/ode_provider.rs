@@ -340,14 +340,15 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     {
         return false;
     }
-    // An `ExpressionScale` divisor is served only on the **static** walk (the
-    // subject-static quotient via `apply_expression_scale_outer`, #486); a TV-cov scale
-    // would be per-event, which that quotient does not carry. Decline here so an
-    // `ExpressionScale` subject that would otherwise route to the event-driven walk
-    // (TV cov / lagtime / SS / rate-defined-under-`F`) falls back to FD rather than
-    // running the walk *without* applying the scale. (`ode_subject_supported` already
-    // excludes those subjects from the static walk too, so the net effect is FD for the
-    // combination — matching the analytical path's "TV + `ExpressionScale` → FD".)
+    // On this **non-IOV** TV-cov path an `ExpressionScale` divisor is served only on the
+    // **static** walk (the subject-static quotient via `apply_expression_scale_outer`,
+    // #486); the event-driven walk here carries no post-walk scale quotient, so decline
+    // rather than run the walk *without* applying the scale. (The scale itself is
+    // subject-static even for TV-cov subjects — production `apply_scaling` reads
+    // `subject.covariates` — so the IOV walk *does* serve this combination via its
+    // per-occasion-group post-walk quotient since #590; the non-IOV walk just lacks that
+    // machinery. `ode_subject_supported` also excludes these subjects from the static
+    // walk, so the net effect is FD for the non-IOV combination.)
     if matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
         return false;
     }
@@ -1988,6 +1989,31 @@ fn apply_scale_quotient_grad_iov<const N: usize>(o: &mut ObsGrad, s: &Dual1<N>, 
     o.f = f * inv;
 }
 
+/// Build one `ExpressionScale` `obs_scale` jet per occasion group from per-group seeded
+/// PK duals: gather the scale program's referenced PK slots (`slots`) into a scratch
+/// buffer and evaluate the scale via `eval`. Generic over the dual type so the outer
+/// (`Dual2`) and inner (`Dual1`) IOV walks share one jet-assembly loop instead of keeping
+/// two copies in lockstep (#590 review). The per-type difference (`eval_scale_dual` vs
+/// `eval_scale_dual1`) is supplied by the `eval` closure.
+fn build_iov_scale_jets<T: crate::sens::num::PkNum>(
+    groups: &[Vec<T>],
+    slots: &[usize],
+    mut eval: impl FnMut(&[T]) -> T,
+) -> Vec<T> {
+    let mut jets = Vec::with_capacity(groups.len());
+    let mut var_duals: Vec<T> = Vec::with_capacity(slots.len());
+    for seeded in groups {
+        var_duals.clear();
+        var_duals.extend(
+            slots
+                .iter()
+                .map(|&s| seeded.get(s).copied().unwrap_or_else(|| T::from_f64(0.0))),
+        );
+        jets.push(eval(&var_duals));
+    }
+    jets
+}
+
 /// IOV outer (`Dual2<M>`, `M = n_theta + n_eta + K·n_kappa`) sensitivities for an ODE
 /// model — the IOV counterpart of [`run_subject_tvcov`]. Seeds each event's stacked
 /// PK duals at its (occasion, covariate-snapshot) — one source per occasion group when
@@ -2033,6 +2059,13 @@ fn run_subject_iov<const M: usize>(
             ))
         };
 
+    // Build every occasion group's stacked PK seeding at the subject-static covariate
+    // snapshot. Shared by `static_group_dual` (the static-cov event-walk source) and the
+    // `ExpressionScale` scale jets' TV-cov fallback below — one source for both.
+    let build_all_groups = || -> Option<Vec<Vec<Dual2<M>>>> {
+        (0..k_groups).map(|g| seed_group_cov(g, cov)).collect()
+    };
+
     // For static-covariate subjects the per-occasion-group stacked PK seeding is the same
     // source the event walk uses, so build it once here and share it with `seed_iov_events`
     // — no double seeding (#575 review). `None` for TV-cov subjects (each event seeds at
@@ -2040,11 +2073,7 @@ fn run_subject_iov<const M: usize>(
     let static_group_dual: Option<Vec<Vec<Dual2<M>>>> = if subject.has_tv_covariates() {
         None
     } else {
-        Some(
-            (0..k_groups)
-                .map(|g| seed_group_cov(g, cov))
-                .collect::<Option<_>>()?,
-        )
+        Some(build_all_groups()?)
     };
 
     let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual2<M>>(
@@ -2065,30 +2094,19 @@ fn run_subject_iov<const M: usize>(
             deriv: Some(sprog), ..
         } => {
             let eta_bsv = &stacked_eta[..n_eta];
-            let slots = sprog.var_to_pk_slot();
             let owned;
             let groups: &[Vec<Dual2<M>>] = match static_group_dual.as_deref() {
                 Some(groups) => groups,
                 None => {
-                    owned = (0..k_groups)
-                        .map(|g| seed_group_cov(g, cov))
-                        .collect::<Option<Vec<_>>>()?;
+                    owned = build_all_groups()?;
                     &owned
                 }
             };
-            let mut jets = Vec::with_capacity(k_groups);
-            let mut var_duals: Vec<Dual2<M>> = Vec::with_capacity(slots.len());
-            for seeded in groups {
-                var_duals.clear();
-                var_duals.extend(slots.iter().map(|&s| {
-                    seeded
-                        .get(s)
-                        .copied()
-                        .unwrap_or_else(|| Dual2::constant(0.0))
-                }));
-                jets.push(sprog.eval_scale_dual::<M>(theta, eta_bsv, cov, &var_duals));
-            }
-            Some(jets)
+            Some(build_iov_scale_jets::<Dual2<M>>(
+                groups,
+                sprog.var_to_pk_slot(),
+                |var_duals| sprog.eval_scale_dual::<M>(theta, eta_bsv, cov, var_duals),
+            ))
         }
         _ => None,
     };
@@ -2273,16 +2291,19 @@ fn run_subject_iov_eta<const N: usize>(
             Some(seed_pk_dual1_iov::<N>(model, &pk, &cd, g, n_eta, n_kappa))
         };
 
+    // Build every occasion group's stacked PK seeding at the subject-static covariate
+    // snapshot — the inner counterpart of the outer `build_all_groups`. Shared by
+    // `static_group_dual` and the `ExpressionScale` scale jets' TV-cov fallback below.
+    let build_all_groups = || -> Option<Vec<Vec<Dual1<N>>>> {
+        (0..k_groups).map(|g| seed_group_cov(g, cov)).collect()
+    };
+
     // Static-cov per-group seeding built once and shared by the event walk — the inner
     // counterpart of the outer `static_group_dual` (#575 review). `None` for TV-cov subjects.
     let static_group_dual: Option<Vec<Vec<Dual1<N>>>> = if subject.has_tv_covariates() {
         None
     } else {
-        Some(
-            (0..k_groups)
-                .map(|g| seed_group_cov(g, cov))
-                .collect::<Option<_>>()?,
-        )
+        Some(build_all_groups()?)
     };
 
     let (pk_at_dose, pk_at_obs) = seed_iov_events::<Dual1<N>>(
@@ -2301,30 +2322,19 @@ fn run_subject_iov_eta<const N: usize>(
             deriv: Some(sprog), ..
         } => {
             let eta_bsv = &stacked_eta[..n_eta];
-            let slots = sprog.var_to_pk_slot();
             let owned;
             let groups: &[Vec<Dual1<N>>] = match static_group_dual.as_deref() {
                 Some(groups) => groups,
                 None => {
-                    owned = (0..k_groups)
-                        .map(|g| seed_group_cov(g, cov))
-                        .collect::<Option<Vec<_>>>()?;
+                    owned = build_all_groups()?;
                     &owned
                 }
             };
-            let mut jets = Vec::with_capacity(k_groups);
-            let mut var_duals: Vec<Dual1<N>> = Vec::with_capacity(slots.len());
-            for seeded in groups {
-                var_duals.clear();
-                var_duals.extend(slots.iter().map(|&s| {
-                    seeded
-                        .get(s)
-                        .copied()
-                        .unwrap_or_else(|| Dual1::constant(0.0))
-                }));
-                jets.push(sprog.eval_scale_dual1::<N>(theta, eta_bsv, cov, &var_duals));
-            }
-            Some(jets)
+            Some(build_iov_scale_jets::<Dual1<N>>(
+                groups,
+                sprog.var_to_pk_slot(),
+                |var_duals| sprog.eval_scale_dual1::<N>(theta, eta_bsv, cov, var_duals),
+            ))
         }
         _ => None,
     };

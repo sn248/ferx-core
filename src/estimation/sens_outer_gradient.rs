@@ -5308,6 +5308,157 @@ mod tests {
         }
     }
 
+    /// 1-cpt oral **user-ODE** IOV model (κ on CL), the ODE counterpart of
+    /// [`WARFARIN_IOV`]. Drives the ODE IOV M3 outer test below.
+    const ONECPT_ODE_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  ode_reltol  = 1e-10
+  ode_abstol  = 1e-12
+"#;
+
+    /// **ODE** M3 BLOQ + IOV (#486): the ODE counterpart of
+    /// [`iov_m3_packed_gradient_matches_reconverged_fd`]. The full `[θ, Ω_bsv, σ, Ω_iov]`
+    /// analytic packed gradient — assembled from the **event-driven ODE sensitivity walk**
+    /// (`subject_sensitivities_iov` → `ode_subject_sensitivities_iov`) with censored rows
+    /// entering `prepare_stacked`'s M3 branch — must match Richardson reconverged FD of the
+    /// FOCEI IOV marginal. Censoring is provider-agnostic (keyed on `subject.cens[j]`), so
+    /// the only change versus the closed-form path is the dropped gate clause. Both tails.
+    #[test]
+    fn iov_m3_ode_packed_gradient_matches_reconverged_fd() {
+        use crate::estimation::parameterization::pack_params;
+
+        let mut model = parse_model_string(ONECPT_ODE_IOV).expect("parse ODE IOV");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(model.is_ode_based(), "must be on the ODE path");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + M3 must be analytic (#486)"
+        );
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+
+        for right in [false, true] {
+            let subject = if right {
+                iov_m3_subject_right(&model, &theta)
+            } else {
+                iov_m3_subject(&model, &theta)
+            };
+            assert!(
+                subject.cens.iter().any(|&c| c != 0),
+                "subject must be censored"
+            );
+            let template = params.clone();
+            let x = pack_params(&params);
+
+            let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+            let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+                .expect("ODE IOV + M3 packed gradient supported");
+
+            let f = |xx: &[f64]| -> f64 {
+                let p = unpack_params(xx, &template);
+                marginal_nll_iov(&model, &subject, &p)
+            };
+            for i in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[i].abs());
+                let fd_at = |hh: f64| -> f64 {
+                    let mut xp = x.clone();
+                    xp[i] += hh;
+                    let mut xm = x.clone();
+                    xm[i] -= hh;
+                    (f(&xp) - f(&xm)) / (2.0 * hh)
+                };
+                let f1 = fd_at(h);
+                let f2 = fd_at(h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                eprintln!(
+                    "iov+m3 ode (right={right}) packed x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[i],
+                    fd,
+                    (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+                );
+                approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+            }
+        }
+    }
+
+    /// **ODE** FOCE (non-interaction) M3 BLOQ + IOV (#486): the ODE counterpart of
+    /// [`iov_m3_foce_packed_gradient_matches_reconverged_fd`]. Guards the §6 gotcha — the
+    /// ODE FOCE-IOV objective must route censored rows the same way as the closed-form
+    /// path (no silent promotion to interaction; censored rows re-enter as `−logΦ` at the
+    /// population η=0, κ=0 variance). The FOCE packed gradient assembled from the ODE walk
+    /// must match Richardson reconverged FD of `marginal_nll_iov_inter(.., false)`.
+    #[test]
+    fn iov_m3_foce_ode_packed_gradient_matches_reconverged_fd() {
+        use crate::estimation::parameterization::pack_params;
+
+        let mut model = parse_model_string(ONECPT_ODE_IOV).expect("parse ODE IOV");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(model.is_ode_based(), "must be on the ODE path");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_m3_subject(&model, &theta);
+        assert!(
+            subject.cens.iter().any(|&c| c != 0),
+            "subject must be censored"
+        );
+        let template = params.clone();
+        let x = pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
+            .expect("FOCE-ODE-IOV-M3 packed gradient supported");
+
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov_inter(&model, &subject, &p, false)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "iov+m3 foce-ode packed x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[i],
+                fd,
+                (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+            );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+        }
+    }
+
     /// Two-occasion IOV + `iiv_on_ruv` subject (the [`iov_ruv_subject`] geometry) with
     /// occasion 2's two tail observations flagged `CENS = 1` — the **triple**
     /// M3 + IOV + `iiv_on_ruv` (#591). Shallow left-censoring (≈ 0.85·f) keeps the

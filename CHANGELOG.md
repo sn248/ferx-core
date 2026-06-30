@@ -56,7 +56,7 @@ section of the SDLC for the versioning policy).
   observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
   supported and are rejected with a clear error.
 - **Exact analytic gradients for M3 BLOQ + IOV models — full FOCEI/FOCE matrix**
-  (closed-form 1/2/3-cpt, #580/#591/#486). An inter-occasion-variability model with M3
+  (closed-form 1/2/3-cpt and user-ODE, #580/#591/#486). An inter-occasion-variability model with M3
   below-limit handling now runs on exact analytic sensitivities instead of finite
   differences across the whole estimator matrix: **FOCEI**, **non-interaction FOCE**, and
   the triple **M3 + IOV + `iiv_on_ruv`**. The censored data term `−logΦ((LLOQ−f)/√v)` and
@@ -69,7 +69,11 @@ section of the SDLC for the versioning policy).
   Inner stacked-η gradients match central FD of the IOV inner objective and outer packed
   gradients match Richardson reconverged FD of the corresponding marginal, all to ~1e-3;
   estimate-level tests confirm the analytic fits land on the FD (NONMEM-anchored) optima.
-  Only the **ODE** M3 + IOV + `iiv_on_ruv` triple still routes to FD.
+  This applies equally to **user-ODE** models (#486): the event-driven ODE sensitivity walk
+  emits the standard per-observation shape, and censoring is applied downstream keyed on the
+  `CENS` flag, so M3 + IOV on an `[odes]` model rides the exact same analytic assembly as the
+  closed-form path (inner and outer FD-comparison tests on a censored ODE-IOV fixture confirm
+  both tails). Only the **ODE** M3 + IOV + `iiv_on_ruv` triple still routes to FD.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose

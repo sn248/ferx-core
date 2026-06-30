@@ -6390,6 +6390,45 @@ mod tests {
         );
     }
 
+    /// ODE M3 BLOQ + IOV scope (#486): the ODE-path counterpart of
+    /// [`iov_analytical_supported_admits_m3_but_not_the_ruv_triple`]. After the gate flip,
+    /// `ode_iov_supported` admits M3 (censoring is provider-agnostic — it rides the same
+    /// stacked `[η_bsv, κ]` assembly as the closed-form path), so `iov_sens_supported`
+    /// follows. The ODE **triple** M3 + IOV + `iiv_on_ruv` stays FD via the residual-eta
+    /// clause. LTBS still declines.
+    #[test]
+    fn ode_iov_supported_admits_m3_but_not_the_ruv_triple() {
+        let mut model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some(), "must be an ODE model");
+        // Plain ODE IOV: analytic.
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        // M3 + ODE IOV (no iiv_on_ruv): analytic as of #486.
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + M3 must be on the analytic path (#486)"
+        );
+        assert!(
+            iov_sens_supported(&model),
+            "iov_sens_supported follows ode_iov_supported"
+        );
+        // The ODE triple M3 + IOV + iiv_on_ruv stays FD (residual-eta clause).
+        model.residual_error_eta = Some(2);
+        assert!(
+            !crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + M3 + iiv_on_ruv (the triple) stays FD"
+        );
+        // LTBS still declines (the in-walk transform is not composed with the post-walk
+        // quotient on the IOV path).
+        model.residual_error_eta = None;
+        model.log_transform = true;
+        assert!(
+            !crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + M3 + LTBS stays FD"
+        );
+    }
+
     #[test]
     fn ode_iov_expr_scale_provider_matches_fd_of_predict_iov() {
         let model = parse_model_string(WARFARIN_IOV_ODE_EXPRSCALE).expect("parse expr-scale IOV");

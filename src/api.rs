@@ -1245,13 +1245,19 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
-            if !matches!(m, EstimationMethod::Foce | EstimationMethod::Saem) {
+            if !matches!(
+                m,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::Saem
+                    | EstimationMethod::Imp
+            ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce and method = saem only. FOCEI, GN, and \
-                         importance-sampling paths still use diagonal residual-error derivatives.",
+                         method = foce, focei, saem, and imp only. The gn / gn_hybrid \
+                         Gauss-Newton paths still use diagonal residual-error derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -7231,8 +7237,9 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
-    // block_sigma correlated residual errors are wired into ordinary Gaussian
-    // FOCE and SAEM; every other method in the chain must be rejected up front.
+    // block_sigma correlated residual errors are wired into the Gaussian FOCE,
+    // FOCEI, SAEM, and IMP paths; the Gauss-Newton (gn / gn_hybrid) methods still
+    // use diagonal residual-error derivatives and must be rejected up front.
     #[test]
     fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
         let mut model =
@@ -7243,28 +7250,39 @@ mod iov_integration {
             rho: 0.5,
         }];
 
-        // FOCEI is rejected.
-        let opts = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, true);
+        // gn (Gauss-Newton) is rejected.
+        let opts = fast_opts(EstimationMethod::FoceGn, Optimizer::Bobyqa, true);
         let diags = super::check_model_options(&model, &opts);
         let d = diags
             .iter()
             .find(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED")
-            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for FOCEI");
-        assert!(d.is_error() && d.message.contains("method = foce") && d.message.contains("saem"));
+            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for gn");
+        assert!(d.is_error() && d.message.contains("focei") && d.message.contains("gn"));
 
-        // SAEM is accepted for the ordinary Gaussian subset.
-        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
-        assert!(!super::check_model_options(&model, &saem)
+        // gn_hybrid is likewise rejected.
+        let hybrid = fast_opts(EstimationMethod::FoceGnHybrid, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &hybrid)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-        // Plain FOCE is accepted (no block_sigma diagnostic).
-        let foce = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
-        assert!(!super::check_model_options(&model, &foce)
-            .iter()
-            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+        // FOCE, FOCEI, SAEM, and IMP are all accepted (no method diagnostic).
+        for method in [
+            EstimationMethod::Foce,
+            EstimationMethod::FoceI,
+            EstimationMethod::Saem,
+            EstimationMethod::Imp,
+        ] {
+            let opts = fast_opts(method, Optimizer::Bobyqa, false);
+            assert!(
+                !super::check_model_options(&model, &opts)
+                    .iter()
+                    .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"),
+                "block_sigma must be accepted for {method:?}"
+            );
+        }
 
         model.n_kappa = 1;
+        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
         assert!(super::check_model_options(&model, &saem)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
@@ -7417,6 +7435,98 @@ mod iov_integration {
         assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
     }
 
+    // Importance sampling must accept a correlated $SIGMA block: the weights use
+    // the dense residual covariance (obs_nll_subject_into) and the Student-t
+    // proposal precision is built from R⁻¹ (compute_posterior_hessian dense
+    // branch). A short evaluation-only run must produce a finite marginal.
+    #[test]
+    fn test_imp_accepts_block_sigma_cross_endpoint() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0) FIX
+  theta TVV(10.0, 1.0, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+        )
+        .expect("cross-endpoint block_sigma ODE model parses");
+
+        let mut subjects = Vec::new();
+        for (id, dose_amt, obs) in [
+            ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
+            ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 1.0, 2.0, 2.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 2, 1, 2],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 4],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        // No method diagnostic for IMP + block_sigma.
+        let mut opts = fast_opts(EstimationMethod::Imp, Optimizer::Bobyqa, false);
+        assert!(!super::check_model_options(&model, &opts)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+
+        // Evaluation-only marginal at the initial params (fast + deterministic).
+        opts.imp_eval_only = true;
+        opts.imp_samples = 200;
+        opts.imp_iterations = 1;
+        opts.imp_seed = Some(7);
+        let result = fit(&model, &population, &model.default_params, &opts)
+            .expect("IMP eval with cross-endpoint block_sigma should succeed");
+        assert!(result.ofv.is_finite(), "IMP block_sigma OFV must be finite");
+    }
+
     // Regression: the SAEM final OFV (computed via `2·pop_nll` with
     // `interaction = true`) must include the block_sigma cross-endpoint
     // covariance. The interaction Laplace accumulator builds R diagonally, so
@@ -7512,6 +7622,98 @@ mod iov_integration {
         assert!(
             (saem_ofv - foce_ofv).abs() < 1e-3,
             "SAEM OFV {saem_ofv} must match FOCE OFV {foce_ofv} (block_sigma correlation dropped?)"
+        );
+    }
+
+    // FOCEI with a correlated $SIGMA block must (a) evaluate to a finite OFV and
+    // (b) genuinely apply the interaction correction — i.e. differ from the FOCE
+    // (non-interaction) OFV on an f-dependent (combined) error model. Before #616
+    // the only correlated objective was the FOCE marginal, so the interaction term
+    // was unavailable (FOCEI was rejected up front). Fixed params → maxiter 0 just
+    // evaluates the OFV at the typical values, so this stays fast.
+    #[test]
+    fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+",
+        )
+        .expect("fixed-param block_sigma combined model parses");
+
+        let mut subjects = Vec::new();
+        for (id, obs) in [
+            ("1", vec![9.5, 8.0, 6.2]),
+            ("2", vec![10.5, 7.4, 5.6]),
+            ("3", vec![8.8, 7.9, 6.7]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 2.0, 4.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 3],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let eval = |method, interaction| {
+            let mut opts = fast_opts(method, Optimizer::Bobyqa, false);
+            opts.outer_maxiter = 0;
+            opts.interaction = interaction;
+            fit(&model, &population, &model.default_params, &opts)
+                .expect("block_sigma evaluation succeeds")
+                .ofv
+        };
+
+        let focei_ofv = eval(EstimationMethod::FoceI, true);
+        let foce_ofv = eval(EstimationMethod::Foce, false);
+
+        assert!(
+            focei_ofv.is_finite(),
+            "FOCEI block_sigma OFV must be finite"
+        );
+        // The interaction term (½·log|H̃| with the dense ∂R/∂η curvature) shifts
+        // the OFV away from the non-interaction marginal on a combined model.
+        assert!(
+            (focei_ofv - foce_ofv).abs() > 1e-4,
+            "FOCEI OFV {focei_ofv} must differ from FOCE OFV {foce_ofv} (interaction dropped?)"
         );
     }
 

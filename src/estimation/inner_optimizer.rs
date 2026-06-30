@@ -1503,7 +1503,7 @@ fn residual_inner_obs(
     sigma: &[f64],
     ruv_scale: f64,
     ruv_active: bool,
-    is_cens: bool,
+    cens: i8,
 ) -> Option<(f64, f64)> {
     let mut v = model.residual_variance_at(cmt, f, sigma);
     let mut dv_df = model.error_spec.dvar_df(cmt, f, sigma);
@@ -1514,8 +1514,10 @@ fn residual_inner_obs(
     if !(v > 0.0) {
         return None;
     }
-    let (coef, ruv_term) = if is_cens {
-        let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
+    let (coef, ruv_term) = if cens != 0 {
+        // Signed kernel: right-censored (`cens < 0`) rows use the upper tail, so
+        // `h·m` / `h·z` match `individual_nll_iov`'s `m3_logcdf` data term.
+        let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df, cens);
         (h * m, if ruv_active { h * z } else { 0.0 })
     } else {
         let ruv_term = if ruv_active {
@@ -1533,8 +1535,8 @@ fn residual_inner_obs(
 /// `m3_censored_dterm_df_matches_fd` unit test.
 #[cfg(test)]
 #[inline]
-fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
-    let (h, _z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
+fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> f64 {
+    let (h, _z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df, cens);
     h * m
 }
 
@@ -1597,7 +1599,11 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let mut grad = vec![0.0_f64; n_eta];
     let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
-        let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
+        let cens = if m3 {
+            subject.cens.get(j).copied().unwrap_or(0)
+        } else {
+            0
+        };
         let (coef, ruv_term) = residual_inner_obs(
             model,
             subject.obs_cmts[j],
@@ -1606,7 +1612,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             sigma,
             ruv_scale,
             ruv_active,
-            is_cens,
+            cens,
         )?;
         for k in 0..n_eta {
             grad[k] += coef * obs.df_deta[k];
@@ -1681,9 +1687,14 @@ fn analytic_eta_nll_gradient_iov(
     let mut grad = vec![0.0_f64; n_stacked];
     let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
-        let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
+        let cens = if m3 {
+            subject.cens.get(j).copied().unwrap_or(0)
+        } else {
+            0
+        };
         // The residual logic is shared with the non-IOV inner via `residual_inner_obs`
         // so the two cannot drift (Gaussian coef + `1 − ε²/v`, or the M3-censored `h·m`).
+        // The signed `cens` makes right-censored rows use the upper tail.
         let (coef, ruv_term) = residual_inner_obs(
             model,
             subject.obs_cmts[j],
@@ -1692,7 +1703,7 @@ fn analytic_eta_nll_gradient_iov(
             sigma,
             ruv_scale,
             ruv_active,
-            is_cens,
+            cens,
         )?;
         for (p, g) in grad.iter_mut().enumerate() {
             *g += coef * obs.df_deta[p];
@@ -2552,7 +2563,7 @@ mod tests {
         for (f, sig_add, sig_prop) in cases {
             let v = sig_add * sig_add + sig_prop * sig_prop * f * f;
             let dv_df = 2.0 * sig_prop * sig_prop * f; // ∂v/∂f
-            let analytic = m3_censored_dterm_df(lloq, f, v, dv_df);
+            let analytic = m3_censored_dterm_df(lloq, f, v, dv_df, 1);
             // `normal_cdf` is a rational approximation (~1.5e-7 abs error); a tiny
             // FD step amplifies that noise (noise/h), so use a moderate step where
             // truncation and approximation error both sit well under the band.
@@ -4229,6 +4240,113 @@ mod iov_tests {
         // Richardson-extrapolated central FD: the censored `−logΦ` term has sharp
         // curvature on the occasion-2 κ axis, so plain central FD is truncation-limited
         // (~2e-4) there — Richardson removes it and validates the analytic to ~1e-7.
+        for p in 0..n_stacked {
+            let h = 1e-5 * (1.0 + stacked[p].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut sp = stacked.clone();
+                sp[p] += hh;
+                let mut sm = stacked.clone();
+                sm[p] -= hh;
+                (nll(&sp) - nll(&sm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-5, epsilon = 1e-6);
+        }
+    }
+
+    /// Right-censored (above-ULOQ, `CENS = -1`) regression for the analytic IOV+M3
+    /// inner gradient. The objective `individual_nll_iov` scores these rows with the
+    /// **upper** tail (`m3_logcdf`, `z = (f − ULOQ)/√v`); the analytic gradient must use
+    /// the same tail. Before the signed `m3_censored_kernel` (review of #591) the kernel
+    /// always took the lower tail, so this gradient was wrong-signed for `CENS = -1` and
+    /// `find_ebe_iov` pushed the EBE the wrong way. Same model/fixture as
+    /// `iov_m3_inner_grad_matches_fd` with the occasion-2 tail flipped to `CENS = -1`.
+    #[test]
+    fn iov_m3_right_censored_inner_grad_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        let mut model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + M3");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(crate::sens::provider::iov_analytical_supported(&model));
+
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 6],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            // Occasion-2 tail is M3 *right*-censored (above ULOQ): upper tail.
+            cens: vec![0, 0, 0, 0, -1, -1],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        // Carry ULOQ at 0.85·f for the censored rows, so z = (f − ULOQ)/√v ≈ +0.15·f/√v
+        // sits in the moderate upper-tail regime (Φ(z) well away from 0/1), where the
+        // A&S `log_normal_cdf` and the exact φ in `inv_mills` agree to FD precision.
+        let preds = crate::pk::predict_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &[0.12, -0.08, 0.2],
+            &[vec![0.05], vec![-0.07]],
+        );
+        subject.observations = preds.iter().map(|p| p * 0.85).collect();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let k = iov_occasion_groups(&subject).len();
+        let n_stacked = n_eta + k * n_kappa;
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+        let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
+        assert_eq!(stacked.len(), n_stacked);
+
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            n_eta,
+            n_kappa,
+            k,
+        )
+        .expect("analytic IOV + M3 inner gradient (right-censored)");
+
+        let nll = |s: &[f64]| -> f64 {
+            let eta_t = &s[..n_eta];
+            let kappas: Vec<Vec<f64>> = (0..k)
+                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+                .collect();
+            individual_nll_iov(
+                &model,
+                &subject,
+                &params.theta,
+                eta_t,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
         for p in 0..n_stacked {
             let h = 1e-5 * (1.0 + stacked[p].abs());
             let fd_at = |hh: f64| -> f64 {

@@ -63,24 +63,33 @@ struct ErrTerms {
     /// True for an M3-censored row. The residual-eta blocks read the censored
     /// `ruv_cz`/`ruv_cm` coefficients instead of the Gaussian `2ε²/R`/`ruv_kappa`.
     censored: bool,
+    /// Raw NONMEM `CENS` sign for this row (`0` quantified, `>0` below-LLOQ /
+    /// lower tail, `<0` above-ULOQ / upper tail). The σ-block's FD of the
+    /// censored df-coefficient must re-evaluate the kernel on the same tail, so
+    /// the sign is carried here rather than re-read from the subject.
+    cens_sign: i8,
 }
 
 /// All M3-censored-row coefficients from a **single** [`m3_censored_kernel`] eval:
 /// `(g1, g2, cz, cm)` = `(∂L/∂f, ∂²L/∂f², C·z, C·m)` for `L = −logΦ(z)`,
-/// `z = (y−f)/√R`, `(h, z, m)` the kernel, `C = h(z²+h·z−1)`:
+/// `z = σ·(y−f)/√R` (`σ = sign(cens)`), `(h, z, m)` the signed kernel,
+/// `C = h(z²+h·z−1)`:
 /// ```text
 ///   g1 = h·m
-///   g2 = h(h+z)·m² + h·∂m/∂f,   ∂m/∂f = [−2d + (y−f)d2]/(2w³) − 3(y−f)d²/(4w⁵)
+///   g2 = h(h+z)·m² + h·∂m/∂f,   ∂m/∂f = σ·{[−2d + (y−f)d2]/(2w³) − 3(y−f)d²/(4w⁵)}
 ///   (cz, cm) = (C·z, C·m)       (residual-eta cross coefficients, `iiv_on_ruv`)
 /// ```
-/// One kernel (one `erfc`/`exp` pair) per censored row instead of two.
-fn m3_censored_outer(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64, f64, f64) {
-    let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, r, d);
+/// `z` and `m` carry the tail sign from the kernel; `∂m/∂f` is signed here by the
+/// same `σ` so the curvature matches the upper tail for right-censored
+/// (`cens < 0`) rows. One kernel (one `erfc`/`exp` pair) per censored row.
+fn m3_censored_outer(y: f64, f: f64, r: f64, d: f64, d2: f64, cens: i8) -> (f64, f64, f64, f64) {
+    let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, r, d, cens);
+    let sgn = if cens < 0 { -1.0 } else { 1.0 };
     let w = r.sqrt();
     let w3 = r * w; // w³
     let w5 = r * r * w; // w⁵
     let g1 = h * m;
-    let dm_df = (-2.0 * d + (y - f) * d2) / (2.0 * w3) - 3.0 * (y - f) * d * d / (4.0 * w5);
+    let dm_df = sgn * ((-2.0 * d + (y - f) * d2) / (2.0 * w3) - 3.0 * (y - f) * d * d / (4.0 * w5));
     let g2 = h * (h + z) * m * m + h * dm_df;
     let c = h * (z * z + h * z - 1.0);
     (g1, g2, c * z, c * m)
@@ -91,16 +100,16 @@ fn m3_censored_outer(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64, f64,
 /// [`m3_censored_outer`]. Delegates so the formula stays single-sourced.
 #[cfg(test)]
 #[inline]
-fn m3_censored_scalars(y: f64, f: f64, r: f64, d: f64, d2: f64) -> (f64, f64) {
-    let (g1, g2, _, _) = m3_censored_outer(y, f, r, d, d2);
+fn m3_censored_scalars(y: f64, f: f64, r: f64, d: f64, d2: f64, cens: i8) -> (f64, f64) {
+    let (g1, g2, _, _) = m3_censored_outer(y, f, r, d, d2, cens);
     (g1, g2)
 }
 
 /// `g1 = ∂L/∂f = h·m` only (one kernel, no `g2` `pow` work) — for the censored
 /// σ-block FD, which differences `g1` and never needs `g2`.
 #[inline]
-fn m3_censored_g1(y: f64, f: f64, v: f64, dv_df: f64) -> f64 {
-    let (h, _z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df);
+fn m3_censored_g1(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> f64 {
+    let (h, _z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df, cens);
     h * m
 }
 
@@ -128,6 +137,7 @@ fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
         ruv_cz: 0.0,
         ruv_cm: 0.0,
         censored: false,
+        cens_sign: 0,
     }
 }
 
@@ -157,21 +167,25 @@ fn censored_sigma_m_terms(
     ruv_cz: f64,
     r: f64,
     has_ruv: bool,
+    cens: i8,
 ) -> (f64, f64, f64) {
     let s = ruv_scale;
     let es = &model.error_spec;
     let vp = es.variance_at(cmt, f, sp);
     let vm = es.variance_at(cmt, f, sm);
-    let g1p = m3_censored_g1(y, f, vp * s, es.dvar_df(cmt, f, sp) * s);
-    let g1m = m3_censored_g1(y, f, vm * s, es.dvar_df(cmt, f, sm) * s);
+    let g1p = m3_censored_g1(y, f, vp * s, es.dvar_df(cmt, f, sp) * s, cens);
+    let g1m = m3_censored_g1(y, f, vm * s, es.dvar_df(cmt, f, sm) * s, cens);
     let dg1 = (g1p - g1m) / (2.0 * h);
     let ruv_sig = if has_ruv {
         0.5 * ruv_cz * (s * (vp - vm) / (2.0 * h)) / r
     } else {
         0.0
     };
-    let l_sig = (-crate::stats::special::log_normal_cdf((y - f) / (vp * s).sqrt())
-        + crate::stats::special::log_normal_cdf((y - f) / (vm * s).sqrt()))
+    // Data σ-term `∂(−logΦ(z))/∂σ` by central FD of the censored log-CDF. Uses the
+    // tail-correct `m3_logcdf` (upper tail when `cens < 0`) so right-censored rows
+    // match the objective; for `cens ≥ 0` this is the historical lower-tail form.
+    let l_sig = (-crate::stats::likelihood::m3_logcdf(y, f, (vp * s).sqrt(), cens)
+        + crate::stats::likelihood::m3_logcdf(y, f, (vm * s).sqrt(), cens))
         / (2.0 * h);
     (dg1, ruv_sig, l_sig)
 }
@@ -316,7 +330,8 @@ fn prepare_stacked(
         let d = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
         let d2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
         let y = subject.observations[j];
-        let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        let is_cens = m3 && cens != 0;
         // For a censored row the data term is `−logΦ(z)`: store its f-derivatives
         // as `alpha = 2·g1`, `alpha_p = 2·g2` (so the assembly's `½α`, `½α'` recover
         // `∂L/∂f`, `∂²L/∂f²`) and force `p = β = 0` (excluded from `H̃` / `log|H̃|`).
@@ -328,7 +343,7 @@ fn prepare_stacked(
             // blocks still exclude censored rows (they exclude *all* censored rows,
             // matching `gaussian_foce_accum`).
             // One kernel eval for all four censored coefficients.
-            let (g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2);
+            let (g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2, cens);
             let (ruv_cz, ruv_cm) = if ruv.is_some() { (cz, cm) } else { (0.0, 0.0) };
             ErrTerms {
                 r,
@@ -341,6 +356,7 @@ fn prepare_stacked(
                 ruv_cz,
                 ruv_cm,
                 censored: true,
+                cens_sign: cens,
             }
         } else {
             err_terms(r, d, d2, y - f)
@@ -717,6 +733,7 @@ fn sigma_block(
                     prep.et[j].ruv_cz,
                     prep.et[j].r,
                     prep.ruv.is_some(),
+                    prep.et[j].cens_sign,
                 );
                 fixed += l_sig;
                 for m in 0..n_eta {
@@ -1225,9 +1242,10 @@ pub fn subject_packed_gradient_foce(
     // Mills ratio h and the population variance / its f-derivative per row.
     struct Cens {
         j: usize,
-        resid: f64, // LLOQ − f(η̂)
+        resid: f64, // limit − f(η̂)
         w: f64,     // √R⁰
-        h: f64,     // φ(z)/Φ(z)
+        h: f64,     // φ(z)/Φ(z) at the signed tail z = σ·resid/w
+        sgn: f64,   // tail sign σ: +1 below-LLOQ, −1 above-ULOQ
         d0: f64,    // ∂R⁰/∂f at f(η=0)
         f0act: f64, // f(η=0)
         cmt: usize,
@@ -1235,7 +1253,8 @@ pub fn subject_packed_gradient_foce(
     let mut cens: Vec<Cens> = Vec::new();
     if m3 {
         for j in 0..n_obs {
-            if subject.cens.get(j).copied().unwrap_or(0) == 0 {
+            let cens_sign = subject.cens.get(j).copied().unwrap_or(0);
+            if cens_sign == 0 {
                 continue;
             }
             let cmt = subject.obs_cmts[j];
@@ -1246,11 +1265,16 @@ pub fn subject_packed_gradient_foce(
             }
             let w = r0c.sqrt();
             let resid = subject.observations[j] - sens.obs[j].f;
+            // σ = +1 below-LLOQ (lower tail), −1 above-ULOQ (upper tail); the signed
+            // z = σ·resid/w matches `m3_logcdf`, and every censored gradient term below
+            // carries the same σ.
+            let sgn = if cens_sign < 0 { -1.0 } else { 1.0 };
             cens.push(Cens {
                 j,
                 resid,
                 w,
-                h: crate::stats::special::inv_mills(resid / w),
+                h: crate::stats::special::inv_mills(sgn * resid / w),
+                sgn,
                 d0: model.error_spec.dvar_df(cmt, f0act, sigma),
                 f0act,
                 cmt,
@@ -1298,7 +1322,7 @@ pub fn subject_packed_gradient_foce(
         for c in &cens {
             let bhat = sens.obs[c.j].df_dtheta[m];
             let dr0 = c.d0 * sens0.obs[c.j].df_dtheta[m];
-            nat += c.h * (bhat / c.w + c.resid * dr0 / (2.0 * c.w * c.w * c.w));
+            nat += c.sgn * c.h * (bhat / c.w + c.resid * dr0 / (2.0 * c.w * c.w * c.w));
         }
         let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
             params.theta[m]
@@ -1356,7 +1380,7 @@ pub fn subject_packed_gradient_foce(
             let dr0 = (model.error_spec.variance_at(c.cmt, c.f0act, &sp)
                 - model.error_spec.variance_at(c.cmt, c.f0act, &sm))
                 / (2.0 * hsig);
-            nat += c.h * c.resid * dr0 / (2.0 * c.w * c.w * c.w);
+            nat += c.sgn * c.h * c.resid * dr0 / (2.0 * c.w * c.w * c.w);
         }
         fixed[sigma_start + k] = nat * sigma[k];
     }
@@ -1382,7 +1406,7 @@ pub fn subject_packed_gradient_foce(
         let udku = u.dot(&(&dkojt * &u));
         let mut ck = u.dot(&pk) + tr - udku;
         for c in &cens {
-            ck += c.h * sens.obs[c.j].df_deta[k] / c.w;
+            ck += c.sgn * c.h * sens.obs[c.j].df_deta[k] / c.w;
         }
         coupling[k] = ck;
     }
@@ -1595,6 +1619,7 @@ pub fn subject_eta_dx_iov(
                     prep.et[j].ruv_cz,
                     prep.et[j].r,
                     prep.ruv.is_some(),
+                    prep.et[j].cens_sign,
                 );
                 for m in 0..n_st {
                     mvec[m] += dg1 * obs.df_deta[m];
@@ -1717,13 +1742,15 @@ pub fn subject_packed_gradient_foce_iov(
         d0[i] = model.error_spec.dvar_df(cmt, f0act, sigma);
     }
 
-    // Censored rows: `−logΦ(z)`, z = (LLOQ − f̂)/√R⁰. Precompute the inverse Mills ratio
-    // h and the population (η=0, κ=0) variance / its f-derivative per row.
+    // Censored rows: `−logΦ(z)`, z = σ·(limit − f̂)/√R⁰ (σ = +1 below-LLOQ / lower tail,
+    // −1 above-ULOQ / upper tail). Precompute the inverse Mills ratio h at the signed
+    // tail and the population (η=0, κ=0) variance / its f-derivative per row.
     struct Cens {
         j: usize,
-        resid: f64, // LLOQ − f̂
+        resid: f64, // limit − f̂
         w: f64,     // √R⁰
-        h: f64,     // φ(z)/Φ(z)
+        h: f64,     // φ(z)/Φ(z) at the signed tail z = σ·resid/w
+        sgn: f64,   // tail sign σ: +1 below-LLOQ, −1 above-ULOQ
         d0: f64,    // ∂R⁰/∂f at f(η=0, κ=0)
         f0act: f64, // f(η=0, κ=0)
         cmt: usize,
@@ -1731,7 +1758,8 @@ pub fn subject_packed_gradient_foce_iov(
     let mut cens: Vec<Cens> = Vec::new();
     if m3 {
         for j in 0..n_obs {
-            if subject.cens.get(j).copied().unwrap_or(0) == 0 {
+            let cens_sign = subject.cens.get(j).copied().unwrap_or(0);
+            if cens_sign == 0 {
                 continue;
             }
             let cmt = subject.obs_cmts[j];
@@ -1742,11 +1770,13 @@ pub fn subject_packed_gradient_foce_iov(
             }
             let w = r0c.sqrt();
             let resid = subject.observations[j] - sens.obs[j].f;
+            let sgn = if cens_sign < 0 { -1.0 } else { 1.0 };
             cens.push(Cens {
                 j,
                 resid,
                 w,
-                h: crate::stats::special::inv_mills(resid / w),
+                h: crate::stats::special::inv_mills(sgn * resid / w),
+                sgn,
                 d0: model.error_spec.dvar_df(cmt, f0act, sigma),
                 f0act,
                 cmt,
@@ -1792,7 +1822,7 @@ pub fn subject_packed_gradient_foce_iov(
         for c in &cens {
             let bhat = sens.obs[c.j].df_dtheta[m];
             let dr0 = c.d0 * sens0.obs[c.j].df_dtheta[m];
-            nat += c.h * (bhat / c.w + c.resid * dr0 / (2.0 * c.w * c.w * c.w));
+            nat += c.sgn * c.h * (bhat / c.w + c.resid * dr0 / (2.0 * c.w * c.w * c.w));
         }
         let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
             params.theta[m]
@@ -1842,7 +1872,7 @@ pub fn subject_packed_gradient_foce_iov(
             let dr0 = (model.error_spec.variance_at(c.cmt, c.f0act, &sp)
                 - model.error_spec.variance_at(c.cmt, c.f0act, &sm))
                 / (2.0 * hsig);
-            nat += c.h * c.resid * dr0 / (2.0 * c.w * c.w * c.w);
+            nat += c.sgn * c.h * c.resid * dr0 / (2.0 * c.w * c.w * c.w);
         }
         fixed[sigma_start + kk] = nat * sigma[kk];
     }
@@ -1878,7 +1908,7 @@ pub fn subject_packed_gradient_foce_iov(
         let udku = u.dot(&(&dkojt * &u));
         let mut ck = u.dot(&pk) + tr - udku;
         for c in &cens {
-            ck += c.h * sens.obs[c.j].df_deta[kk] / c.w;
+            ck += c.sgn * c.h * sens.obs[c.j].df_deta[kk] / c.w;
         }
         coupling[kk] = ck;
     }
@@ -1978,6 +2008,7 @@ pub fn subject_eta_dx(
                     prep.et[j].ruv_cz,
                     prep.et[j].r,
                     prep.ruv.is_some(),
+                    prep.et[j].cens_sign,
                 );
                 for m in 0..n_eta {
                     mvec[m] += dg1 * obs.df_deta[m];
@@ -2310,7 +2341,7 @@ mod tests {
                 // (g1, g2) = (∂L/∂f, ∂²L/∂f²): the censored `−logΦ` scalars for an
                 // M3 BLOQ row, else the Gaussian `½α`, `½α'`.
                 let (g1, g2) = if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-                    m3_censored_scalars(y, f, r, d, d2)
+                    m3_censored_scalars(y, f, r, d, d2, subject.cens.get(j).copied().unwrap_or(0))
                 } else {
                     let t = err_terms(r, d, d2, y - f);
                     (0.5 * t.alpha, 0.5 * t.alpha_p)
@@ -2691,7 +2722,7 @@ mod tests {
                 let eps = y - f;
                 let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
                 let (g1, g2) = if is_cens {
-                    m3_censored_scalars(y, f, r, d, d2)
+                    m3_censored_scalars(y, f, r, d, d2, subject.cens.get(j).copied().unwrap_or(0))
                 } else {
                     let t = err_terms(r, d, d2, eps);
                     (0.5 * t.alpha, 0.5 * t.alpha_p)
@@ -2707,7 +2738,13 @@ mod tests {
                 // rows use the M3 cross-terms `h·z` / `C·z` / `C·m·a` (#4c); quantified
                 // rows the Gaussian `1−ε²/R` / `2ε²/R` / `κ a` (#474).
                 if is_cens {
-                    let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, r, d);
+                    let (h, z, m) = crate::stats::special::m3_censored_kernel(
+                        y,
+                        f,
+                        r,
+                        d,
+                        subject.cens.get(j).copied().unwrap_or(0),
+                    );
                     let c = h * (z * z + h * z - 1.0);
                     grad[rr] += h * z;
                     hess[(rr, rr)] += c * z;
@@ -4810,7 +4847,7 @@ mod tests {
                 // reconverged EBE (and the marginal FD built on it) would be wrong.
                 let is_cens = m3 && subject.cens.get(j).copied().unwrap_or(0) != 0;
                 let (g1, g2) = if is_cens {
-                    m3_censored_scalars(y, f, r, d, d2)
+                    m3_censored_scalars(y, f, r, d, d2, subject.cens.get(j).copied().unwrap_or(0))
                 } else {
                     let t = err_terms(r, d, d2, eps);
                     (0.5 * t.alpha, 0.5 * t.alpha_p)
@@ -4832,8 +4869,21 @@ mod tests {
                 // M3 + IOV + `iiv_on_ruv` inner objective `find_ebe_iov` minimises.
                 if let Some(rr) = ruv_idx {
                     if is_cens {
-                        let (h_im, z_k, _m) = crate::stats::special::m3_censored_kernel(y, f, r, d);
-                        let (_g1, _g2, cz, cm) = m3_censored_outer(y, f, r, d, d2);
+                        let (h_im, z_k, _m) = crate::stats::special::m3_censored_kernel(
+                            y,
+                            f,
+                            r,
+                            d,
+                            subject.cens.get(j).copied().unwrap_or(0),
+                        );
+                        let (_g1, _g2, cz, cm) = m3_censored_outer(
+                            y,
+                            f,
+                            r,
+                            d,
+                            d2,
+                            subject.cens.get(j).copied().unwrap_or(0),
+                        );
                         g[rr] += h_im * z_k;
                         h[(rr, rr)] += cz;
                         for ll in 0..n_st {
@@ -5150,6 +5200,17 @@ mod tests {
         subject
     }
 
+    /// As [`iov_m3_subject`] but the occasion-2 tail is **right**-censored
+    /// (`CENS = -1`, above ULOQ) — exercises the upper-tail (`σ = -1`) branch of the
+    /// signed `m3_censored_kernel` / FOCE `Cens` terms.
+    fn iov_m3_subject_right(model: &CompiledModel, theta: &[f64]) -> Subject {
+        let mut subject = iov_subject_outer(model, theta);
+        let n = subject.observations.len();
+        subject.cens[n - 2] = -1;
+        subject.cens[n - 1] = -1;
+        subject
+    }
+
     /// M3 BLOQ + IOV (#580): the analytic IOV FOCEI θ-gradient (censored rows carry
     /// `p = β = 0` so they leave `H̃`/`log|H̃|` exactly as `foce_subject_nll_iov`
     /// builds it, and re-enter via the `−logΦ` data term + true inner Hessian over the
@@ -5363,6 +5424,94 @@ mod tests {
                 fd,
                 (analytic[i] - fd).abs() / fd.abs().max(1e-9)
             );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// Right-censored (`CENS = -1`) regression of the **FOCEI** IOV+M3 packed gradient.
+    /// The signed `m3_censored_outer` feeds the upper-tail `(g1, g2, C·z, C·m)` into the
+    /// stacked assembly; the gradient must match Richardson reconverged FD of the FOCEI
+    /// marginal (upper-tail `m3_logcdf`). Mirror of
+    /// `iov_m3_packed_gradient_matches_reconverged_fd` with the tail flipped.
+    #[test]
+    fn iov_m3_right_censored_packed_gradient_matches_reconverged_fd() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_m3_subject_right(&model, &theta);
+        assert!(
+            subject.cens.iter().any(|&c| c < 0),
+            "must be right-censored"
+        );
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            .expect("IOV + M3 packed gradient supported");
+
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov(&model, &subject, &p)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// Right-censored (`CENS = -1`) regression of the **FOCE** (non-interaction) IOV+M3
+    /// packed gradient: the hand-written censored `Cens` θ/σ/η̂-coupling terms in
+    /// `subject_packed_gradient_foce_iov` each carry the tail sign `σ`, so the gradient
+    /// must match Richardson reconverged FD of the FOCE-IOV-M3 marginal for above-ULOQ
+    /// rows. Mirror of `iov_m3_foce_packed_gradient_matches_reconverged_fd`.
+    #[test]
+    fn iov_m3_foce_right_censored_packed_gradient_matches_reconverged_fd() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_m3_subject_right(&model, &theta);
+        assert!(
+            subject.cens.iter().any(|&c| c < 0),
+            "must be right-censored"
+        );
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
+            .expect("FOCE-IOV-M3 packed gradient supported");
+
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov_inter(&model, &subject, &p, false)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
             approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
         }
     }

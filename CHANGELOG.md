@@ -327,6 +327,16 @@ section of the SDLC for the versioning policy).
   The covariance / SIR step now runs only on the last *estimating* stage;
   evaluation-only IMP (`imp_eval_only`) still cedes the step to the preceding
   estimator as before. Plain chains without IMP were already correct.
+- **M3 BLOQ above-ULOQ (right-censored, `CENS = -1`) handling under FOCE and the analytic
+  gradients** (#591). The non-interaction FOCE marginal (`foce_subject_nll_standard`) and
+  the analytic FOCE/FOCEI censored-row sensitivities (inner EBE gradient, outer
+  θ/Ω/σ gradient, and the `iiv_on_ruv` cross-terms) hardcoded the lower (below-LLOQ) tail,
+  so an above-ULOQ observation was scored and differentiated with the wrong normal tail —
+  giving a wrong FOCE objective and a wrong-signed EBE/parameter gradient for any dataset
+  with `CENS = -1` rows. The censored kernels and the FOCE marginal are now tail-aware
+  (selecting `z = (f − ULOQ)/√v` for `CENS < 0`, matching `m3_logcdf`). This also repairs
+  the pre-existing **non-IOV** M3 right-censored gradient/objective (the bug predated the
+  IOV work). Left-censored (`CENS = 1`) results are unchanged.
 - **A time-dependent individual parameter written with the `TIME` built-in
   inside a conditional-expression RHS now switches** (e.g.
   `MAINT = if (TIME > 45) 1 else 0`). The "uses TIME" flag that routes such a

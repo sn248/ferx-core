@@ -221,6 +221,10 @@ fn iov_saem_smoke_returns_finite_ofv() {
 // `resolve_scaling`): with it, pure FOCEI/SLSQP from the cold default start reaches
 // OFV 307.84 and omega_iov climbs to ≈0.046, matching the default BOBYQA.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
     let focei = run_single(EstimationMethod::FoceI, Optimizer::Slsqp);
     assert!(

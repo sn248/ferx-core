@@ -528,6 +528,26 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Analytic sensitivity gradients for moving infusion-end boundaries: modeled
+  duration / rate doses and `zero_order(dur)` absorption** (#530). Three dosing
+  features previously routed both the outer (θ/Ω/σ) and inner (EBE η) FOCE/FOCEI
+  gradients to finite differences because the infusion *end* time is a moving
+  boundary in an estimated parameter: a `RATE=-2` (`D{cmt}`, modeled duration) or
+  `RATE=-1` (`R{cmt}`, modeled rate) dose (end `t_dose + D` resp. `t_dose + amt/R`),
+  and a `zero_order(dur)` absorption forcing (end `t_dose + dur`). The dual walk now
+  resolves the modeled rate/window from its PK slot as a live jet and carries the
+  boundary derivative via the rate-off **event-time saltation** — the exact
+  sign-mirror of the estimated-lagtime dose-*start* saltation (#472). Modeled
+  duration/rate doses ride the event-driven walk; `zero_order(dur)` is delivered as a
+  per-segment constant window (like an infusion) on the static walk, with the
+  saltation injected at its cutoff. So these fits take the exact `Dual2`/`Dual1`
+  gradient (the estimates are unchanged; the gradient is faster and Hessian-clean).
+  Validated against finite differences of the production predictor, with the modeled
+  parameter η-coupled so both the θ- and η-blocks of the moving-boundary term are
+  checked, plus inner/outer scope parity. Still FD: a *steady-state* modeled dose
+  (the SS equilibration reads a fixed per-cycle window), and modeled doses /
+  `zero_order` combined with IOV, an estimated lagtime, or an EVID 3/4 reset (those
+  combinations route to FD upstream).
 - **Analytic sensitivity gradients for ODE IOV models with an `ExpressionScale`
   `obs_scale` divisor** (#575). An `[odes]` model combining IOV (occasion `kappa`)
   with an η-dependent `obs_scale = expr` (e.g. `obs_scale = V1`) previously routed

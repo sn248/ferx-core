@@ -386,6 +386,34 @@ fn ebe_guard_rejects(
     raw_ofv.is_finite() && frac > max_unconverged_frac && max_unconverged_frac >= 0.0
 }
 
+/// Objective value for a guard-rejected outer step, **consistent** with the center-push
+/// gradient `g[i] = 100·(xs[i] − c[i])` (`c` = scaled bound midpoint) returned alongside it.
+///
+/// NLopt's gradient line search (More-Thuente) reconciles `f` and `∇f`: it interpolates on
+/// both, so the returned objective must integrate the returned gradient. The historical
+/// pairing — flat `f = 1e20` with a non-zero center-push gradient — violates that
+/// (`∇(const) = 0 ≠ center-push`), and on a stiff objective whose **first** optimizer step
+/// overshoots straight into the EBE guard (ODE + `iiv_on_ruv`: a large step diverges the
+/// inner EBEs and overflows the `exp(2·η_ruv)` marginal) the line search fails on iteration
+/// one, before any curvature is built. Returning the quadratic bowl `BASE + 50·Σ(xs − c)²`
+/// — whose gradient is exactly the `100·(xs − c)` center-push — lets the line search
+/// backtrack to a feasible step. `BASE` is a wall far above any feasible OFV yet low enough
+/// that the quadratic term stays f64-resolvable (the old `1e20` swamped it). Only the
+/// gradient optimizers need this; derivative-free BOBYQA keeps the flat `1e20` wall.
+fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
+    const BASE: f64 = 1e12;
+    let pen: f64 = xs
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            let c = (lower_s[i] + upper_s[i]) / 2.0;
+            let d = x - c;
+            d * d
+        })
+        .sum();
+    BASE + 50.0 * pen
+}
+
 fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     if !enabled {
         return false;
@@ -988,12 +1016,19 @@ fn optimize_nlopt(
             }
         }
 
-        let ofv = if ebe_guard_triggered {
-            1e20
-        } else if raw_ofv.is_finite() {
-            raw_ofv
+        // Guard-rejected (EBE guard or non-finite OFV). For the gradient optimizers return
+        // a quadratic penalty consistent with the center-push gradient below, so NLopt's
+        // line search can backtrack instead of failing on a first-step overshoot (#486; see
+        // `guard_penalty_value`). Derivative-free BOBYQA (`grad` is `None`) keeps the wall.
+        let guarded = ebe_guard_triggered || !raw_ofv.is_finite();
+        let ofv = if guarded {
+            if grad.is_some() {
+                guard_penalty_value(xs, &lower_s, &upper_s)
+            } else {
+                1e20
+            }
         } else {
-            1e20
+            raw_ofv
         };
 
         // Compute gradient if requested (central FD with fixed EBEs)
@@ -1003,7 +1038,7 @@ fn optimize_nlopt(
             // ascent toward bounds center nudges the optimizer back. Fall through (no early
             // return) so the eval is still traced and prev_x / stagnation stay correct,
             // just skipping the expensive population gradient (#603 review #5).
-            if ebe_guard_triggered || !raw_ofv.is_finite() {
+            if guarded {
                 for i in 0..g.len() {
                     let center_s = (lower_s[i] + upper_s[i]) / 2.0;
                     g[i] = 100.0 * (xs[i] - center_s);
@@ -1308,12 +1343,17 @@ fn optimize_nlopt(
                     acc.n_convergence_warnings += 1;
                 }
             }
-            let ofv = if ebe_guard2 {
-                1e20
-            } else if raw_ofv.is_finite() {
-                raw_ofv
+            // Consistent guard penalty for the gradient line search (mirrors the primary
+            // closure / `guard_penalty_value`); flat `1e20` wall for derivative-free callers.
+            let guarded = ebe_guard2 || !raw_ofv.is_finite();
+            let ofv = if guarded {
+                if grad.is_some() {
+                    guard_penalty_value(xs, &lower_s, &upper_s)
+                } else {
+                    1e20
+                }
             } else {
-                1e20
+                raw_ofv
             };
 
             let mut grad_norm_for_trace: Option<f64> = None;
@@ -1323,7 +1363,7 @@ fn optimize_nlopt(
                 // stall this PR targets also reaches the SLSQP fallback — #603 review #3),
                 // and falls through to the shared bookkeeping so the eval stays traced
                 // (#603 review #5).
-                if ebe_guard2 || !raw_ofv.is_finite() {
+                if guarded {
                     for i in 0..g.len() {
                         let center_s = (lower_s[i] + upper_s[i]) / 2.0;
                         g[i] = 100.0 * (xs[i] - center_s);
@@ -4023,6 +4063,43 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// The guard-rejected objective (`guard_penalty_value`) must **integrate** the
+    /// center-push gradient `g[i] = 100·(xs[i] − c[i])` the closures return alongside it —
+    /// otherwise NLopt's More-Thuente line search cannot reconcile `f` and `∇f` and fails on
+    /// a first-step overshoot (#486, the ODE + `iiv_on_ruv` LBFGS failure). Pin the
+    /// consistency (central FD of the value matches the center-push) and the wall height.
+    #[test]
+    fn guard_penalty_value_integrates_the_center_push_gradient() {
+        let lower = vec![-2.0, -1.0, 0.0, -5.0];
+        let upper = vec![2.0, 3.0, 4.0, 1.0];
+        let xs = vec![0.5, -0.3, 1.7, -2.1];
+        let n = xs.len();
+        let centers: Vec<f64> = (0..n).map(|i| (lower[i] + upper[i]) / 2.0).collect();
+        for i in 0..n {
+            // The center-push gradient the closures pair with the penalty value.
+            let analytic = 100.0 * (xs[i] - centers[i]);
+            // Central FD of the exactly-quadratic penalty is exact at any step; use a large
+            // `h` so the penalty change clears the f64 ULP floor of the `1e12` base
+            // (a tiny `h` would lose the derivative to catastrophic cancellation).
+            let h = 0.25;
+            let mut xp = xs.clone();
+            xp[i] += h;
+            let mut xm = xs.clone();
+            xm[i] -= h;
+            let fd = (guard_penalty_value(&xp, &lower, &upper)
+                - guard_penalty_value(&xm, &lower, &upper))
+                / (2.0 * h);
+            approx::assert_relative_eq!(analytic, fd, max_relative = 1e-3, epsilon = 1e-2);
+        }
+        // A wall: far above any feasible OFV, so a guarded point is never mistaken for best.
+        assert!(guard_penalty_value(&xs, &lower, &upper) > 1e11);
+        // Minimised at the bound midpoint (the center-push fixed point).
+        assert!(
+            guard_penalty_value(&centers, &lower, &upper)
+                < guard_penalty_value(&xs, &lower, &upper)
+        );
+    }
 
     /// #603 review #1/#2/#8: the centralised EBE guard. A hard reject forces rejection
     /// unconditionally; otherwise the fraction trigger behaves as before.

@@ -2793,9 +2793,12 @@ impl CompiledModel {
     /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
     /// combined alike.
     /// One predicate in the `iiv_on_ruv` × {plain | IOV | M3} × {closed-form | ODE}
-    /// routing decision: `true` only for **ODE M3 BLOQ + `iiv_on_ruv`** (the censored
-    /// × residual-eta cross-terms are implemented in the shared assembly, #4c, but the
-    /// ODE path is not yet regression-tested for that combo, so it stays on FD).
+    /// routing decision: `true` only for **non-IOV ODE M3 BLOQ + `iiv_on_ruv`** (the
+    /// censored × residual-eta cross-terms are implemented in the shared assembly, #4c).
+    /// The *IOV* ODE M3 + `iiv_on_ruv` triple is analytic and regression-tested as of #486
+    /// (the ODE IOV walk emits a zero `∂f/∂η_ruv` column, so the shared assembly's variance
+    /// scaling and residual-eta column apply unchanged); only the **non-IOV** ODE variant
+    /// stays on FD pending its own regression coverage — hence the `n_kappa == 0` guard.
     ///
     /// **This is NOT the single source of truth for the full routing** — the decision
     /// is spread across several predicates that must move together, so a future scope
@@ -2810,14 +2813,18 @@ impl CompiledModel {
     /// - [`analytical_supported`](crate::sens::provider::analytical_supported)
     ///   (closed-form M3 + `iiv_on_ruv`, #4c).
     ///
-    /// Net effect today: analytic for **closed-form M3 + `iiv_on_ruv`** (#4c) and
-    /// **closed-form IOV + `iiv_on_ruv`** (#4b/#474); FD for ODE M3 + `iiv_on_ruv`
-    /// (here) and ODE IOV + `iiv_on_ruv` (via `ode_iov_supported`).
+    /// Net effect today: analytic for **closed-form M3 + `iiv_on_ruv`** (#4c),
+    /// **closed-form IOV + `iiv_on_ruv`** (#4b/#474), and **ODE IOV + `iiv_on_ruv`**
+    /// incl. the M3 triple (#486, via `ode_iov_supported`); FD only for **non-IOV** ODE
+    /// M3 + `iiv_on_ruv` (here).
     #[inline]
     pub fn iiv_on_ruv_forces_fd(&self) -> bool {
         self.residual_error_eta.is_some()
             && matches!(self.bloq_method, BloqMethod::M3)
             && self.ode_spec.is_some()
+            // The IOV variant (`n_kappa > 0`) is analytic + tested as of #486; only the
+            // non-IOV ODE M3 + `iiv_on_ruv` combo remains on FD.
+            && self.n_kappa == 0
     }
 
     /// Whether a custom residual-error magnitude (#484) is active. The

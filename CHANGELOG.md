@@ -69,11 +69,15 @@ section of the SDLC for the versioning policy).
   Inner stacked-η gradients match central FD of the IOV inner objective and outer packed
   gradients match Richardson reconverged FD of the corresponding marginal, all to ~1e-3;
   estimate-level tests confirm the analytic fits land on the FD (NONMEM-anchored) optima.
-  This applies equally to **user-ODE** models (#486): the event-driven ODE sensitivity walk
-  emits the standard per-observation shape, and censoring is applied downstream keyed on the
-  `CENS` flag, so M3 + IOV on an `[odes]` model rides the exact same analytic assembly as the
-  closed-form path (inner and outer FD-comparison tests on a censored ODE-IOV fixture confirm
-  both tails). Only the **ODE** M3 + IOV + `iiv_on_ruv` triple still routes to FD.
+  This applies equally to **user-ODE** models (#486), including the triple **M3 + IOV +
+  `iiv_on_ruv`**: the event-driven ODE sensitivity walk emits the standard per-observation
+  shape (with a structural zero `∂f/∂η_ruv` column for the residual-error η), and the
+  censoring and `exp(2·η_ruv)` variance scaling are applied downstream keyed on the `CENS`
+  flag and `residual_error_eta`, so the ODE path rides the exact same analytic assembly as
+  the closed-form path (inner and outer FD-comparison tests on censored ODE-IOV fixtures
+  confirm both tails for plain IOV, M3 + IOV, IOV + `iiv_on_ruv`, and the full triple). The
+  only `iiv_on_ruv` × M3 combination still on finite differences is the **non-IOV** ODE
+  variant.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
@@ -330,6 +334,19 @@ section of the SDLC for the versioning policy).
   reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
 
 ### Fixed
+- **Gradient optimizers no longer fail on a first-step overshoot into the EBE guard**
+  (#486). When the outer optimizer's inner EBE loop rejected a trial step (too many
+  unconverged subjects, or a non-finite OFV), the objective was clamped to a flat `1e20`
+  while the gradient was set to a non-zero "push back toward the bound centre" vector — an
+  objective/gradient pair NLopt's L-BFGS / SLSQP line search cannot reconcile (the slope of
+  a constant is zero). For most fits this was harmless because the guard only triggers deep
+  in the run; but a model whose **first** optimizer step overshoots straight into the guard
+  (notably ODE models with `iiv_on_ruv`, where a large step diverges the inner EBEs and
+  overflows the `exp(2·η_ruv)` marginal) failed on iteration one and never moved off the
+  initial estimates. The guard now returns a quadratic penalty whose gradient *is* the
+  push-back vector, so the line search backtracks to a feasible step and the fit proceeds.
+  This makes the analytic **M3 + IOV + `iiv_on_ruv`** triple on ODE models (#486) converge
+  under the default gradient optimizer, matching the closed-form fit to estimator precision.
 - **Estimation-method chains now run the covariance step only once, at the end of
   the chain** (#615). When a chain ended in a *default (estimating)* IMP stage
   (e.g. `methods = [saem, imp]`), both the preceding estimator and the IMP stage

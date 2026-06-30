@@ -1147,7 +1147,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // (which all consume `indiv_var_names` / `indiv_stmts`) so the synthetic params
     // get slots, values, and partials like any individual parameter. Only `y`
     // readouts are scanned; `obs_scale` θ/η stays with `ScaleDerivProgram`.
-    let readout_synth_params: Vec<ReadoutSynthParam> = if is_ode {
+    let mut readout_synth_params: Vec<ReadoutSynthParam> = if is_ode {
         match blocks.get("scaling") {
             Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)?,
             None => Vec::new(),
@@ -1155,10 +1155,46 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     } else {
         Vec::new()
     };
+    // #486 — the `__ferx_ro_` prefix is reserved for these synthetic params.
+    // Reject a user/generated parameter that carries it rather than silently
+    // misclassifying it as internal (it would vanish from EBE/sdtab output and be
+    // rejected as an unknown output column by `is_synthetic_readout_param`).
+    if let Some(bad) = all_assigned
+        .iter()
+        .chain(theta_names.iter())
+        .chain(eta_names.iter())
+        .find(|n| is_synthetic_readout_param(n.as_str()))
+    {
+        return Err(format!(
+            "parameter name `{bad}` uses the reserved `{READOUT_SYNTH_PREFIX}` prefix, which ferx \
+             reserves for internal Form-C readout parameters (#486). Rename it."
+        ));
+    }
+    // #486 slot headroom: each synthetic readout param consumes a PK slot. A model
+    // that previously parsed via the FD fallback (where a direct θ/η in the readout
+    // took no slot) must not start failing the fixed PK-slot layout now. If
+    // the synthetics would overflow, keep the readout on the FD fallback (its prior
+    // behaviour) instead of erroring, and note it.
+    let mut readout_fd_fallback_note: Option<String> = None;
+    if !readout_synth_params.is_empty() {
+        let free = ode_free_slot_count(&indiv_var_names);
+        if readout_synth_params.len() > free {
+            let short = readout_synth_params.len() - free;
+            readout_fd_fallback_note = Some(format!(
+                "[scaling] y: a direct THETA/ETA reference in the readout needs {short} more PK \
+                 slot(s) than the {}-slot layout has free; the readout falls back to \
+                 finite-difference sensitivities. For analytic sensitivities, free up {short} \
+                 individual-parameter slot(s).",
+                crate::types::MAX_PK_PARAMS,
+            ));
+            readout_synth_params.clear();
+        }
+    }
     for s in &readout_synth_params {
-        // The synthetic name is reserved (`__ferx_ro_`) and BTreeSet-deduped, so it
-        // cannot collide with a user parameter; append it as a trailing individual
-        // parameter (value = θ_i / η_k, ∂p/∂θ_i = 1 / ∂p/∂η_k = 1).
+        // The synthetic name carries the reserved `__ferx_ro_` prefix (rejected for
+        // user params by the guard above) and is BTreeSet-deduped, so it cannot
+        // collide; append it as a trailing individual parameter (value = θ_i / η_k,
+        // ∂p/∂θ_i = 1 / ∂p/∂η_k = 1).
         indiv_var_names.push(s.name.clone());
         let rhs = if s.is_eta {
             Expression::Eta(s.idx)
@@ -2315,6 +2351,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
     // reported as unused in mixed PK+TTE models.
+    // #486 — surface the FD fallback when a direct-θ/η readout could not be
+    // desugared because the PK-slot layout was full (see the headroom check above).
+    if let Some(note) = readout_fd_fallback_note.take() {
+        model.parse_warnings.push(note);
+    }
+
     model.parse_warnings.extend(check_unused_parameters(
         &thetas,
         &eta_names_bsv,
@@ -6164,6 +6206,27 @@ fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
     }
 
     Ok(slots)
+}
+
+/// Number of additional individual parameters that can still be assigned a
+/// non-reserved PK slot, given the already-declared `names`. Returns 0 if `names`
+/// itself does not fit (the real error then surfaces in `ode_param_slots`).
+/// Reuses `ode_param_slots` so the headroom can never drift from the real
+/// assignment. Used by the #486 readout desugaring to fall back to FD rather than
+/// fail a model that previously parsed, when synthetic readout params would
+/// overflow the layout.
+fn ode_free_slot_count(names: &[String]) -> usize {
+    let slots = match ode_param_slots(names) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut taken = [false; MAX_PK_PARAMS];
+    for s in slots {
+        taken[s] = true;
+    }
+    (0..MAX_PK_PARAMS)
+        .filter(|s| !taken[*s] && !RESERVED_PK_SLOTS.contains(s))
+        .count()
 }
 
 /// Find `name(` at a word boundary in `s` (ASCII), returning the index of `name`.
@@ -21409,6 +21472,106 @@ if (WT > 70) {
                 .iter()
                 .any(|w| w.contains("computed but never used")),
             "synthetic readout params must not trip the unused-parameter census, got: {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// #486 headroom helper: `ode_free_slot_count` reports how many non-reserved PK
+    /// slots remain, reusing the real `ode_param_slots` assignment so it can never
+    /// drift from it.
+    #[test]
+    fn ode_free_slot_count_reports_headroom() {
+        // 16 slots − 2 reserved (F, lagtime) = 14 usable.
+        assert_eq!(ode_free_slot_count(&[]), 14);
+        // CL→0, V→1 are non-reserved canonical slots, leaving 12.
+        assert_eq!(
+            ode_free_slot_count(&["CL".to_string(), "V".to_string()]),
+            12
+        );
+        // 14 non-canonical params exactly fill the layout → 0 free; one more still 0
+        // (`ode_param_slots` errors, and the headroom is reported as full).
+        let full: Vec<String> = (0..14).map(|i| format!("EXTRA{i}")).collect();
+        assert_eq!(ode_free_slot_count(&full), 0);
+        let over: Vec<String> = (0..15).map(|i| format!("EXTRA{i}")).collect();
+        assert_eq!(ode_free_slot_count(&over), 0);
+    }
+
+    /// #486: the `__ferx_ro_` prefix is reserved for synthetic readout params, so a
+    /// user/generated parameter carrying it is rejected at parse time rather than
+    /// being silently misclassified as internal (and dropped from output).
+    #[test]
+    fn test_form_c_reserved_prefix_param_rejected() {
+        let src =
+            ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"))
+                .replace("  KA = TVKA\n", "  KA = TVKA\n  __ferx_ro_x = TVKA\n");
+        let err = parse_model_string(&src)
+            .expect_err("a user parameter using the reserved __ferx_ro_ prefix must be rejected");
+        assert!(
+            err.contains("reserved") && err.contains("__ferx_ro_"),
+            "expected a reserved-prefix error, got: {err}"
+        );
+    }
+
+    /// #486 regression: a model that previously parsed (direct-θ readout served by the
+    /// FD fallback) must not start failing the 16-slot PK layout once desugaring is
+    /// available. When the synthetic param has no free slot, the readout falls back to
+    /// FD (its prior behaviour) with a warning, instead of erroring.
+    #[test]
+    fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
+        // CL, V, KA take 3 of the 14 usable slots; 11 extra top-level params fill the
+        // remaining 11 → zero headroom. A direct-θ readout would need one more.
+        let extras: String = (0..11).map(|i| format!("  EXTRA{i} = TVV\n")).collect();
+        let src = format!(
+            "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+{extras}
+[structural_model]
+  ode(states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 10
+  gradient = fd
+
+[scaling]
+  y = central / V * TVCL
+"
+        );
+        let model = parse_model_string(&src)
+            .expect("a slot-full model with a direct-θ readout must still parse (FD fallback)");
+
+        // No synthetic param was injected — desugaring stood down for lack of a slot.
+        assert!(
+            !model
+                .indiv_param_names
+                .iter()
+                .any(|n| is_synthetic_readout_param(n)),
+            "desugaring must not consume a slot it does not have"
+        );
+        // The fallback is surfaced, not silent.
+        assert!(
+            model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("finite-difference")),
+            "the FD fallback must be warned about, got: {:?}",
             model.parse_warnings
         );
     }

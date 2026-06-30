@@ -318,6 +318,12 @@ pub const PK_IDX_F: usize = 5;
 pub const PK_IDX_Q3: usize = 6;
 pub const PK_IDX_V3: usize = 7;
 pub const PK_IDX_LAGTIME: usize = 8;
+/// Transit-compartment count `n` (Savic continuous-N) for the analytic
+/// `one_cpt_transit` absorption model (#386). Lives in the spare slot region
+/// (≥9); only that model reads it, so it does not shrink ODE structural headroom.
+pub const PK_IDX_N: usize = 9;
+/// Mean transit time `mtt` for the analytic `one_cpt_transit` model (#386).
+pub const PK_IDX_MTT: usize = 10;
 
 /// The engine-reserved PK slots: bioavailability (`F`) and absorption lag
 /// (`lagtime`). `ode_param_slots` keeps these free for an undeclared F/lagtime
@@ -522,6 +528,15 @@ impl PkParams {
     pub fn ka(&self) -> f64 {
         self.values[PK_IDX_KA]
     }
+    /// Transit-compartment count `n` (Savic continuous-N) for the analytic
+    /// `one_cpt_transit` model (#386); `0` for every other model.
+    pub fn n_transit(&self) -> f64 {
+        self.values[PK_IDX_N]
+    }
+    /// Mean transit time `mtt` for the analytic `one_cpt_transit` model (#386).
+    pub fn mtt(&self) -> f64 {
+        self.values[PK_IDX_MTT]
+    }
     pub fn f_bio(&self) -> f64 {
         self.values[PK_IDX_F]
     }
@@ -571,6 +586,9 @@ impl PkParams {
             "q3" => Some(PK_IDX_Q3),
             "v3" => Some(PK_IDX_V3),
             "lagtime" | "alag" => Some(PK_IDX_LAGTIME),
+            // Savic transit-absorption params for `pk one_cpt_transit` (#386).
+            "n" => Some(PK_IDX_N),
+            "mtt" => Some(PK_IDX_MTT),
             _ => None,
         }
     }
@@ -1176,6 +1194,10 @@ impl ModelParameters {
 pub enum PkModel {
     OneCptIv,
     OneCptOral,
+    /// 1-cpt with Savic transit-compartment absorption via the analytic
+    /// exponential-tilting closed form (#386). Requires `cl`, `v`, `n` (transit
+    /// count), `mtt` (mean transit time); `f`/`lagtime` optional as for oral.
+    OneCptTransit,
     TwoCptIv,
     TwoCptOral,
     ThreeCptIv,
@@ -1196,6 +1218,12 @@ impl PkModel {
         match self {
             PkModel::OneCptIv => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v")],
             PkModel::OneCptOral => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_KA, "ka")],
+            PkModel::OneCptTransit => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v"),
+                (PK_IDX_N, "n"),
+                (PK_IDX_MTT, "mtt"),
+            ],
             PkModel::TwoCptIv => &[
                 (PK_IDX_CL, "cl"),
                 (PK_IDX_V, "v1"),
@@ -1240,6 +1268,7 @@ impl PkModel {
         match self {
             PkModel::OneCptIv => "one_cpt_iv",
             PkModel::OneCptOral => "one_cpt_oral",
+            PkModel::OneCptTransit => "one_cpt_transit",
             PkModel::TwoCptIv => "two_cpt_iv",
             PkModel::TwoCptOral => "two_cpt_oral",
             PkModel::ThreeCptIv => "three_cpt_iv",
@@ -1265,6 +1294,10 @@ impl PkModel {
             // Oral: cmt 1 = depot (zero-order-into-depot, #400), cmt 2 = central
             // (depot-bypassing infusion).
             PkModel::OneCptOral => &[1, 2],
+            // Transit models a bolus absorbed through the Gamma transit chain;
+            // modeled-duration infusions are unsupported in v1, so a `D{cmt}` on a
+            // transit model is rejected at parse (#386).
+            PkModel::OneCptTransit => &[],
             PkModel::TwoCptIv => &[1, 2],
             PkModel::TwoCptOral => &[1, 2],
             PkModel::ThreeCptIv => &[1, 2, 3],
@@ -1286,6 +1319,7 @@ impl PkModel {
         match name {
             "one_cpt_iv" | "one_compartment_iv" => Some(PkModel::OneCptIv),
             "one_cpt_oral" | "one_compartment_oral" => Some(PkModel::OneCptOral),
+            "one_cpt_transit" | "one_compartment_transit" => Some(PkModel::OneCptTransit),
             "two_cpt_iv" | "two_compartment_iv" => Some(PkModel::TwoCptIv),
             "two_cpt_oral" | "two_compartment_oral" => Some(PkModel::TwoCptOral),
             "three_cpt_iv" | "three_compartment_iv" => Some(PkModel::ThreeCptIv),
@@ -1294,13 +1328,21 @@ impl PkModel {
         }
     }
 
-    /// Whether this is a first-order-absorption (oral) model. Oral models read
-    /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
-    /// IV bolus/infusion doses too.) The canonical home for this predicate.
+    /// Whether this is an **absorption** model — the dose enters an input
+    /// compartment (cmt 1) and is absorbed into central (cmt 2), as opposed to IV
+    /// (dose directly into central, cmt 1). True for first-order oral *and* the
+    /// `one_cpt_transit` model. The name is historical: what it gates is the
+    /// compartment layout / dose routing, not `ka` specifically (oral reads `ka`,
+    /// transit reads `n`/`mtt`; which slots a model actually consumes is
+    /// [`PkModel::consumes_pk_slot`] via [`PkModel::required_pk_params`], not this
+    /// predicate). (`f` is read by every model since #327 — it scales IV doses too.)
     pub(crate) fn is_oral(&self) -> bool {
         matches!(
             self,
-            PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+            PkModel::OneCptOral
+                | PkModel::OneCptTransit
+                | PkModel::TwoCptOral
+                | PkModel::ThreeCptOral
         )
     }
 
@@ -1497,6 +1539,75 @@ impl ErrorSpec {
                         }
                         if let Some(&i) = ep.sigma_idx.get(1) {
                             out.push((i, 1.0));
+                        }
+                        out
+                    }
+                },
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
+    /// parallel in shape to [`sigma_loadings`].
+    ///
+    /// Every loading coefficient is affine in the prediction `f`: the
+    /// proportional slot loads `f` (slope `1`), the additive slot loads the
+    /// constant `1` (slope `0`). Returning the slopes with the *same slot
+    /// presence* as [`sigma_loadings`] lets the dense-`R` derivative
+    /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
+    /// bilinear cross-covariance assembly with the value loadings replaced by
+    /// these slopes — the off-diagonal `R` is linear in each observation's
+    /// loadings, so `∂R_jk/∂f_j = cross(slopes_j, values_k)`.
+    pub fn sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> Vec<(usize, f64)> {
+        match self {
+            ErrorSpec::Single(em) => match em {
+                ErrorModel::Additive => {
+                    if n_sigma > 0 {
+                        vec![(0, 0.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Proportional => {
+                    if n_sigma > 0 {
+                        vec![(0, 1.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Combined => {
+                    let mut out = Vec::with_capacity(2);
+                    if n_sigma > 0 {
+                        out.push((0, 1.0));
+                    }
+                    if n_sigma > 1 {
+                        out.push((1, 0.0));
+                    }
+                    out
+                }
+            },
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => match ep.error_model {
+                    ErrorModel::Additive => ep
+                        .sigma_idx
+                        .first()
+                        .copied()
+                        .map(|i| vec![(i, 0.0)])
+                        .unwrap_or_default(),
+                    ErrorModel::Proportional => ep
+                        .sigma_idx
+                        .first()
+                        .copied()
+                        .map(|i| vec![(i, 1.0)])
+                        .unwrap_or_default(),
+                    ErrorModel::Combined => {
+                        let mut out = Vec::with_capacity(2);
+                        if let Some(&i) = ep.sigma_idx.first() {
+                            out.push((i, 1.0));
+                        }
+                        if let Some(&i) = ep.sigma_idx.get(1) {
+                            out.push((i, 0.0));
                         }
                         out
                     }
@@ -2899,6 +3010,7 @@ impl CompiledModel {
         match self.pk_model {
             PkModel::OneCptIv => names!(ONE_CMT_IV, "central"),
             PkModel::OneCptOral => names!(ONE_CMT_ORAL, "depot", "central"),
+            PkModel::OneCptTransit => names!(ONE_CMT_TRANSIT, "depot", "central"),
             PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
             PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
             PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
@@ -3395,6 +3507,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // "falls back to" intentionally removed: no emitted message uses that exact
         // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
         (WarningSeverity::Info, "gradient_fallback")
+    } else if lower.contains("not mu-referenced") {
+        (WarningSeverity::Warning, "mu_referencing")
     } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
         (WarningSeverity::Info, "mu_referencing")
     } else if lower.contains("global_search disabled") {
@@ -5160,6 +5274,14 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
+    /// Transit (`OneCptTransit`) descriptors: canonical name, the analytic 2-state
+    /// `[depot, central]` layout, and no modeled-duration infusions (#386).
+    #[test]
+    fn one_cpt_transit_descriptors() {
+        assert_eq!(PkModel::OneCptTransit.canonical_name(), "one_cpt_transit");
+        assert!(PkModel::OneCptTransit.infusable_compartments().is_empty());
+    }
+
     /// `sim_residual_variance` must split FREM covariate pseudo-observations
     /// (FREMTYPE>0) off the PK error model: they use the additive covariate
     /// sigma (EPSCOV) and ignore the IIV-on-RUV scaling, while ordinary PK rows
@@ -5492,6 +5614,16 @@ mod tests {
     }
 
     #[test]
+    fn classify_warning_saem_non_mu_ref_is_warning() {
+        let w = classify_warning(
+            "SAEM: individual parameter(s) not mu-referenced: V. This can strongly \
+             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+        );
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category, "mu_referencing");
+    }
+
+    #[test]
     fn classify_warning_strips_chain_prefix() {
         let w = classify_warning("[FOCEI] Covariance step failed");
         assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
@@ -5634,6 +5766,12 @@ mod tests {
             ),
             ("mu-ref: CL, V, KA", Info, "mu_referencing"),
             (
+                "SAEM: individual parameter(s) not mu-referenced: V. This can strongly \
+                 affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+                Warning,
+                "mu_referencing",
+            ),
+            (
                 "Multi-start: best result from start 3/8",
                 Info,
                 "multi_start",
@@ -5743,7 +5881,11 @@ mod tests {
                 Critical,
                 "covariance_step",
             ),
-            ("[SAEM] mu-ref: CL", Info, "mu_referencing"),
+            (
+                "[SAEM] individual parameter(s) not mu-referenced: V",
+                Warning,
+                "mu_referencing",
+            ),
             (
                 "[FOCEI] Outer optimization did not converge",
                 Critical,
@@ -6526,6 +6668,53 @@ mod tests {
         assert_eq!(spec.sigma_loadings(1, 7.0, 4), vec![(2, 7.0), (3, 1.0)]);
         assert_eq!(spec.sigma_loadings(2, 7.0, 4), vec![(0, 1.0)]);
         assert!(spec.sigma_loadings(9, 7.0, 4).is_empty());
+    }
+
+    #[test]
+    fn sigma_loading_slopes_match_loading_shape_with_f_derivatives() {
+        // Slopes have the SAME slot presence as `sigma_loadings` but carry
+        // ∂coeff/∂f: 0 for the additive (constant) slot, 1 for the proportional
+        // slot. This keeps the dense-R ∂R/∂f cross-covariance assembly consistent.
+        let add = ErrorSpec::Single(ErrorModel::Additive);
+        assert_eq!(add.sigma_loading_slopes(0, 1), vec![(0, 0.0)]);
+        assert!(add.sigma_loading_slopes(0, 0).is_empty());
+
+        let prop = ErrorSpec::Single(ErrorModel::Proportional);
+        assert_eq!(prop.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
+        assert!(prop.sigma_loading_slopes(0, 0).is_empty());
+
+        let comb = ErrorSpec::Single(ErrorModel::Combined);
+        assert_eq!(comb.sigma_loading_slopes(0, 2), vec![(0, 1.0), (1, 0.0)]);
+        assert_eq!(comb.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
+
+        // PerCmt dispatch over global sigma indices, mirroring sigma_loadings.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            1usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![2, 3],
+            },
+        );
+        map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        map.insert(
+            3usize,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        assert_eq!(spec.sigma_loading_slopes(1, 4), vec![(2, 1.0), (3, 0.0)]);
+        assert_eq!(spec.sigma_loading_slopes(2, 4), vec![(0, 1.0)]);
+        assert_eq!(spec.sigma_loading_slopes(3, 4), vec![(1, 0.0)]);
+        assert!(spec.sigma_loading_slopes(9, 4).is_empty());
     }
 
     #[test]

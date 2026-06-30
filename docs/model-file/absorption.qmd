@@ -465,16 +465,26 @@ way an infusion is injected), so the absorbed mass is exact — not smeared acro
 the step.
 
 ::: {.callout-note}
-## Sensitivity of `dur` is finite-difference
+## Sensitivity of `zero_order(dur)` is analytic (#530)
 
-The other input-rate models carry **exact analytic** (`Dual2`) FOCE/FOCEI
-gradients. `zero_order` is the exception: the derivative with respect to `dur`
-crosses the moving boundary at `tad = dur` (a Leibniz boundary term), which the
-pointwise dual walk cannot express, so `dur`'s gradient is computed by **finite
-differences**. This is correct — just slightly slower and less precise than the
-analytic route. The analytic boundary-impulse mechanism (shared with the
-modeled-duration `Dn` infusion) is tracked as a follow-up
-([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)).
+All input-rate models — including `zero_order(dur)` — carry **exact analytic**
+(`Dual2`) FOCE/FOCEI gradients. The derivative with respect to `dur` crosses the
+moving boundary at `tad = dur` (a Leibniz boundary term); the analytic provider
+delivers the window as a per-segment constant (like an infusion) and injects the
+**rate-off saltation** at the cutoff for that boundary term — the sign-mirror of the
+estimated-lagtime dose-start saltation. The closely-related **modeled-duration /
+modeled-rate infusion** (`RATE=−2` / `D{cmt}` and `RATE=−1` / `R{cmt}`) is analytic
+by the same mechanism, but on the *event-driven* walk.
+
+The two paths differ in what keeps them analytic. A **modeled-duration / -rate dose**
+stays analytic when composed with an estimated lagtime (the start *and* end
+saltations carry the combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying
+covariates, or multiple doses — only a *steady-state* modeled dose or one under IOV
+falls back to finite differences. The **`zero_order(dur)` forcing** rides the static
+walk, which has a narrower analytic scope: it stays analytic across multiple doses
+and a mixed (zero- + first-order) pathway, but reverts to **finite differences** when
+combined with an estimated lagtime, an EVID 3/4 reset, or time-varying covariates.
+See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 :::
 
 ### Worked examples
@@ -550,12 +560,14 @@ feed a compartment — biphasic zero-order is rejected when the model is parsed 
 
 ### Sensitivities
 
-`parallel` (only smooth `first_order` terms) keeps **exact analytic** (`Dual2`)
-FOCE/FOCEI gradients — including the derivative with respect to the pathway fraction.
-`mixed` contains a `zero_order` term, so — exactly as for a plain `zero_order` model —
-the zero-order **duration and fraction** are differentiated by **finite differences**
-(the moving-boundary case, [#530](https://github.com/FeRx-NLME/ferx-core/issues/530));
-the first-order pathway's parameters stay analytic.
+Both `parallel` (smooth `first_order` terms) and `mixed` (a `zero_order` term
+alongside a `first_order` one) keep **exact analytic** (`Dual2`) FOCE/FOCEI
+gradients — including the derivatives with respect to the pathway fraction and the
+zero-order **duration**: the moving-boundary `∂/∂dur` is carried by the rate-off
+saltation at the cutoff
+([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)). As for a plain
+`zero_order` model, this reverts to finite differences only in combination with an
+estimated lagtime, an EVID 3/4 reset, or time-varying covariates.
 
 ### Worked examples
 

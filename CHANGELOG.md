@@ -569,6 +569,31 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Analytic sensitivity gradients for moving infusion-end boundaries: modeled
+  duration / rate doses and `zero_order(dur)` absorption** (#530). Three dosing
+  features previously routed both the outer (θ/Ω/σ) and inner (EBE η) FOCE/FOCEI
+  gradients to finite differences because the infusion *end* time is a moving
+  boundary in an estimated parameter: a `RATE=-2` (`D{cmt}`, modeled duration) or
+  `RATE=-1` (`R{cmt}`, modeled rate) dose (end `t_dose + D` resp. `t_dose + amt/R`),
+  and a `zero_order(dur)` absorption forcing (end `t_dose + dur`). The dual walk now
+  resolves the modeled rate/window from its PK slot as a live jet and carries the
+  boundary derivative via the rate-off **event-time saltation** — the exact
+  sign-mirror of the estimated-lagtime dose-*start* saltation (#472). Modeled
+  duration/rate doses ride the event-driven walk; `zero_order(dur)` is delivered as a
+  per-segment constant window (like an infusion) on the static walk, with the
+  saltation injected at its cutoff. So these fits take the exact `Dual2`/`Dual1`
+  gradient (the estimates are unchanged; the gradient is faster and Hessian-clean).
+  Validated against finite differences of the production predictor, with the modeled
+  parameter η-coupled so both the θ- and η-blocks of the moving-boundary term are
+  checked, plus inner/outer scope parity. Modeled duration/rate doses stay analytic
+  when composed with an estimated lagtime (the start and end saltations carry the
+  combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying covariates, or
+  multiple doses; `zero_order(dur)` stays analytic across multiple doses and a mixed
+  (zero- + first-order) pathway. Still FD: a *steady-state* modeled dose or
+  `zero_order` window (the SS equilibration reads a fixed per-cycle window), a modeled
+  dose under IOV, and a `zero_order(dur)` *forcing* combined with an estimated
+  lagtime, an EVID 3/4 reset, or time-varying covariates (which keep it on the static
+  walk's FD fallback).
 - **Joint PK-TTE fits integrate the augmented PK + cumulative-hazard ODE once per
   inner likelihood evaluation instead of twice** (#570). For a drug-driven hazard
   (`[event_model] hazard = …`), the cumulative hazard at the event/censor times is now

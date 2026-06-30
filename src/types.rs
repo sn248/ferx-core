@@ -3395,6 +3395,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // "falls back to" intentionally removed: no emitted message uses that exact
         // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
         (WarningSeverity::Info, "gradient_fallback")
+    } else if lower.contains("not mu-referenced") {
+        (WarningSeverity::Warning, "mu_referencing")
     } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
         (WarningSeverity::Info, "mu_referencing")
     } else if lower.contains("global_search disabled") {
@@ -5492,6 +5494,16 @@ mod tests {
     }
 
     #[test]
+    fn classify_warning_saem_non_mu_ref_is_warning() {
+        let w = classify_warning(
+            "SAEM: individual parameter(s) not mu-referenced: V. This can strongly \
+             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+        );
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category, "mu_referencing");
+    }
+
+    #[test]
     fn classify_warning_strips_chain_prefix() {
         let w = classify_warning("[FOCEI] Covariance step failed");
         assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
@@ -5634,6 +5646,12 @@ mod tests {
             ),
             ("mu-ref: CL, V, KA", Info, "mu_referencing"),
             (
+                "SAEM: individual parameter(s) not mu-referenced: V. This can strongly \
+                 affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+                Warning,
+                "mu_referencing",
+            ),
+            (
                 "Multi-start: best result from start 3/8",
                 Info,
                 "multi_start",
@@ -5743,7 +5761,11 @@ mod tests {
                 Critical,
                 "covariance_step",
             ),
-            ("[SAEM] mu-ref: CL", Info, "mu_referencing"),
+            (
+                "[SAEM] individual parameter(s) not mu-referenced: V",
+                Warning,
+                "mu_referencing",
+            ),
             (
                 "[FOCEI] Outer optimization did not converge",
                 Critical,

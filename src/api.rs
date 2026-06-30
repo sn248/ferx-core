@@ -3080,6 +3080,31 @@ pub(crate) fn compute_extra_output_columns(
     }
 }
 
+fn saem_non_mu_referenced_individual_params_warning(model: &CompiledModel) -> Option<String> {
+    let mut names = Vec::new();
+    for (param_name, &eta_idx) in model.indiv_param_names.iter().zip(model.eta_map.iter()) {
+        if eta_idx < 0 {
+            continue;
+        }
+        let Some(eta_name) = model.eta_names.get(eta_idx as usize) else {
+            continue;
+        };
+        if !model.mu_refs.contains_key(eta_name) {
+            names.push(param_name.as_str());
+        }
+    }
+
+    if names.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "individual parameter(s) not mu-referenced: {}. This can strongly \
+             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+            names.join(", ")
+        ))
+    }
+}
+
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
@@ -3804,18 +3829,18 @@ fn fit_inner(
         }
     }
 
-    // Report detected mu-referencing relationships (only when feature is enabled)
-    if options.mu_referencing && !model.mu_refs.is_empty() {
-        let mut names: Vec<&String> = model.mu_refs.keys().collect();
-        names.sort();
-        warnings.push(format!(
-            "mu-ref: {}",
-            names
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+    // Emitted whenever the chain runs SAEM, independent of `options.mu_referencing`:
+    // the non-mu-referenced case is *most* at risk under SAEM when mu-centering is
+    // off, so gating on the opt-in flag would silence the warning exactly when it
+    // matters most (#621).
+    if chain.iter().any(|&m| m == EstimationMethod::Saem) {
+        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
+            warnings.push(if n_stages > 1 {
+                format!("[SAEM] {w}")
+            } else {
+                format!("SAEM: {w}")
+            });
+        }
     }
 
     // M3 censoring under non-interaction FOCE is a consistent Sheiner–Beal fit (the
@@ -4933,6 +4958,51 @@ mod tests {
         assert!(eps_shrinkage_warning(-0.05).is_none());
         // NaN — no warning.
         assert!(eps_shrinkage_warning(f64::NAN).is_none());
+    }
+
+    #[test]
+    fn saem_non_mu_referenced_warning_lists_individual_params_with_unmapped_eta() {
+        let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
+        model.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+        model.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        model.eta_map = vec![0, 1, -1];
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                log_transformed: true,
+            },
+        );
+
+        let warning =
+            saem_non_mu_referenced_individual_params_warning(&model).expect("expected warning");
+        assert!(warning.contains("not mu-referenced: V."));
+        assert!(!warning.contains("not mu-referenced: CL"));
+        assert!(!warning.contains("KA"));
+    }
+
+    #[test]
+    fn saem_non_mu_referenced_warning_is_none_when_all_eta_params_are_muref() {
+        let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
+        model.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+        model.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        model.eta_map = vec![0, 1, -1];
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                log_transformed: true,
+            },
+        );
+        model.mu_refs.insert(
+            "ETA_V".into(),
+            MuRef {
+                theta_name: "TVV".into(),
+                log_transformed: true,
+            },
+        );
+
+        assert!(saem_non_mu_referenced_individual_params_warning(&model).is_none());
     }
 
     // ── kappa shrinkage ──────────────────────────────────────────────────────

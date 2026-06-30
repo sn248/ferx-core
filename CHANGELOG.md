@@ -317,6 +317,12 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Changed
+- **SAEM now warns on non-mu-referenced individual parameters instead of listing detected
+  mu-referencing** (#621). The broad `mu-ref: ...` info notice is replaced by a SAEM-only
+  warning that names any individual parameter whose random effect is not mu-referenced
+  (e.g. `CL = TVCL + ETA_CL` rather than `CL = TVCL * exp(ETA_CL)`), since such forms can
+  strongly slow SAEM convergence. The warning fires whenever the estimation chain runs SAEM,
+  independent of the `mu_referencing` fit option.
 - **IOV occasions with doses but no observations now contribute their own κ random-effect
   axis** (#590). Occasion grouping (`iov_occasion_groups`) now includes every occasion in
   the dose record, not only those carrying sampled observations, so a dose-only occasion

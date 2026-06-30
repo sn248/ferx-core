@@ -3094,7 +3094,7 @@ fn saem_non_mu_referenced_individual_params_warning(model: &CompiledModel) -> Op
         None
     } else {
         Some(format!(
-            "SAEM: individual parameter(s) not mu-referenced: {}. This can strongly \
+            "individual parameter(s) not mu-referenced: {}. This can strongly \
              affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
             names.join(", ")
         ))
@@ -3825,12 +3825,16 @@ fn fit_inner(
         }
     }
 
-    if options.mu_referencing && chain.iter().any(|&m| m == EstimationMethod::Saem) {
+    // Emitted whenever the chain runs SAEM, independent of `options.mu_referencing`:
+    // the non-mu-referenced case is *most* at risk under SAEM when mu-centering is
+    // off, so gating on the opt-in flag would silence the warning exactly when it
+    // matters most (#621).
+    if chain.iter().any(|&m| m == EstimationMethod::Saem) {
         if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
             warnings.push(if n_stages > 1 {
                 format!("[SAEM] {w}")
             } else {
-                w
+                format!("SAEM: {w}")
             });
         }
     }

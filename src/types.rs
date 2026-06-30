@@ -3395,7 +3395,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // "falls back to" intentionally removed: no emitted message uses that exact
         // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
         (WarningSeverity::Info, "gradient_fallback")
-    } else if lower.contains("saem:") && lower.contains("not mu-referenced") {
+    } else if lower.contains("not mu-referenced") {
         (WarningSeverity::Warning, "mu_referencing")
     } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
         (WarningSeverity::Info, "mu_referencing")
@@ -5762,7 +5762,7 @@ mod tests {
                 "covariance_step",
             ),
             (
-                "[SAEM] SAEM: individual parameter(s) not mu-referenced: V",
+                "[SAEM] individual parameter(s) not mu-referenced: V",
                 Warning,
                 "mu_referencing",
             ),

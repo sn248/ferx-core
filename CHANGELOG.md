@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
+  expressions and direct analytical `pk(...=TIME)` mappings, enabling
+  NONMEM-style time-dependent PK parameter switches without declaring `TIME` as
+  a covariate (#607). The event time is threaded through every prediction and
+  diagnostic path — analytical and ODE predictions, the `[odes]` right-hand side,
+  sdtab individual-parameter columns, `[derived]` columns, the survival/TTE
+  hazard, and the SDE EKF — so `TIME` resolves to each event's time everywhere
+  rather than only on the main prediction path; for models that use it, analytic
+  FOCE/FOCEI sensitivities fall back to finite differences (#610).
 - **Platelet-ladder adaptive-dosing example + mrgsolve external anchor** (#391, S2.5a). A new
   bundled model `examples/adaptive_platelet_ladder.ferx` exercises the reactive
   `[adaptive_dosing]` `levels` ladder on an oncology dose-modification scenario — a Friberg

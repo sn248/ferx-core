@@ -5370,9 +5370,15 @@ pub(crate) fn build_y_output_fn(
     // dual-evaluable when the expression references only states / individual
     // parameters / covariates / constants — covariates thread in as constants
     // from the per-observation snapshot (#540), and a direct θ/η reference is
-    // desugared above into a synthetic individual parameter (#486), so after the
-    // `rewrite_readout_synth` pass only an NN output (`PushNnOutput`) disqualifies
-    // the analytic readout.
+    // *normally* desugared above into a synthetic individual parameter (#486).
+    //
+    // The `PushTheta`/`PushEta` arms below are still load-bearing and must not be
+    // removed: when the synthetic readout params overflow the fixed PK-slot layout,
+    // the parser clears `readout_synth_params` and leaves the bare θ/η ops in the
+    // bytecode (the documented FD fallback). Those arms are what keep `dual_evaluable`
+    // `false` on that path; dropping them would wrongly route a slot-overflowed
+    // direct-θ/η readout onto the analytic walk. `PushNnOutput` is the other
+    // disqualifier (an NN output is never desugared).
     let output_dual_evaluable = !bc.ops.iter().any(|op| {
         matches!(
             op,
@@ -11550,10 +11556,14 @@ pub struct OdeOutputProgram {
     /// True when the expression references only states / individual parameters /
     /// covariates / constants — the case the dual readout can evaluate, threading
     /// the covariate snapshot in while leaving θ/η empty. A θ/η referenced
-    /// *directly* in the readout is desugared at parse time into a synthetic
-    /// individual parameter (`__ferx_ro_*`, #486), so it reaches the readout as an
-    /// ordinary `PushVar` and rides the individual-parameter sensitivity chain;
-    /// only an NN output (`PushNnOutput`) leaves the readout on the FD fallback.
+    /// *directly* in the readout is *normally* desugared at parse time into a
+    /// synthetic individual parameter (`__ferx_ro_*`, #486), so it reaches the
+    /// readout as an ordinary `PushVar` and rides the individual-parameter
+    /// sensitivity chain. The exception is the slot-overflow FD fallback: when the
+    /// synthetic params would exceed the PK-slot layout the parser leaves the bare
+    /// θ/η ops in place, and the `PushTheta`/`PushEta` check at the construction
+    /// site keeps this `false` so that readout stays on FD. An NN output
+    /// (`PushNnOutput`) is the other, always-FD disqualifier.
     dual_evaluable: bool,
 }
 

@@ -429,11 +429,17 @@ delivers the window as a per-segment constant (like an infusion) and injects the
 **rate-off saltation** at the cutoff for that boundary term — the sign-mirror of the
 estimated-lagtime dose-start saltation. The closely-related **modeled-duration /
 modeled-rate infusion** (`RATE=−2` / `D{cmt}` and `RATE=−1` / `R{cmt}`) is analytic
-by the same mechanism on the event-driven walk.
+by the same mechanism, but on the *event-driven* walk.
 
-`zero_order(dur)` reverts to **finite differences** only when combined with an
-estimated lagtime, an EVID 3/4 reset, or time-varying covariates (those route to the
-FD fallback). See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
+The two paths differ in what keeps them analytic. A **modeled-duration / -rate dose**
+stays analytic when composed with an estimated lagtime (the start *and* end
+saltations carry the combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying
+covariates, or multiple doses — only a *steady-state* modeled dose or one under IOV
+falls back to finite differences. The **`zero_order(dur)` forcing** rides the static
+walk, which has a narrower analytic scope: it stays analytic across multiple doses
+and a mixed (zero- + first-order) pathway, but reverts to **finite differences** when
+combined with an estimated lagtime, an EVID 3/4 reset, or time-varying covariates.
+See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 :::
 
 ### Worked examples

@@ -544,10 +544,15 @@ section of the SDLC for the versioning policy).
   gradient (the estimates are unchanged; the gradient is faster and Hessian-clean).
   Validated against finite differences of the production predictor, with the modeled
   parameter η-coupled so both the θ- and η-blocks of the moving-boundary term are
-  checked, plus inner/outer scope parity. Still FD: a *steady-state* modeled dose
-  (the SS equilibration reads a fixed per-cycle window), and modeled doses /
-  `zero_order` combined with IOV, an estimated lagtime, or an EVID 3/4 reset (those
-  combinations route to FD upstream).
+  checked, plus inner/outer scope parity. Modeled duration/rate doses stay analytic
+  when composed with an estimated lagtime (the start and end saltations carry the
+  combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying covariates, or
+  multiple doses; `zero_order(dur)` stays analytic across multiple doses and a mixed
+  (zero- + first-order) pathway. Still FD: a *steady-state* modeled dose or
+  `zero_order` window (the SS equilibration reads a fixed per-cycle window), a modeled
+  dose under IOV, and a `zero_order(dur)` *forcing* combined with an estimated
+  lagtime, an EVID 3/4 reset, or time-varying covariates (which keep it on the static
+  walk's FD fallback).
 - **Analytic sensitivity gradients for ODE IOV models with an `ExpressionScale`
   `obs_scale` divisor** (#575). An `[odes]` model combining IOV (occasion `kappa`)
   with an η-dependent `obs_scale = expr` (e.g. `obs_scale = V1`) previously routed

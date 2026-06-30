@@ -439,6 +439,27 @@ pub(crate) fn has_rate_defined_ss_infusion_under_f(
         })
 }
 
+/// Resolve a dose's modeled `RATE` to its PK slot (#530). A `RATE=-2` (`D{cmt}`) dose reads
+/// its duration slot, a `RATE=-1` (`R{cmt}`) dose its rate slot; a `Fixed` dose — or a modeled
+/// dose whose `D{cmt}`/`R{cmt}` slot is undeclared — returns `None`. Single-sourced so the
+/// `ode_tvcov_supported` slot-presence gate and the `integrate_tvcov_readout` jet resolution
+/// can never resolve the same dose differently if a new `RateMode` / `DoseAttr` mapping lands
+/// (#530 review finding 5).
+fn modeled_slot_for(
+    attr_map: &crate::types::DoseAttrMap,
+    d: &crate::types::DoseEvent,
+) -> Option<(crate::types::RateMode, usize)> {
+    match d.rate_mode {
+        crate::types::RateMode::Fixed => None,
+        crate::types::RateMode::ModeledDuration => attr_map
+            .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
+            .map(|s| (crate::types::RateMode::ModeledDuration, s)),
+        crate::types::RateMode::ModeledRate => attr_map
+            .indexed_slot(crate::types::DoseAttr::Rate, d.cmt)
+            .map(|s| (crate::types::RateMode::ModeledRate, s)),
+    }
+}
+
 pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
     // The event-driven walk serves a subject with time-varying covariates, an estimated
     // lagtime (per-dose event-time saltation), a steady-state dose (dual SS equilibration),
@@ -510,14 +531,9 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // wrong gradient (the walk's `inf_eff` would silently fall to the unresolved fixed arm).
     if !subject.all_doses_fixed() {
         let attr_map = model.active_dose_attr_map();
-        let all_slots_present = subject.doses.iter().all(|d| match d.rate_mode {
-            crate::types::RateMode::Fixed => true,
-            crate::types::RateMode::ModeledDuration => attr_map
-                .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
-                .is_some(),
-            crate::types::RateMode::ModeledRate => attr_map
-                .indexed_slot(crate::types::DoseAttr::Rate, d.cmt)
-                .is_some(),
+        let all_slots_present = subject.doses.iter().all(|d| {
+            matches!(d.rate_mode, crate::types::RateMode::Fixed)
+                || modeled_slot_for(attr_map, d).is_some()
         });
         if has_ss || !all_slots_present {
             return false;
@@ -1790,15 +1806,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
             subject
                 .doses
                 .iter()
-                .map(|d| match d.rate_mode {
-                    crate::types::RateMode::Fixed => None,
-                    crate::types::RateMode::ModeledDuration => attr_map
-                        .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
-                        .map(|s| (crate::types::RateMode::ModeledDuration, s)),
-                    crate::types::RateMode::ModeledRate => attr_map
-                        .indexed_slot(crate::types::DoseAttr::Rate, d.cmt)
-                        .map(|s| (crate::types::RateMode::ModeledRate, s)),
-                })
+                .map(|d| modeled_slot_for(attr_map, d))
                 .collect()
         };
 
@@ -3031,16 +3039,6 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     let is_inf = |d: &crate::types::DoseEvent| -> bool {
         !d.is_fixed() || crate::ode::predictions::is_real_infusion(d)
     };
-    // Domain-wall clamp mirroring the f64 `clamp_above_floor` (NaN → floor; drops the
-    // derivative at the wall so a converged interior fit is unperturbed). #530.
-    let clamp_floor = |x: T, floor: f64| -> T {
-        if x.val() > floor {
-            x
-        } else {
-            T::from_f64(floor)
-        }
-    };
-
     // Mode-aware bioavailability for infusions (#419). A duration-defined infusion
     // (`RATE=-2` / `D{cmt}`) scales its *rate* by `F` over a fixed window; a rate-defined
     // infusion (`RATE>0` / `R{cmt}` / `RATE=-1`) holds its rate and scales the *window
@@ -3079,18 +3077,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     match mode {
                         // `RATE=-2` / `D{cmt}`: window = `D` jet, rate = `F·amt/D`.
                         crate::types::RateMode::ModeledDuration => {
-                            let dur = clamp_floor(
-                                pk_at_dose[k][slot],
-                                crate::types::DoseEvent::DURATION_FLOOR,
-                            );
+                            let dur = pk_at_dose[k][slot]
+                                .guard_floor(crate::types::DoseEvent::DURATION_FLOOR);
                             (f_bio_at_dose[k] * amt / dur, dur)
                         }
                         // `RATE=-1` / `R{cmt}`: rate = `R` jet, window = `F·amt/R`.
                         crate::types::RateMode::ModeledRate => {
-                            let rate = clamp_floor(
-                                pk_at_dose[k][slot],
-                                crate::types::DoseEvent::RATE_FLOOR,
-                            );
+                            let rate = pk_at_dose[k][slot]
+                                .guard_floor(crate::types::DoseEvent::RATE_FLOOR);
                             (rate, f_bio_at_dose[k] * amt / rate)
                         }
                         crate::types::RateMode::Fixed => {
@@ -3717,6 +3711,17 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // tolerance, not bit pattern (issue #410).
         record_at(t_start, &u, &mut states, &mut recorded);
 
+        // Last effective dose at or before the segment start (the TAD anchor). Shared by the
+        // zero-order saltation below and the RHS forcing — one fold over `subject.doses` per
+        // segment, so the two consumers can never drift on a different filter epsilon (#530
+        // review finding 4).
+        let last_dose_eff = subject
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .filter(|&dt| dt <= t_start + 1e-12)
+            .fold(f64::NEG_INFINITY, f64::max);
+
         // #530: zero-order rate-off saltation. At a window end `w_end = dose.time + dur`, the
         // constant rate turns off; the boundary moves with `dur`, so inject the moving-boundary
         // sensitivity (`s = +1`, the sign-mirror of the lagtime dose-start saltation). Fired
@@ -3725,12 +3730,6 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // intervening EVID 3/4 reset (`w_start >= reset_floor`). The state value is continuous
         // — only its `∂/∂dur` jet changes.
         if has_zero_order {
-            let last_dose_eff = subject
-                .doses
-                .iter()
-                .map(|d| d.time)
-                .filter(|&dt| dt <= t_start + 1e-12)
-                .fold(f64::NEG_INFINITY, f64::max);
             for &(cmt, rate, w_start, dur) in &zero_windows {
                 let w_end = w_start + dur.val();
                 if w_start >= reset_floor && (w_end - t_start).abs() < 1e-9 {
@@ -3815,14 +3814,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 .collect()
         };
 
-        // Last effective dose at or before the segment start, for TAD.
-        let last_dose_eff = subject
-            .doses
-            .iter()
-            .map(|d| d.time)
-            .filter(|&dt| dt <= t_start + 1e-12)
-            .fold(f64::NEG_INFINITY, f64::max);
-
+        // (`last_dose_eff`, the TAD anchor, was computed once above the saltation block.)
         let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
             eval_rhs_anchored::<T>(
                 program,
@@ -5181,6 +5173,83 @@ mod tests {
         check_vs_production(&model, &subject, &[5.0, 50.0, 20.0], &[0.12, -0.08]);
     }
 
+    /// #530 cross-term: a **modeled-duration dose under an estimated lagtime**. Both the
+    /// dose *start* (`t_dose + lag`, rate-on, moves with `lag`) and the window *end*
+    /// (`t_dose + lag + D1`, rate-off, moves with `lag + D1`) are moving boundaries. The
+    /// event-driven walk carries the start saltation with shift `δlag` and the end saltation
+    /// with the combined shift `δlag + δD1` (`integrate_tvcov_g` `d_off = dlag + dtinf`,
+    /// `ode_provider.rs:3475`). Both `D1` and `LAGTIME` are η-coupled so the cross-term's
+    /// θ- and η-blocks are FD-checked against the production predictor (which resolves the
+    /// modeled window and the lag per evaluation). This guards the combination the gate
+    /// admits to the analytic walk — it is *not* an FD fallback (#530 review finding 1).
+    /// Observations straddle the lagged window end (window `[1, 6]` at `lag=1, D1=5`): 4
+    /// inside, 7 and 11 after, 0.5 before the lagged dose arrival.
+    #[test]
+    fn ode_provider_modeled_duration_with_lagtime_matches_production() {
+        const MODELED_DUR_LAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  theta TVLAG(1.0, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_D1 ~ 0.04
+  omega ETA_LAG ~ 0.02
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1 * exp(ETA_D1)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL/V * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(MODELED_DUR_LAG_ODE).expect("parse");
+        let mut subject = bolus_subject(&[0.5, 4.0, 7.0, 11.0]);
+        subject.doses = vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        )];
+        // Modeled dose + lagtime both route to the event-driven walk; the combination must
+        // be admitted there (not declined to FD) — the saltation carries the cross-term.
+        assert!(
+            model.has_lagtime()
+                && ode_tvcov_supported(&model, &subject)
+                && !ode_subject_supported(&model, &subject),
+            "modeled-duration + lagtime must ride the event-driven walk analytically"
+        );
+        let theta = [5.0, 50.0, 5.0, 1.0];
+        let eta = [0.12, -0.08, 0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        // Inner/outer scope parity on the same walk.
+        let inner = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("inner served");
+        let outer =
+            ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("outer served");
+        for (io, oo) in inner.iter().zip(outer.obs.iter()) {
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    io.df_deta[k],
+                    oo.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
     /// #530: **zero-order absorption** (`zero_order(dur)`) gets analytic sensitivities on the
     /// static walk. The forcing delivers `F·amt/dur` over `[t_dose, t_dose+dur]`; the window
     /// end is a moving boundary in `dur`, carried by the rate-off saltation injected at the
@@ -5238,6 +5307,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #530 finding 2: **multi-dose `zero_order(dur)`**. The global `ZeroOrder` Dual2 lift
+    /// serves more than the single-dose case the first zero-order test covers — every dose
+    /// opens its own constant-rate window with its own moving end. Two doses (t=0 and t=12)
+    /// each deliver `F·amt/DUR` over their own `[t_dose, t_dose+DUR]` window; the second
+    /// window's saltation must fire independently. `DUR` is η-coupled. Observations straddle
+    /// both window ends (`DUR=4`: windows `[0,4]` and `[12,16]`; obs 3, 6 around the first,
+    /// 14, 18 around the second).
+    #[test]
+    fn ode_provider_zero_order_multi_dose_matches_production() {
+        const ZERO_ORDER_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(ZERO_ORDER_ODE).expect("parse");
+        let mut subject = bolus_subject(&[3.0, 6.0, 14.0, 18.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        assert!(
+            ode_subject_supported(&model, &subject),
+            "multi-dose zero-order must be served analytically on the static walk"
+        );
+        check_vs_production(&model, &subject, &[5.0, 50.0, 4.0], &[0.12, -0.08]);
+    }
+
+    /// #530 finding 2: **mixed (zero-order + first-order) absorption**. `FZO*zero_order(dur=DUR)`
+    /// `+ FZO1*first_order(ka=KA)` feeds one compartment; the docs claim the whole `mixed`
+    /// family is now analytic (the zero-order `∂/∂DUR` boundary term carried by the saltation,
+    /// the first-order pathway smooth). This checks the composite against production FD with
+    /// `DUR` η-coupled — the saltation must fire for the zero-order pathway while the
+    /// first-order forcing rides the smooth dual path alongside it.
+    #[test]
+    fn ode_provider_mixed_absorption_matches_production() {
+        const MIXED_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(3.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FZO  = TVFZO
+  FZO1 = 1 - TVFZO
+  KA   = TVKA
+  DUR  = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(MIXED_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 10.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        assert!(
+            ode_subject_supported(&model, &subject),
+            "mixed zero+first-order absorption must be served analytically (#530)"
+        );
+        check_vs_production(
+            &model,
+            &subject,
+            &[5.0, 50.0, 0.4, 1.0, 3.0],
+            &[0.12, -0.08],
+        );
     }
 
     /// EVID 3/4 reset: a two-occasion subject (reset + re-dose at t=10) must zero

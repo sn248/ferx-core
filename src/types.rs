@@ -5655,7 +5655,7 @@ mod tests {
                 "dw_autocorrelation",
             ),
             (
-                "M3 censoring handling requires FOCEI semantics",
+                "M3 censoring under FOCE uses non-interaction (Sheiner–Beal) semantics",
                 Warning,
                 "bloq_method",
             ),

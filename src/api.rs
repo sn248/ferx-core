@@ -3365,14 +3365,10 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
-        // Run the covariance step on the last *estimating* stage. IMP is a
-        // likelihood evaluation (NONMEM EONLY=1 equivalent), not an estimator,
-        // so when IMP follows an estimator the preceding stage is effectively
-        // the final estimating stage and should compute covariance / SIR.
-        let is_last_estimating = is_last
-            || chain[stage_idx + 1..]
-                .iter()
-                .all(|&m| m == EstimationMethod::Imp);
+        // Run the covariance step (and SIR) only on the last *estimating* stage,
+        // so a chain doesn't recompute the expensive FD covariance after every
+        // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
+        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, options.imp_eval_only);
         if !is_last_estimating {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
@@ -3824,10 +3820,13 @@ fn fit_inner(
         ));
     }
 
-    // When M3 censoring is combined with non-interaction FOCE, mixing linearized
-    // Gaussian residuals with non-linearized log Φ terms gives inconsistent
-    // OFVs near the LOQ boundary. The FOCE dispatcher routes affected
-    // subjects through FOCEI internally — surface the promotion to the user.
+    // M3 censoring under non-interaction FOCE is a consistent Sheiner–Beal fit (the
+    // censored rows leave the linearized marginal and re-enter as `−logΦ` at the
+    // population variance; plain FOCE no longer promotes censored subjects to interaction
+    // — non-IOV since #367, IOV since #591). It is a *different optimum* from FOCEI-M3,
+    // mirroring NONMEM `METHOD=1 LAPLACE` with vs without `INTER`. Since M3 is run with
+    // interaction in most practice, surface the non-interaction choice so a user does not
+    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599).
     if matches!(model.bloq_method, BloqMethod::M3)
         && matches!(
             options.method,
@@ -3840,9 +3839,9 @@ fn fit_inner(
             .any(|s| s.has_censored_observation())
     {
         warnings.push(
-            "M3 censoring handling requires FOCEI semantics; subjects with CENS!=0 \
-             rows were evaluated with η-interaction. Set method=focei explicitly \
-             to silence this notice."
+            "M3 censoring under FOCE uses non-interaction (Sheiner–Beal) semantics; \
+             FOCE-M3 and FOCEI-M3 are different optima (as in NONMEM METHOD=1 LAPLACE \
+             with vs without INTER). Set method=focei for interaction semantics."
                 .to_string(),
         );
     }
@@ -4317,6 +4316,28 @@ fn compute_param_corr(
         }
     }
     Some(corr)
+}
+
+/// Whether `stage_idx` is the last *estimating* stage of `chain` — the single
+/// stage that owns the covariance / SIR step. Running it on every stage is
+/// wasteful and not expected (#615); only the final estimate needs SEs.
+///
+/// An evaluation-only IMP (`imp_eval_only`, NONMEM `IMP EONLY=1`) is a likelihood
+/// evaluation, not an estimator, so trailing eval-only IMP stages cede the
+/// covariance step to the preceding estimator. A default (estimating) IMP is a
+/// real estimator that owns the step itself, so it must not be skipped. Split out
+/// of `fit()` so the per-stage gating is unit-testable.
+fn is_last_estimating_stage(
+    chain: &[EstimationMethod],
+    stage_idx: usize,
+    imp_eval_only: bool,
+) -> bool {
+    let is_last = stage_idx + 1 == chain.len();
+    let trailing_eval_only_imp = imp_eval_only
+        && chain[stage_idx + 1..]
+            .iter()
+            .all(|&m| m == EstimationMethod::Imp);
+    is_last || trailing_eval_only_imp
 }
 
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
@@ -8241,6 +8262,53 @@ mod tests_cov_diagnostics {
             resolve_covariance_status(true, false, false),
             CovarianceStatus::Failed
         );
+    }
+
+    // ── is_last_estimating_stage: covariance runs once, at chain end (#615) ──
+    use EstimationMethod::*;
+
+    #[test]
+    fn cov_stage_single_method_is_last() {
+        assert!(is_last_estimating_stage(&[Foce], 0, false));
+    }
+
+    #[test]
+    fn cov_stage_only_final_estimator_in_plain_chain() {
+        // [foce, saem]: covariance only on saem (the last stage), never on foce.
+        let chain = [Foce, Saem];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(is_last_estimating_stage(&chain, 1, false));
+    }
+
+    #[test]
+    fn cov_stage_estimating_imp_owns_step_not_predecessor() {
+        // [saem, imp] with estimating IMP (imp_eval_only = false): the trailing
+        // IMP is a real estimator and owns the covariance step, so saem must NOT
+        // also run it — otherwise covariance is computed twice (#615).
+        let chain = [Saem, Imp];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(is_last_estimating_stage(&chain, 1, false));
+    }
+
+    #[test]
+    fn cov_stage_eval_only_imp_cedes_step_to_predecessor() {
+        // [saem, imp] with imp_eval_only = true: trailing IMP is a likelihood
+        // evaluation, so saem is the last estimating stage and owns covariance.
+        let chain = [Saem, Imp];
+        assert!(is_last_estimating_stage(&chain, 0, true));
+        // The eval-only IMP stage itself never runs the covariance step (handled
+        // by the eval-only branch in fit), but as the last stage it still reports
+        // as last-estimating; gating there is a no-op since it skips covariance.
+        assert!(is_last_estimating_stage(&chain, 1, true));
+    }
+
+    #[test]
+    fn cov_stage_three_method_chain_estimating_imp() {
+        // [foce, saem, imp] estimating: only the final imp owns covariance.
+        let chain = [Foce, Saem, Imp];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(!is_last_estimating_stage(&chain, 1, false));
+        assert!(is_last_estimating_stage(&chain, 2, false));
     }
 }
 

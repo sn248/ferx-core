@@ -3119,14 +3119,29 @@ fn fit_inner(
 ) -> Result<FitResult, String> {
     let fit_start = Instant::now();
     let chain = options.method_chain();
+    let n_stages = chain.len();
     // Compute up-front so we can both surface the warnings before the fit
     // starts (a long-running fit shouldn't bury a "this option is unused"
     // notice at the end) and carry them through into FitResult.warnings.
-    let mut unsupported_warnings = options.unsupported_keys_warnings();
+    let mut pre_run_warnings = options.unsupported_keys_warnings();
     // Surface a "no method specified, defaulting to FOCEI" notice through the
     // same channel so it reaches both stderr and FitResult.warnings.
     if let Some(w) = options.method_default_warning() {
-        unsupported_warnings.push(w);
+        pre_run_warnings.push(w);
+    }
+    // Emitted whenever the chain runs SAEM, independent of `options.mu_referencing`:
+    // the non-mu-referenced case is *most* at risk under SAEM when mu-centering is
+    // off, so gating on the opt-in flag would silence the warning exactly when it
+    // matters most (#621). This is assembled before the startup banner so verbose
+    // runs show it before SAEM begins.
+    if chain.iter().any(|&m| m == EstimationMethod::Saem) {
+        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
+            pre_run_warnings.push(if n_stages > 1 {
+                format!("[SAEM] {w}")
+            } else {
+                format!("SAEM: {w}")
+            });
+        }
     }
 
     // Capture thread count before chain runs (current_num_threads() reports
@@ -3163,9 +3178,9 @@ fn fit_inner(
         // otherwise the global pool. So this stays accurate in both paths.
         let n_threads = rayon::current_num_threads();
         let thread_word = if n_threads == 1 { "thread" } else { "threads" };
-        if !unsupported_warnings.is_empty() {
+        if !pre_run_warnings.is_empty() {
             eprintln!("--- Warnings ---");
-            for w in &unsupported_warnings {
+            for w in &pre_run_warnings {
                 eprintln!("  * {}", w);
             }
             eprintln!();
@@ -3273,11 +3288,10 @@ fn fit_inner(
     };
 
     // Run each stage in sequence, feeding params forward.
-    let n_stages = chain.len();
     let mut stage_params: ModelParameters = init_params.clone();
     let mut result: Option<crate::estimation::outer_optimizer::OuterResult> = None;
     let mut accumulated_warnings: Vec<String> = model.parse_warnings.clone();
-    accumulated_warnings.extend(unsupported_warnings);
+    accumulated_warnings.extend(pre_run_warnings);
     // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
     // by read_nonmem_csv into population.warnings.
     accumulated_warnings.extend(population.warnings.iter().cloned());
@@ -3832,20 +3846,6 @@ fn fit_inner(
                  if depot/central compartment amounts are required."
                     .to_string(),
             );
-        }
-    }
-
-    // Emitted whenever the chain runs SAEM, independent of `options.mu_referencing`:
-    // the non-mu-referenced case is *most* at risk under SAEM when mu-centering is
-    // off, so gating on the opt-in flag would silence the warning exactly when it
-    // matters most (#621).
-    if chain.iter().any(|&m| m == EstimationMethod::Saem) {
-        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
-            warnings.push(if n_stages > 1 {
-                format!("[SAEM] {w}")
-            } else {
-                format!("SAEM: {w}")
-            });
         }
     }
 

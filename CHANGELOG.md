@@ -307,6 +307,13 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Changed
+- **IOV occasions with doses but no observations now contribute their own κ random-effect
+  axis** (#590). Occasion grouping (`iov_occasion_groups`) now includes every occasion in
+  the dose record, not only those carrying sampled observations, so a dose-only occasion
+  (e.g. a loading dose with no PK samples) adds an IOV κ axis and a `k_occasions·log|Ω_iov|`
+  prior term. This shifts converged OFV / estimates / SEs for datasets with dose-only
+  occasions versus prior versions; it is intended (carryover means such an occasion's κ is
+  still informed by later observations).
 - **FOCE + M3 BLOQ + IOV no longer silently promotes censored subjects to interaction**
   (#591). Under `method = foce` (non-interaction), an IOV subject with `CENS != 0` rows is
   now scored with a consistent Sheiner–Beal objective for the whole subject — the censored

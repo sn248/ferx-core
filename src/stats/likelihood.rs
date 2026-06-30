@@ -655,9 +655,6 @@ pub fn foce_subject_nll(
     let frem_r_override =
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
-    let m3_active =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
-
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
     // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
     // the interaction path so log|H̃| includes both Gaussian and TTE curvature.
@@ -713,9 +710,16 @@ pub fn foce_subject_nll(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
-            // Promote to interaction when M3 censoring is active, matching the
-            // non-TTE branch below so M3 subjects always get the CᵀC correction.
-            interaction || m3_active,
+            // FOCE/FOCEI is selected by the `interaction` flag alone — M3 no longer
+            // force-promotes to interaction (mirrors the non-TTE branch below and the
+            // IOV `foce_subject_nll_iov`, #367/#591), so FOCE-M3 keeps non-interaction
+            // (no CᵀC) semantics here too. NOTE: the censored data term on this TTE path
+            // still rides `gaussian_foce_accum` at the conditional (η̂) variance, not the
+            // population-variance Sheiner–Beal `foce_subject_nll_standard` the non-TTE
+            // FOCE-M3 path uses; reconciling that (a `*_standard_with_tte` censored term)
+            // is a follow-up — joint analytic-`family` TTE + M3 + FOCE is the only path
+            // affected.
+            interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
         );
@@ -726,7 +730,6 @@ pub fn foce_subject_nll(
     // entering the standard path as `−logΦ` terms (excluded from R̃). FOCEI still
     // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
     // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
-    let _ = m3_active;
     // block_sigma cross-endpoint residual covariance is only carried by the
     // non-interaction (Sheiner–Beal) path via `compute_r_matrix_with_correlations`;
     // the interaction accumulator builds R diagonally and would silently drop the

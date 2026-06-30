@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `block_sigma` correlated residual errors are now supported under
+  `method = focei` and `method = imp`, not just `foce` and `saem` (#616). FOCEI
+  carries the off-diagonal residual covariance through the Almquist interaction
+  Hessian (`H̃ = HᵀR⁻¹H + ½·tr(R⁻¹∂R/∂η R⁻¹∂R/∂η) + Ω⁻¹`), and IMP builds its
+  Student-t proposal precision from the dense `R⁻¹`. On the committed
+  `correlated_residual_combined` anchor, ferx FOCEI OFV 18.722087 matches NONMEM
+  `METHOD=1 INTER` (18.722087) to better than 1e-5. The Gauss-Newton
+  (`gn` / `gn_hybrid`) paths remain diagonal-only and are still rejected.
 - `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
   expressions and direct analytical `pk(...=TIME)` mappings, enabling
   NONMEM-style time-dependent PK parameter switches without declaring `TIME` as
@@ -290,6 +298,16 @@ section of the SDLC for the versioning policy).
   data clock everywhere — the model `TIME`/`T` builtin, `[derived]` columns,
   sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
   report the value in the data file; no per-subject time shift is applied.
+
+### Changed
+- For `block_sigma` correlated residual models, the SAEM reported OFV (the
+  FOCE-approximation used for AIC/BIC) now follows the `interaction` flag like
+  FOCE/FOCEI instead of always using the non-interaction marginal: with
+  interaction on (the default) it reports the dense interaction marginal
+  (e.g. 18.7221 on the `correlated_residual_combined` anchor, matching ferx
+  FOCEI) rather than the previous non-interaction value (18.7274) (#616). The
+  off-diagonal correlation is carried in both cases; only the marginal's
+  curvature term changed.
 
 ### Fixed
 - **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).

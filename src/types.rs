@@ -1506,6 +1506,75 @@ impl ErrorSpec {
         }
     }
 
+    /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
+    /// parallel in shape to [`sigma_loadings`].
+    ///
+    /// Every loading coefficient is affine in the prediction `f`: the
+    /// proportional slot loads `f` (slope `1`), the additive slot loads the
+    /// constant `1` (slope `0`). Returning the slopes with the *same slot
+    /// presence* as [`sigma_loadings`] lets the dense-`R` derivative
+    /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
+    /// bilinear cross-covariance assembly with the value loadings replaced by
+    /// these slopes — the off-diagonal `R` is linear in each observation's
+    /// loadings, so `∂R_jk/∂f_j = cross(slopes_j, values_k)`.
+    pub fn sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> Vec<(usize, f64)> {
+        match self {
+            ErrorSpec::Single(em) => match em {
+                ErrorModel::Additive => {
+                    if n_sigma > 0 {
+                        vec![(0, 0.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Proportional => {
+                    if n_sigma > 0 {
+                        vec![(0, 1.0)]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                ErrorModel::Combined => {
+                    let mut out = Vec::with_capacity(2);
+                    if n_sigma > 0 {
+                        out.push((0, 1.0));
+                    }
+                    if n_sigma > 1 {
+                        out.push((1, 0.0));
+                    }
+                    out
+                }
+            },
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => match ep.error_model {
+                    ErrorModel::Additive => ep
+                        .sigma_idx
+                        .first()
+                        .copied()
+                        .map(|i| vec![(i, 0.0)])
+                        .unwrap_or_default(),
+                    ErrorModel::Proportional => ep
+                        .sigma_idx
+                        .first()
+                        .copied()
+                        .map(|i| vec![(i, 1.0)])
+                        .unwrap_or_default(),
+                    ErrorModel::Combined => {
+                        let mut out = Vec::with_capacity(2);
+                        if let Some(&i) = ep.sigma_idx.first() {
+                            out.push((i, 1.0));
+                        }
+                        if let Some(&i) = ep.sigma_idx.get(1) {
+                            out.push((i, 0.0));
+                        }
+                        out
+                    }
+                },
+                None => Vec::new(),
+            },
+        }
+    }
+
     /// Residual variance including fixed residual correlations from
     /// `block_sigma`.
     pub fn variance_at_with_correlations(
@@ -6526,6 +6595,53 @@ mod tests {
         assert_eq!(spec.sigma_loadings(1, 7.0, 4), vec![(2, 7.0), (3, 1.0)]);
         assert_eq!(spec.sigma_loadings(2, 7.0, 4), vec![(0, 1.0)]);
         assert!(spec.sigma_loadings(9, 7.0, 4).is_empty());
+    }
+
+    #[test]
+    fn sigma_loading_slopes_match_loading_shape_with_f_derivatives() {
+        // Slopes have the SAME slot presence as `sigma_loadings` but carry
+        // ∂coeff/∂f: 0 for the additive (constant) slot, 1 for the proportional
+        // slot. This keeps the dense-R ∂R/∂f cross-covariance assembly consistent.
+        let add = ErrorSpec::Single(ErrorModel::Additive);
+        assert_eq!(add.sigma_loading_slopes(0, 1), vec![(0, 0.0)]);
+        assert!(add.sigma_loading_slopes(0, 0).is_empty());
+
+        let prop = ErrorSpec::Single(ErrorModel::Proportional);
+        assert_eq!(prop.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
+        assert!(prop.sigma_loading_slopes(0, 0).is_empty());
+
+        let comb = ErrorSpec::Single(ErrorModel::Combined);
+        assert_eq!(comb.sigma_loading_slopes(0, 2), vec![(0, 1.0), (1, 0.0)]);
+        assert_eq!(comb.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
+
+        // PerCmt dispatch over global sigma indices, mirroring sigma_loadings.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            1usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![2, 3],
+            },
+        );
+        map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        map.insert(
+            3usize,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![1],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        assert_eq!(spec.sigma_loading_slopes(1, 4), vec![(2, 1.0), (3, 0.0)]);
+        assert_eq!(spec.sigma_loading_slopes(2, 4), vec![(0, 1.0)]);
+        assert_eq!(spec.sigma_loading_slopes(3, 4), vec![(1, 0.0)]);
+        assert!(spec.sigma_loading_slopes(9, 4).is_empty());
     }
 
     #[test]

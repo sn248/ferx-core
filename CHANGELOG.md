@@ -76,8 +76,10 @@ section of the SDLC for the versioning policy).
   flag and `residual_error_eta`, so the ODE path rides the exact same analytic assembly as
   the closed-form path (inner and outer FD-comparison tests on censored ODE-IOV fixtures
   confirm both tails for plain IOV, M3 + IOV, IOV + `iiv_on_ruv`, and the full triple). The
-  only `iiv_on_ruv` × M3 combination still on finite differences is the **non-IOV** ODE
-  variant.
+  **non-IOV** ODE M3 + `iiv_on_ruv` combination is analytic too — the last `iiv_on_ruv`
+  holdout: the ODE and closed-form packed gradients are bit-identical and both match
+  reconverged FD to ~1e-7 on each censoring tail (inner and outer), completing the entire
+  `iiv_on_ruv` × {plain, IOV, M3} × {closed-form, ODE} matrix.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose

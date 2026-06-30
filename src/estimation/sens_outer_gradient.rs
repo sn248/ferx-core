@@ -4512,6 +4512,136 @@ mod tests {
         }
     }
 
+    /// Non-IOV 1-cpt oral **user-ODE** model with M3 BLOQ **and** `iiv_on_ruv`
+    /// (`Y = IPRED + EPS·EXP(η_ruv)`) — [`ONECPT_ODE_M3_OUTER`] plus an extra residual-error
+    /// η that no structural parameter references. Drives the last `iiv_on_ruv` holdout
+    /// (#486): non-IOV ODE M3 + `iiv_on_ruv` on the outer loop.
+    const ONECPT_ODE_M3_RUV_OUTER: &str = r#"
+[parameters]
+  theta TVCL(0.2,  0.001, 10.0)
+  theta TVV(10.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method      = focei
+  bloq_method = m3
+  ode_reltol  = 1e-10
+  ode_abstol  = 1e-12
+"#;
+
+    /// **Non-IOV ODE M3 + `iiv_on_ruv`** (#486 — the last `iiv_on_ruv` holdout, the #547
+    /// pattern): the ODE counterpart of [`population_packed_gradient_iiv_on_ruv_m3_matches_fd`].
+    /// The censored × residual-eta cross-terms (`h·z` inner column, `C·z`/`C·m·a` true-Hessian /
+    /// mixed blocks, the σ-cross) are applied by the provider-agnostic `prepare` over the
+    /// **event-driven ODE walk's** `ObsSens`, and censored rows are excluded from `H̃`/`log|H̃|`,
+    /// exactly as on the closed-form path. The FOCEI packed gradient must match Richardson
+    /// reconverged FD of the `exp(2·η_ruv)`-scaled, censored FOCEI marginal across every packed
+    /// coordinate — note the EBE must be reconverged with [`precise_ebe_ruv`] (which carries the
+    /// `exp(2·η_ruv)` variance scaling), not the plain [`precise_ebe`]. Both censoring tails.
+    #[test]
+    fn population_packed_gradient_ode_m3_iiv_on_ruv_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::{BloqMethod, Population};
+
+        let model = parse_model_string(ONECPT_ODE_M3_RUV_OUTER).expect("parse ODE M3 + iiv_on_ruv");
+        assert!(matches!(model.bloq_method, BloqMethod::M3), "must be M3");
+        assert!(model.is_ode_based(), "must be on the ODE path");
+        assert_eq!(model.residual_error_eta, Some(3));
+        assert!(
+            !model.iiv_on_ruv_forces_fd(),
+            "non-IOV ODE M3 + iiv_on_ruv must no longer force FD (#486)"
+        );
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "non-IOV ODE M3 + iiv_on_ruv must route to the analytic outer gradient (#486)"
+        );
+        let theta = [0.22, 11.0, 1.4];
+
+        for right in [false, true] {
+            let mut s1 = subject_with_obs(&model, &theta, &[0.5, 1.0, 2.0, 8.0]);
+            let mut s2 = subject_with_obs(&model, &theta, &[0.25, 1.5, 6.0, 12.0, 36.0]);
+            for s in [&mut s1, &mut s2] {
+                let n = s.observations.len();
+                let tail = if right { -1 } else { 1 };
+                s.cens[n - 1] = tail;
+                s.cens[n - 2] = tail;
+            }
+            assert!(s1.cens.iter().any(|&c| c != 0) && s2.cens.iter().any(|&c| c != 0));
+
+            let pop = Population {
+                subjects: vec![s1, s2],
+                covariate_names: vec![],
+                dv_column: "DV".into(),
+                input_columns: vec![],
+                exclusions: None,
+                warnings: vec![],
+            };
+
+            let mut template = model.default_params.clone();
+            template.theta = theta.to_vec();
+            let x = pack_params(&template);
+            let params = unpack_params(&x, &template);
+            // `precise_ebe_ruv` carries the `exp(2·η_ruv)` variance scaling — the plain
+            // `precise_ebe` ignores the residual-eta and converges to the wrong EBE.
+            let ehs: Vec<DVector<f64>> = pop
+                .subjects
+                .iter()
+                .map(|s| DVector::from_vec(precise_ebe_ruv(&model, s, &params)))
+                .collect();
+
+            let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+                .expect("ODE M3 + iiv_on_ruv supported");
+
+            let ofv = |xv: &[f64]| -> f64 {
+                let p = unpack_params(xv, &template);
+                2.0 * pop
+                    .subjects
+                    .iter()
+                    .map(|s| {
+                        let eta = precise_ebe_ruv(&model, s, &p);
+                        marginal_nll_at(&model, s, &p, &eta)
+                    })
+                    .sum::<f64>()
+            };
+            let fd_at = |k: usize, h: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[k] += h;
+                let mut xm = x.clone();
+                xm[k] -= h;
+                (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+            };
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let f1 = fd_at(k, h);
+                let f2 = fd_at(k, h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                eprintln!(
+                    "ode m3+ruv (right={right}) x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[k],
+                    fd,
+                    (analytic[k] - fd).abs() / fd.abs().max(1e-9)
+                );
+                approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 2e-5);
+            }
+        }
+    }
+
     /// The analytic **FOCE** (Sheiner–Beal, non-interaction) M3 packed gradient
     /// (censored rows excluded from R̃, added as `−logΦ((LLOQ−f̂)/√R⁰)` with the
     /// population variance) must match the reconverged-FD of ferx's FOCE-M3

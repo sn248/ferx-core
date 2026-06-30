@@ -2827,6 +2827,77 @@ mod tests {
         }
     }
 
+    /// **Non-IOV ODE** M3 BLOQ + `iiv_on_ruv` (#486 — the last `iiv_on_ruv` holdout):
+    /// the ODE counterpart of [`analytic_inner_gradient_iiv_on_ruv_m3_matches_fd`]. The
+    /// censored residual-eta data column `h·z` and the `exp(2·η_ruv)` variance scaling are
+    /// applied by the provider-agnostic `residual_inner_obs` over the **event-driven ODE
+    /// walk's** `ObsSens` (not the closed-form provider), so the analytic inner η-gradient
+    /// must match central FD of `individual_nll`. This is what flipping `iiv_on_ruv_forces_fd`
+    /// to a uniform `false` now admits on the inner loop.
+    #[test]
+    fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  omega ETA_RUV ~ 0.05\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot / V - (CL/V) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  method = focei\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse ODE iiv_on_ruv");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert_eq!(model.residual_error_eta, Some(3));
+        assert!(model.is_ode_based(), "model must be on the ODE path");
+        assert!(
+            !model.iiv_on_ruv_forces_fd(),
+            "non-IOV ODE M3 + iiv_on_ruv must no longer force FD (#486)"
+        );
+
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
+            obs_raw_times: Vec::new(),
+            // The last two rows are below the LLOQ (carried in `cens`).
+            observations: vec![8.0, 7.0, 5.0, 3.0, 2.0, 2.0],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0, 0, 1, 1],
+            occasions: vec![1; 6],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let theta = &model.default_params.theta;
+        let omega = &model.default_params.omega;
+        let sigma = &model.default_params.sigma.values;
+        let eta = vec![0.12, -0.05, 0.2, 0.15]; // non-zero η_ruv
+
+        let analytic = analytic_eta_nll_gradient(&model, &subject, theta, &eta, omega, sigma)
+            .expect("analytic non-IOV ODE M3 + iiv_on_ruv inner gradient");
+
+        let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
+        let obj = |e: &[f64]| -> f64 {
+            let mut s = scratch.borrow_mut();
+            individual_nll_into_with_schedule(
+                &model, &subject, theta, e, omega, sigma, &mut s, None,
+            )
+        };
+        let fd = gradient_fd(&obj, &eta, model.n_eta);
+        for k in 0..model.n_eta {
+            assert!(
+                (analytic[k] - fd[k]).abs() < 1e-4 * (1.0 + fd[k].abs()),
+                "η[{k}]: analytic {} vs FD {}",
+                analytic[k],
+                fd[k]
+            );
+        }
+    }
+
     /// Dense BFGS vs L-BFGS scaling with inner dimension `n`, on an
     /// ill-conditioned 1-D-Laplacian quadratic `½xᵀLx − 1ᵀx` (cond ≈ (n/π)², so
     /// the solve needs ~O(n) curvature updates — representative of a curved inner

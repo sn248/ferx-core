@@ -4190,7 +4190,7 @@ mod iov_tests {
         subject.observations = preds.iter().map(|p| p * 0.85).collect();
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
-        let k = split_obs_by_occasion(&subject).len();
+        let k = iov_occasion_groups(&subject).len();
         let n_stacked = n_eta + k * n_kappa;
         let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
         let stacked = vec![0.10, -0.05, 0.08, 0.05, -0.07];
@@ -4305,7 +4305,7 @@ mod iov_tests {
         subject.observations = preds.iter().map(|p| p * 0.85).collect();
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
-        let k = split_obs_by_occasion(&subject).len();
+        let k = iov_occasion_groups(&subject).len();
         let n_stacked = n_eta + k * n_kappa;
         let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
         // Non-zero η_ruv (index 3) so the residual-variance scaling is exercised.

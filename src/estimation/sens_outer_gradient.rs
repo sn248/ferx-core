@@ -5609,6 +5609,120 @@ mod tests {
         }
     }
 
+    /// 1-cpt oral **user-ODE** IOV model carrying an η-dependent `ExpressionScale`
+    /// `obs_scale` divisor (`obs_scale = 1000 / V`, `V = TVV·exp(ETA_V)`) — the
+    /// [`ONECPT_ODE_IOV`] geometry plus the #575 post-walk quotient scale. The scale
+    /// rides the `(θ, stacked-η)` jet *before* the provider-agnostic M3 censoring
+    /// coefficient is applied, so it composes with BLOQ rows at a different layer.
+    /// Drives the ODE M3 × `ExpressionScale` × IOV cross-check below (#623 review).
+    const ONECPT_ODE_IOV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[scaling]
+  obs_scale = 1000 / V
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  ode_reltol  = 1e-10
+  ode_abstol  = 1e-12
+"#;
+
+    /// **ODE M3 + IOV + η-dependent `ExpressionScale` `obs_scale`** (#623 review of #486):
+    /// the gate flip in `ode_iov_supported` admits censored rows alongside the #575 scale
+    /// quotient, a combination the closed-form mirror never reaches (its gate rejects every
+    /// non-`None` scaling) and that the #486 tests did not exercise. The two features
+    /// compose at different layers — the scale is a post-walk quotient on the `(θ, stacked-η)`
+    /// jet (incl. its second-order derivatives), and the M3 `−logΦ` coefficient is applied
+    /// over that already-scaled jet keyed on `subject.cens[j]`. If the second-order
+    /// composition of the quotient were inconsistent for censored rows, the marginal
+    /// `log|H̃|` term would be wrong. The full `[θ, Ω_bsv, σ, Ω_iov]` analytic packed
+    /// gradient must match Richardson reconverged FD of the FOCEI IOV marginal over every
+    /// packed coordinate, on both censoring tails — proving the composition is consistent.
+    #[test]
+    fn iov_m3_ode_expression_scale_packed_gradient_matches_reconverged_fd() {
+        use crate::estimation::parameterization::pack_params;
+
+        let mut model = parse_model_string(ONECPT_ODE_IOV_EXPRSCALE)
+            .expect("parse ODE IOV + ExpressionScale obs_scale");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(model.is_ode_based(), "must be on the ODE path");
+        assert!(
+            matches!(
+                model.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ),
+            "model must carry an ExpressionScale obs_scale"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + M3 + ExpressionScale obs_scale must be analytic (#486/#575)"
+        );
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+
+        for right in [false, true] {
+            let subject = if right {
+                iov_m3_subject_right(&model, &theta)
+            } else {
+                iov_m3_subject(&model, &theta)
+            };
+            assert!(
+                subject.cens.iter().any(|&c| c != 0),
+                "subject must be censored"
+            );
+            let template = params.clone();
+            let x = pack_params(&params);
+
+            let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+            let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+                .expect("ODE IOV + M3 + ExpressionScale packed gradient supported");
+
+            let f = |xx: &[f64]| -> f64 {
+                let p = unpack_params(xx, &template);
+                marginal_nll_iov(&model, &subject, &p)
+            };
+            for i in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[i].abs());
+                let fd_at = |hh: f64| -> f64 {
+                    let mut xp = x.clone();
+                    xp[i] += hh;
+                    let mut xm = x.clone();
+                    xm[i] -= hh;
+                    (f(&xp) - f(&xm)) / (2.0 * hh)
+                };
+                let f1 = fd_at(h);
+                let f2 = fd_at(h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                eprintln!(
+                    "iov+m3 ode+exprscale (right={right}) packed x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[i],
+                    fd,
+                    (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+                );
+                approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+            }
+        }
+    }
+
     /// Two-occasion IOV + `iiv_on_ruv` subject (the [`iov_ruv_subject`] geometry) with
     /// occasion 2's two tail observations flagged `CENS = 1` — the **triple**
     /// M3 + IOV + `iiv_on_ruv` (#591). Shallow left-censoring (≈ 0.85·f) keeps the

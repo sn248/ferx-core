@@ -366,6 +366,7 @@ mod tests {
             confirm,
             levels,
             target_window: None,
+            auc_target: None,
             rules,
         }
     }
@@ -717,6 +718,7 @@ mod tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
         }
     }

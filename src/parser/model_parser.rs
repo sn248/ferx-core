@@ -3937,6 +3937,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<f64>> = None;
     let mut target_window: Option<(f64, f64)> = None;
+    let mut auc_target: Option<(f64, f64)> = None;
     let mut rules: Vec<AdaptiveRule> = Vec::new();
 
     for line in lines {
@@ -4050,6 +4051,28 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
                 }
                 target_window = Some((lo, hi));
             }
+            "auc_target" => {
+                // Exposure band `[low, high]` for the `auc_target_attainment` metric
+                // only — it does not affect dosing. It is the AUC of a non-negative
+                // signal, so `low` must be finite *and* `>= 0`; `high` may be `inf`
+                // for a one-sided "at or above low" target. Mirrors
+                // `AdaptiveDosingSpec::validate`.
+                let b = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad auc_target: {e}"))?;
+                if b.len() != 2 {
+                    return Err(format!(
+                        "[adaptive_dosing]: auc_target must be `[low, high]`: {val}"
+                    ));
+                }
+                let (lo, hi) = (b[0], b[1]);
+                if !lo.is_finite() || lo < 0.0 || hi.is_nan() || hi < lo {
+                    return Err(format!(
+                        "[adaptive_dosing]: auc_target must be `[low, high]` with low finite, \
+                         0 <= low <= high (high may be `inf`): {val}"
+                    ));
+                }
+                auc_target = Some((lo, hi));
+            }
             other => return Err(format!("[adaptive_dosing]: unknown key `{other}`")),
         }
     }
@@ -4077,6 +4100,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
         confirm,
         levels,
         target_window,
+        auc_target,
         rules,
     };
     spec.validate()?;
@@ -5083,13 +5107,23 @@ fn build_obs_scale_spec(
 /// compartment index for an **analytical** `pk_model`, validating that an
 /// initial amount in that compartment is supported (issue #521).
 ///
-/// Accepted names: `central` (every model), `depot` (oral models, cmt 1), or a
-/// 1-based integer index. Peripheral compartments are rejected — seeding a
-/// peripheral needs the cross-compartment Green's function, which the closed
-/// forms don't expose; use an ODE model for that.
+/// Accepted names: `central` (every model), `depot` (first-order oral models,
+/// cmt 1), or a 1-based integer index. Peripheral compartments are rejected —
+/// seeding a peripheral needs the cross-compartment Green's function, which the
+/// closed forms don't expose; use an ODE model for that.
 fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
     let is_oral = pk_model.is_oral();
     let central = if is_oral { 2 } else { 1 };
+    // A pre-loaded *depot* amount is delivered to central by a first-order
+    // absorption Green's function, which only the oral models expose. The analytic
+    // `one_cpt_transit` model is `is_oral()` (absorption layout, central = cmt 2)
+    // but its "depot" is a lumped Gamma-convolution memory with no closed form for
+    // a seeded amount, so a transit depot init is rejected here — otherwise
+    // `analytical_init_concentration_g`'s depot arm would silently drop it (#386).
+    let depot_seedable = matches!(
+        pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+    );
     let lname = name.trim().to_lowercase();
 
     let cmt = if let Ok(n) = lname.parse::<usize>() {
@@ -5097,7 +5131,16 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
     } else {
         match lname.as_str() {
             "central" => central,
-            "depot" if is_oral => 1,
+            "depot" if depot_seedable => 1,
+            "depot" if matches!(pk_model, PkModel::OneCptTransit) => {
+                return Err(format!(
+                    "[initial_conditions]: `{}` (analytic transit) does not support a `depot` \
+                     initial amount — its transit chain is a lumped convolution with no closed \
+                     form for a pre-loaded depot. Use `central`, or an ODE transit model \
+                     (transit() forcing in [odes]) for a depot initial condition.",
+                    pk_model.canonical_name()
+                ));
+            }
             "depot" => {
                 return Err(format!(
                     "[initial_conditions]: `depot` is only valid for oral models; \
@@ -5110,21 +5153,34 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
                     "[initial_conditions]: unknown compartment `{}`. Use `central`{}, \
                      or a 1-based CMT index.",
                     name,
-                    if is_oral { " or `depot`" } else { "" }
+                    if depot_seedable { " or `depot`" } else { "" }
                 ));
             }
         }
     };
 
-    if cmt == central || (is_oral && cmt == 1) {
+    if cmt == central || (depot_seedable && cmt == 1) {
         Ok(cmt)
+    } else if matches!(pk_model, PkModel::OneCptTransit) && cmt == 1 {
+        // Numeric `init(1)` on transit: same lumped-convolution limitation as
+        // the named `depot` form above (#386).
+        Err(format!(
+            "[initial_conditions]: `{}` (analytic transit) does not support a depot (cmt 1) \
+             initial amount — its transit chain is a lumped convolution with no closed form \
+             for a pre-loaded depot. Use `central` (cmt 2), or an ODE transit model.",
+            pk_model.canonical_name()
+        ))
     } else {
         Err(format!(
             "[initial_conditions]: initial amounts are only supported in the central \
              compartment{} (got compartment {}). A peripheral-compartment initial amount \
              needs the cross-compartment impulse response, which the analytical closed \
              forms don't expose — use an ODE model with `init(...)` in [odes] (issue #521).",
-            if is_oral { " or the oral depot" } else { "" },
+            if depot_seedable {
+                " or the oral depot"
+            } else {
+                ""
+            },
             cmt
         ))
     }
@@ -25319,6 +25375,56 @@ mod adaptive_dosing_tests {
             let err = parse_adaptive_dosing_block(&b).expect_err("expected a typed parse error");
             assert!(
                 err.starts_with("[adaptive_dosing]:") && err.contains("target_window"),
+                "`{bad}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn auc_target_parses_band_and_one_sided() {
+        // Default: no `auc_target` ⇒ `None` (the signal-AUC pass is skipped and
+        // `auc_target_attainment` is unreported).
+        let none = parse_adaptive_dosing_block(&without("nothing")).expect("valid_min parses");
+        assert_eq!(none.auc_target, None);
+
+        // Two-sided AUC₂₄ band (the vancomycin 400–600 mg·h/L target).
+        let band = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("auc_target = [400, 600]".into());
+            b
+        })
+        .expect("two-sided auc_target parses");
+        assert_eq!(band.auc_target, Some((400.0, 600.0)));
+
+        // One-sided "at or above 400": `high = inf` is allowed.
+        let one_sided = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("auc_target = [400, inf]".into());
+            b
+        })
+        .expect("one-sided auc_target parses");
+        let (lo, hi) = one_sided.auc_target.expect("Some");
+        assert_eq!(lo, 400.0);
+        assert!(hi.is_infinite() && hi > 0.0);
+    }
+
+    #[test]
+    fn auc_target_bad_band_errors() {
+        // Inverted, negative/non-finite low, and wrong arity each reject loudly,
+        // naming the key. Unlike `target_window`, a *negative* low is also rejected
+        // (an AUC of a non-negative signal cannot be < 0).
+        for bad in [
+            "auc_target = [600, 400]", // high < low
+            "auc_target = [-1, 600]",  // low must be >= 0
+            "auc_target = [nan, 600]",
+            "auc_target = [inf, 600]", // low must be finite
+            "auc_target = [400]",      // not [low, high]
+        ] {
+            let mut b = without("nothing");
+            b.push(bad.into());
+            let err = parse_adaptive_dosing_block(&b).expect_err("expected a typed parse error");
+            assert!(
+                err.starts_with("[adaptive_dosing]:") && err.contains("auc_target"),
                 "`{bad}` gave: {err}"
             );
         }

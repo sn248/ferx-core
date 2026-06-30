@@ -86,11 +86,37 @@ event time. This supports NONMEM-style `$PK` switches such as:
 
 For analytical models, using `TIME`/`time` routes the subject through the same
 event-driven parameter-switching path used for time-varying covariates. This
-matches the NONMEM `$PK IF (TIME.GT.45) ...` event-time convention: the
-parameter value used for each dose decay interval is the value active at that
-event on the PK timeline. For reset-stacked data where the displayed sdtab
-`TIME` may use the raw per-occasion clock, this built-in follows the internal
-monotone PK event clock.
+matches the NONMEM `$PK IF (TIME.GT.45) ...` event-time convention: `$PK` is
+re-evaluated at each event, and the analytical amount is advanced across each
+inter-event interval with the parameters in effect at the interval's end event.
+For reset-stacked data where the displayed sdtab `TIME` may use the raw
+per-occasion clock, this built-in follows the internal monotone PK event clock.
+
+#### Numerical check against NONMEM
+
+A one-compartment IV bolus (dose 100 at `t = 0`, `V = 10`) with a `CL` switch at
+`TIME = 10` from `CL_E = 1` to `CL_L = 5`, observed at `t = 5` and `t = 20`:
+
+```
+[individual_parameters]
+  if (TIME > 10) { CL = CL_L } else { CL = CL_E }
+  V = V
+```
+
+| Obs `TIME` | Active `CL` advance | ferx `PRED` | NONMEM `$PK IF(TIME.GT.10)` |
+|-----------:|--------------------|------------:|----------------------------:|
+| 5  | `CL_E` over `[0, 5]`            | `10·e^(−0.5)` = 6.065307 | 6.065307 |
+| 20 | `CL_E` `[0,5]` then `CL_L` `[5,20]` | `10·e^(−8.0)` = 0.003355 | 0.003355 |
+
+The `t = 20` prediction is **not** `10·e^(−2) ≈ 1.35` (what a frozen `TIME = 0`
+would give, since the switch would never fire) and **not** `10·e^(−10)` (what a
+single `CL_L` applied over the whole history would give): the value `10·e^(−8)`
+is the event-driven result NONMEM produces, where `CL_L` governs only the
+`[5, 20]` advance. This equivalence is locked by
+`tests/time_origin.rs::time_builtin_cl_switch_matches_nonmem_event_time_semantics`;
+the same `TIME` event clock drives ODE right-hand sides
+(`tests/time_origin.rs::ode_time_builtin_*`) and `[derived]` columns
+(`tests/derived_output.rs::derived_time_builtin_echoes_per_observation_time`).
 
 ### Interaction with mu-referencing
 

@@ -2605,6 +2605,10 @@ fn build_derived_eval_fn(expr: Expression) -> DerivedEvalFn {
     let expr = std::sync::Arc::new(expr);
     Box::new(move |ctx: &DerivedContext<'_>| {
         let vars = build_derived_vars(ctx);
+        // A bare `TIME` parses to `Expression::Time`, resolved from the model-time
+        // thread-local; set it to this row's event time so `[derived]` columns
+        // honour the `TIME` built-in instead of reading the 0.0 default (#610).
+        let _time_guard = ModelTimeGuard::enter(ctx.time);
         // Covariates become Variable nodes (fallback_covariate=false at parse time),
         // so pass an empty covariates map and rely on vars for all name resolution.
         eval_expression(&expr, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
@@ -2616,6 +2620,9 @@ fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
     let cond = std::sync::Arc::new(cond);
     Box::new(move |ctx: &DerivedContext<'_>| {
         let vars = build_derived_vars(ctx);
+        // Match `build_derived_eval_fn`: a `TIME`-keyed filter sees this row's
+        // event time, not the 0.0 default (#610).
+        let _time_guard = ModelTimeGuard::enter(ctx.time);
         eval_condition(&cond, ctx.theta, ctx.eta, &HashMap::new(), &vars, &[])
     })
 }
@@ -7064,6 +7071,11 @@ fn build_ode_spec(
                 // `[covariate_nn]` outputs are routed via `pk_param_fn`, not
                 // the ODE RHS, so this stays empty.
                 let empty_nn_outputs: Vec<Vec<f64>> = Vec::new();
+                // A bare `TIME` in the RHS parses to `Expression::Time`
+                // (`Op::PushTime`), which resolves from the model-time
+                // thread-local — not the `time_slot` the `T`/`t` aliases use.
+                // Set it to the integrator clock so `TIME` matches `T` (#610).
+                let _time_guard = ModelTimeGuard::enter(t);
                 eval_statements_indexed_with_stack(
                     &stmts_owned,
                     &empty_theta,
@@ -8829,7 +8841,14 @@ fn build_pk_param_fn(
     let covariate_nns_owned: Vec<crate::nn::CovariateNn> = covariate_nns.to_vec();
 
     let pk_param_fn: PkParamFn = Box::new(
-        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64| {
+            // Resolve the `TIME` built-in from the event time the caller passed.
+            // `Expression::Time` / `Op::PushTime` and the analytical
+            // `pk_time_mapping` slots read the model-time thread-local, so set
+            // it here for the duration of this evaluation. Gated on
+            // `uses_time_builtin` so models that don't use the built-in (the
+            // common case) pay nothing for the guard (#610).
+            let _time_guard = uses_time_builtin.then(|| ModelTimeGuard::enter(time));
             // Pre-compute each NN's forward output once per call. The
             // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
             // every `Expression::NnOutput` it visits, so multiple `.CL`,
@@ -8974,20 +8993,31 @@ thread_local! {
     static MODEL_TIME: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
+/// RAII guard that sets the model-time thread-local for the duration of a
+/// scope and restores the previous value on drop (panic-safe). Used at every
+/// eval boundary that resolves `Expression::Time` / `Op::PushTime` so the
+/// built-in `TIME` sees the event/integration time rather than the `0.0`
+/// default. Hold it for the lifetime of an evaluation; let it drop to restore.
+pub(crate) struct ModelTimeGuard(f64);
+
+impl ModelTimeGuard {
+    /// Set `MODEL_TIME` to `time`, returning a guard that restores the prior
+    /// value when dropped.
+    pub(crate) fn enter(time: f64) -> Self {
+        let prev = MODEL_TIME.with(|cell| cell.replace(time));
+        ModelTimeGuard(prev)
+    }
+}
+
+impl Drop for ModelTimeGuard {
+    fn drop(&mut self) {
+        MODEL_TIME.with(|cell| cell.set(self.0));
+    }
+}
+
 pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
-    MODEL_TIME.with(|cell| {
-        let prev = cell.replace(time);
-        struct TimeGuard<'a>(&'a std::cell::Cell<f64>, f64);
-        impl Drop for TimeGuard<'_> {
-            fn drop(&mut self) {
-                self.0.set(self.1);
-            }
-        }
-        let guard = TimeGuard(cell, prev);
-        let out = f();
-        drop(guard);
-        out
-    })
+    let _guard = ModelTimeGuard::enter(time);
+    f()
 }
 
 fn current_model_time() -> f64 {
@@ -10889,6 +10919,10 @@ impl OdeRhsProgram {
         }
         // The ODE RHS references states/indiv-params (in `vars`) only, not
         // θ/η/cov directly — so those are empty here.
+        // A bare `TIME` resolves to `Op::PushTime` (the model-time
+        // thread-local), not the `time_slot` used by the `T`/`t` aliases; set
+        // it to the integrator clock so `TIME` matches `T` (#610).
+        let _time_guard = ModelTimeGuard::enter(t);
         eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack, &[]);
     }
 }
@@ -18079,12 +18113,12 @@ if (X < 10) {
 
         let mut covs_heavy = HashMap::new();
         covs_heavy.insert("WT".to_string(), 100.0);
-        let p_heavy = (parsed.model.pk_param_fn)(&theta, &eta, &covs_heavy);
+        let p_heavy = (parsed.model.pk_param_fn)(&theta, &eta, &covs_heavy, 0.0);
         assert!((p_heavy.values[0] - 4.0).abs() < 1e-12, "WT=100 → CL=4");
 
         let mut covs_light = HashMap::new();
         covs_light.insert("WT".to_string(), 50.0);
-        let p_light = (parsed.model.pk_param_fn)(&theta, &eta, &covs_light);
+        let p_light = (parsed.model.pk_param_fn)(&theta, &eta, &covs_light, 0.0);
         assert!((p_light.values[0] - 2.0).abs() < 1e-12, "WT=50 → CL=2");
     }
 
@@ -18177,12 +18211,12 @@ if (X < 10) {
 
         let mut male = HashMap::new();
         male.insert("SEX".to_string(), 1.0);
-        let p_male = (parsed.model.pk_param_fn)(&theta, &eta, &male);
+        let p_male = (parsed.model.pk_param_fn)(&theta, &eta, &male, 0.0);
         assert!((p_male.values[0] - 3.0).abs() < 1e-12);
 
         let mut female = HashMap::new();
         female.insert("SEX".to_string(), 0.0);
-        let p_female = (parsed.model.pk_param_fn)(&theta, &eta, &female);
+        let p_female = (parsed.model.pk_param_fn)(&theta, &eta, &female, 0.0);
         assert!((p_female.values[0] - 2.0).abs() < 1e-12);
     }
 
@@ -19342,7 +19376,7 @@ if (WT > 70) {
         // flows through to the slot.
         let theta: Vec<f64> = parsed.model.default_params.theta.clone();
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
-        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
         assert_eq!(pk.lagtime(), 0.5);
     }
 
@@ -19380,7 +19414,7 @@ if (WT > 70) {
 
         let theta: Vec<f64> = parsed.model.default_params.theta.clone();
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
-        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
         assert_eq!(pk.lagtime(), 0.75);
     }
 
@@ -19476,7 +19510,7 @@ if (WT > 70) {
         let parsed = super::parse_full_model(model_str).unwrap();
         let theta: Vec<f64> = parsed.model.default_params.theta.clone();
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
-        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
         assert_eq!(pk.ka(), 2.5, "literal ka should bind as the constant 2.5");
         assert!(
             pk.cl() > 0.0,
@@ -19513,7 +19547,7 @@ if (WT > 70) {
             super::parse_full_model(model_str).expect("model with CL defined should parse");
         let theta: Vec<f64> = parsed.model.default_params.theta.clone();
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
-        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
         assert!(pk.cl() > 0.0, "cl should bind to KE * V, got {}", pk.cl());
     }
 
@@ -19660,7 +19694,7 @@ if (WT > 70) {
 
         let theta: Vec<f64> = parsed.model.default_params.theta.clone();
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
-        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
         assert_eq!(
             pk.lagtime(),
             0.5,
@@ -19702,7 +19736,7 @@ if (WT > 70) {
         let parsed = super::parse_full_model(model_str).unwrap();
         let theta: Vec<f64> = parsed.model.default_params.theta.clone();
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
-        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
         assert_eq!(
             pk.f_bio(),
             0.7,
@@ -19751,7 +19785,7 @@ if (WT > 70) {
         let parsed = super::parse_full_model(model_str).unwrap();
         let theta: Vec<f64> = parsed.model.default_params.theta.clone();
         let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
-        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
         assert_eq!(
             pk.f_bio(),
             1.0,
@@ -20449,7 +20483,7 @@ if (WT > 70) {
         cov.insert("WT".to_string(), 70.0);
         cov.insert("CRCL".to_string(), 95.0);
 
-        let pk = (model.pk_param_fn)(&theta, &eta, &cov);
+        let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
 
         // What the NN itself would emit, sliced from the same theta vector.
         let nn = &model.covariate_nns[0];
@@ -20484,7 +20518,7 @@ if (WT > 70) {
         let tv_cl = nn_outputs[0];
 
         // eta = +0.3 → CL should be tv_cl * exp(0.3).
-        let pk = (model.pk_param_fn)(&theta, &[0.3_f64, 0.0_f64], &cov);
+        let pk = (model.pk_param_fn)(&theta, &[0.3_f64, 0.0_f64], &cov, 0.0);
         let expected = tv_cl * 0.3_f64.exp();
         assert!(
             (pk.values[PK_IDX_CL] - expected).abs() < 1e-10,
@@ -20837,7 +20871,7 @@ if (WT > 70) {
         for (i, &s) in pk_slots.iter().enumerate() {
             slot_dual.insert(s, pk_duals[i]);
         }
-        let pk_vals = (model.pk_param_fn)(&theta, &eta, &cov);
+        let pk_vals = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
         let var_duals: Vec<Dual2<M>> = prog
             .var_to_pk_slot()
             .iter()
@@ -20852,7 +20886,7 @@ if (WT > 70) {
 
         // Reference: scale as a function of (θ, η) through pk_param_fn.
         let g = |th: &[f64], et: &[f64]| -> f64 {
-            let pk = (model.pk_param_fn)(th, et, &cov);
+            let pk = (model.pk_param_fn)(th, et, &cov, 0.0);
             scale_fn(th, et, &cov, &pk)
         };
         approx::assert_relative_eq!(scale.value, g(&theta, &eta), max_relative = 1e-12);
@@ -20909,7 +20943,7 @@ if (WT > 70) {
                 let cov = HashMap::new();
                 // Mimic what apply_scaling does at runtime: evaluate pk_param_fn
                 // with the subject's theta/eta/covariates to materialize V.
-                let pk = (model.pk_param_fn)(&theta, &eta, &cov);
+                let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
                 let s = scale_fn(&theta, &eta, &cov, &pk);
                 assert!(
                     (s - 20.0).abs() < 1e-12,
@@ -22491,8 +22525,8 @@ if (WT > 70) {
         let mut tm = theta.to_vec();
         tp[k] += h;
         tm[k] -= h;
-        let pk_plus = (model.pk_param_fn)(&tp, eta, cov);
-        let pk_minus = (model.pk_param_fn)(&tm, eta, cov);
+        let pk_plus = (model.pk_param_fn)(&tp, eta, cov, 0.0);
+        let pk_minus = (model.pk_param_fn)(&tm, eta, cov, 0.0);
         let slot = model.pk_indices[i];
         (pk_plus.values[slot] - pk_minus.values[slot]) / (2.0 * h)
     }
@@ -22511,8 +22545,8 @@ if (WT > 70) {
         let mut em = eta.to_vec();
         ep[k] += h;
         em[k] -= h;
-        let pk_plus = (model.pk_param_fn)(theta, &ep, cov);
-        let pk_minus = (model.pk_param_fn)(theta, &em, cov);
+        let pk_plus = (model.pk_param_fn)(theta, &ep, cov, 0.0);
+        let pk_minus = (model.pk_param_fn)(theta, &em, cov, 0.0);
         let slot = model.pk_indices[i];
         (pk_plus.values[slot] - pk_minus.values[slot]) / (2.0 * h)
     }

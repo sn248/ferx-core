@@ -23,7 +23,12 @@ section of the SDLC for the versioning policy).
 - `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
   expressions and direct analytical `pk(...=TIME)` mappings, enabling
   NONMEM-style time-dependent PK parameter switches without declaring `TIME` as
-  a covariate (#607).
+  a covariate (#607). The event time is threaded through every prediction and
+  diagnostic path — analytical and ODE predictions, the `[odes]` right-hand side,
+  sdtab individual-parameter columns, `[derived]` columns, the survival/TTE
+  hazard, and the SDE EKF — so `TIME` resolves to each event's time everywhere
+  rather than only on the main prediction path; for models that use it, analytic
+  FOCE/FOCEI sensitivities fall back to finite differences (#610).
 - **Per-subject outcome metrics for adaptive dosing** (#391, S2.4). `simulate_adaptive()` and
   `simulate_adaptive_from_spec()` now return a `metrics` field on `AdaptiveSimulationResult` —
   one `AdaptiveSubjectMetrics` row per realized `(subject, draw, sim)` run: cumulative dose,

@@ -24,9 +24,9 @@ fn pk_params_at_time(
     covariates: &std::collections::HashMap<String, f64>,
     time: f64,
 ) -> PkParams {
-    crate::parser::model_parser::with_model_time(time, || {
-        (model.pk_param_fn)(theta, eta, covariates)
-    })
+    // `pk_param_fn` sets the model-time thread-local from `time` itself, so the
+    // `TIME` built-in resolves to this event time without a separate wrap.
+    (model.pk_param_fn)(theta, eta, covariates, time)
 }
 
 /// Divide each prediction in-place by the scale derived from
@@ -70,7 +70,9 @@ pub fn apply_scaling(
     // forward passes. (Caught by Copilot review on PR #85.)
     let pk_owned;
     let pk_ref: &PkParams = if model.scaling.needs_pk_eval() {
-        pk_owned = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        // Subject-static scale snapshot (the divisive scale is applied to the
+        // whole prediction vector): typical values at t=0.
+        pk_owned = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         &pk_owned
     } else {
         static DEFAULT_PK: PkParams = PkParams {
@@ -125,8 +127,9 @@ pub fn add_analytical_init(
         return;
     }
     // Non-IOV path: one subject-static PK snapshot drives both the baseline
-    // amount and its decay kernel.
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // amount and its decay kernel. The baseline is seeded at the record start
+    // (t=0), so the `TIME` built-in resolves there.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     add_analytical_init_with(model, subject, theta, eta, &pk, None, preds);
 }
 
@@ -438,7 +441,9 @@ pub fn compute_event_pk_params_into(
             ));
         }
     } else {
-        let p = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        // Reached only when the model uses neither TV covariates nor the `TIME`
+        // built-in, so a single snapshot (t=0) is exact for every event.
+        let p = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         // pk_only stays empty — see EventPkParams docstring.
         for _ in 0..subject.doses.len() {
             out.dose.push(p);
@@ -630,7 +635,9 @@ pub fn predict_iov(
     // IOV-on-disposition baseline decays at the occasion-correct rate rather than
     // the kappa-less BSV rate (issue #521 review).
     if !model.analytical_init.is_empty() && model.ode_spec.is_none() {
-        let amount_pk = (model.pk_param_fn)(theta, eta_bsv, &subject.covariates);
+        // Baseline amount is seeded at the record start (internal t=0 under the
+        // subject-relative time origin), so the `TIME` built-in resolves there.
+        let amount_pk = (model.pk_param_fn)(theta, eta_bsv, &subject.covariates, 0.0);
         add_analytical_init_with(
             model,
             subject,
@@ -1286,7 +1293,8 @@ pub fn compute_predictions_with_states(
             // with IOV and reset. W_DERIVED_CMT_TV_ANALYTICAL explains why.
             vec![]
         } else {
-            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+            // Reached only when !uses_time (guarded above), so t=0 is exact.
+            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
             // Resolve modeled-`RATE` doses (#394) before the superposition states.
             let resolved = crate::ode::resolve_subject_doses(
                 subject,
@@ -1585,7 +1593,9 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         }
     } else {
         // No-TV fast path (or TV with unsupported model — see docstring).
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        // The fast path is time-independent; the degraded unsupported-model
+        // branch matches the existing single-snapshot TV behaviour.
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
         let resolved =
             crate::ode::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
@@ -1924,7 +1934,7 @@ mod tests {
             error_model: ErrorModel::Additive,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|theta, _eta, cov| {
+            pk_param_fn: Box::new(|theta, _eta, cov, _t: f64| {
                 let mut p = PkParams::default();
                 let cr = cov.get("CR").copied().unwrap_or(1.0);
                 p.values[crate::types::PK_IDX_CL] = theta[0] * cr;

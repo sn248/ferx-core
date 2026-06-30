@@ -1122,7 +1122,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             collect_referenced_identifiers(lines, &mut downstream_refs);
         }
     }
-    let indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
+    let mut indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
         .into_iter()
         .filter(|n| {
             top_level_names.iter().any(|t| t == n)
@@ -1131,12 +1131,42 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .collect();
     let indiv_ctx =
         ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
-    let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
+    let mut indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
 
     // Detect ODE vs analytical model
     let is_ode = struct_lines
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
+
+    // #486 — desugar a bare θ/η in a Form-C `y = expr` readout into a synthetic
+    // individual parameter (`__ferx_ro_th{i} = THETA(i)` / `…eta{k} = ETA(k)`). The
+    // readout (rewritten in `parse_scaling_block` below) then references that
+    // parameter, so its direct θ/η dependence rides the validated
+    // individual-parameter sensitivity chain rather than dropping the subject to FD.
+    // Must run *before* `ode_param_slots` / `build_ode_spec` / `build_pk_param_fn`
+    // (which all consume `indiv_var_names` / `indiv_stmts`) so the synthetic params
+    // get slots, values, and partials like any individual parameter. Only `y`
+    // readouts are scanned; `obs_scale` θ/η stays with `ScaleDerivProgram`.
+    let readout_synth_params: Vec<ReadoutSynthParam> = if is_ode {
+        match blocks.get("scaling") {
+            Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    for s in &readout_synth_params {
+        // The synthetic name is reserved (`__ferx_ro_`) and BTreeSet-deduped, so it
+        // cannot collide with a user parameter; append it as a trailing individual
+        // parameter (value = θ_i / η_k, ∂p/∂θ_i = 1 / ∂p/∂η_k = 1).
+        indiv_var_names.push(s.name.clone());
+        let rhs = if s.is_eta {
+            Expression::Eta(s.idx)
+        } else {
+            Expression::Theta(s.idx)
+        };
+        indiv_stmts.push(Statement::Assign(s.name.clone(), rhs));
+    }
 
     // The error rule (#322 Phase 0b): an ODE-only absorption input-rate function
     // (`transit`/`igd`/`weibull`) has no closed form, so it cannot ride on an
@@ -1988,6 +2018,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &state_names_for_scaling,
             is_ode_model,
             &model.kappa_names,
+            &readout_synth_params,
         )?;
 
         // AD compatibility check (Phase 2.5):
@@ -2375,6 +2406,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .iter()
             .enumerate()
             .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
+            // Individual parameters the parser synthesized for a direct-θ/η Form-C
+            // readout (`__ferx_ro_*`, #486) are referenced by the readout via the
+            // post-census rewrite (`rewrite_readout_synth`), not in the raw block
+            // text the census tokenizes — so they always look "dead" here. They are
+            // load-bearing (the readout reads them), so exempt them.
+            .filter(|(_, name)| !is_synthetic_readout_param(name))
             // Exempt parameters the *engine* applies to a dose without a textual
             // reference, so their absence from the RHS / `pk(...)` mapping does not
             // make them dead:
@@ -5192,6 +5229,7 @@ pub(crate) fn build_y_output_fn(
     pk_indices: &[usize],
     state_names: &[String],
     kappa_names: &[String],
+    readout_synth: &[ReadoutSynthParam],
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -5202,7 +5240,14 @@ pub(crate) fn build_y_output_fn(
         }
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
-    let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+    let mut expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+    // #486: rewrite the bare θ/η references the parser desugared into synthetic
+    // individual parameters (`__ferx_ro_*`, already appended to `indiv_var_names`)
+    // back to `Variable(synthetic_name)`. The readout then compiles to `Op::PushVar`
+    // and its θ/η dependence rides the individual-parameter sensitivity chain — so the
+    // analytic provider serves it instead of dropping the subject to FD. Any θ/η left
+    // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
+    rewrite_readout_synth(&mut expr, readout_synth);
 
     // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
     // readout is evaluated once per observation with a single eta, so under IOV
@@ -5275,7 +5320,6 @@ pub(crate) fn build_y_output_fn(
     // Rewrite Variable → VariableIdx and Covariate → CovariateIdx in place,
     // then compile to bytecode so the per-observation hot path is a tight
     // op-tag loop rather than a recursive `Box<Expression>` walk.
-    let mut expr = expr;
     resolve_expr_indices(&mut expr, &var_idx, &cov_idx);
     let bc = compile_bytecode(&expr);
 
@@ -5283,8 +5327,10 @@ pub(crate) fn build_y_output_fn(
     // path (issue #367): same bytecode + layout, evaluated over `Dual2<N>`. It is
     // dual-evaluable when the expression references only states / individual
     // parameters / covariates / constants — covariates thread in as constants
-    // from the per-observation snapshot (#540), so only a direct θ/η/NN reference
-    // (which would need extra chain terms) disqualifies the analytic readout.
+    // from the per-observation snapshot (#540), and a direct θ/η reference is
+    // desugared above into a synthetic individual parameter (#486), so after the
+    // `rewrite_readout_synth` pass only an NN output (`PushNnOutput`) disqualifies
+    // the analytic readout.
     let output_dual_evaluable = !bc.ops.iter().any(|op| {
         matches!(
             op,
@@ -5400,6 +5446,7 @@ fn parse_scaling_block(
     state_names: &[String],
     is_ode: bool,
     kappa_names: &[String],
+    readout_synth: &[ReadoutSynthParam],
 ) -> Result<
     (
         ScalingSpec,
@@ -5428,34 +5475,10 @@ fn parse_scaling_block(
         if trimmed.is_empty() {
             continue;
         }
-        // Split on the first `=` OUTSIDE any `[...]` bracket. A naive
-        // `splitn(2, '=')` would split inside `obs_scale[CMT=1]` and treat
-        // `obs_scale[CMT` as the key. Walk the string tracking bracket
-        // depth and split at the first depth-0 `=`.
-        let mut depth: i32 = 0;
-        let mut split_at: Option<usize> = None;
-        for (i, ch) in trimmed.char_indices() {
-            match ch {
-                '[' => depth += 1,
-                ']' => depth -= 1,
-                '=' if depth == 0 => {
-                    split_at = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let split_at = match split_at {
-            Some(p) => p,
-            None => {
-                return Err(format!(
-                    "[scaling]: expected `key = value`, got: `{}`",
-                    trimmed
-                ));
-            }
-        };
-        let key = trimmed[..split_at].trim();
-        let value = trimmed[split_at + 1..].trim();
+        // Split on the first `=` OUTSIDE any `[...]` bracket (a naive
+        // `splitn(2, '=')` would split inside `obs_scale[CMT=1]`). Shared with the
+        // #486 readout θ/η pre-scan (`collect_readout_theta_eta_synth`).
+        let (key, value) = split_scaling_entry(trimmed)?;
         let (base, cmt_opt) = parse_scaling_key(key)?;
 
         match base {
@@ -5510,6 +5533,7 @@ fn parse_scaling_block(
                     pk_indices,
                     state_names,
                     kappa_names,
+                    readout_synth,
                 )?;
                 for cov in cov_names {
                     if !y_covariates.contains(&cov) {
@@ -9335,6 +9359,168 @@ fn collect_theta_eta_in_stmts(
     });
 }
 
+/// Reserved name prefix for the individual parameters the parser synthesizes when a
+/// Form-C readout `y = expr` references a θ/η **directly** (issue #486). A bare
+/// `THETA(i)` / `ETA(k)` in the readout is desugared into an individual parameter
+/// equal to it (`__ferx_ro_th{i} = THETA(i)`); the readout then references that
+/// parameter instead, so its `∂y/∂θ` / `∂y/∂η` ride the validated
+/// individual-parameter sensitivity chain (every analytic walk serves the readout
+/// without a bespoke θ/η term). The prefix lets user-facing EBE / diagnostic output
+/// suppress these internal parameters — they are not user-declared quantities.
+pub(crate) const READOUT_SYNTH_PREFIX: &str = "__ferx_ro_";
+
+/// True for an individual-parameter name synthesized by the Form-C readout θ/η
+/// desugaring (see [`READOUT_SYNTH_PREFIX`]). User-facing per-subject output skips
+/// these so the synthetic parameters never surface as sdtab / fit-output columns.
+pub(crate) fn is_synthetic_readout_param(name: &str) -> bool {
+    name.starts_with(READOUT_SYNTH_PREFIX)
+}
+
+/// A θ/η reference desugared out of a Form-C readout into a synthetic individual
+/// parameter (issue #486). `is_eta` selects the source axis (`Theta(idx)` when
+/// false, `Eta(idx)` when true); `name` is the `READOUT_SYNTH_PREFIX`-prefixed
+/// individual-parameter name that mirrors it.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadoutSynthParam {
+    name: String,
+    is_eta: bool,
+    idx: usize,
+}
+
+/// Split a `[scaling]` line `key = value` at the first `=` that lies OUTSIDE any
+/// `[...]` bracket, so `obs_scale[CMT=1] = expr` splits at the top-level `=`, not the
+/// one inside the bracket. Returns the trimmed key and value.
+fn split_scaling_entry(trimmed: &str) -> Result<(&str, &str), String> {
+    let mut depth: i32 = 0;
+    let mut split_at: Option<usize> = None;
+    for (i, ch) in trimmed.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            '=' if depth == 0 => {
+                split_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let split_at =
+        split_at.ok_or_else(|| format!("[scaling]: expected `key = value`, got: `{trimmed}`"))?;
+    Ok((trimmed[..split_at].trim(), trimmed[split_at + 1..].trim()))
+}
+
+/// Scan a `[scaling]` block's `y = ...` readout entries for bare `THETA(i)` / `ETA(k)`
+/// references and synthesize one individual parameter per distinct reference (#486).
+/// Only `y` (Form-C readout) entries are scanned — `obs_scale` θ/η is differentiated
+/// separately by `ScaleDerivProgram`. Identifiers other than θ/η (states, individual
+/// parameters) parse as permissive covariate references here and are ignored; we only
+/// collect the θ/η axes. Returns the synthetic descriptors in a stable
+/// (θ-then-η, ascending index) order.
+fn collect_readout_theta_eta_synth(
+    scaling_lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+) -> Result<Vec<ReadoutSynthParam>, String> {
+    let mut thetas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut etas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for line in scaling_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = split_scaling_entry(trimmed)?;
+        let (base, _cmt) = parse_scaling_key(key)?;
+        if base != "y" {
+            continue;
+        }
+        // θ/η names resolve to `Theta`/`Eta`; every other identifier falls back to a
+        // covariate (no `defined` set needed) since we only collect the θ/η axes.
+        let ctx = ParseCtx::new(theta_names, eta_names, &[]);
+        let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        visit_expr_nodes(&expr, &mut |e: &Expression| match e {
+            Expression::Theta(i) => {
+                thetas.insert(*i);
+            }
+            Expression::Eta(i) => {
+                etas.insert(*i);
+            }
+            _ => {}
+        });
+    }
+    let mut out = Vec::with_capacity(thetas.len() + etas.len());
+    for i in thetas {
+        out.push(ReadoutSynthParam {
+            name: format!("{READOUT_SYNTH_PREFIX}th{i}"),
+            is_eta: false,
+            idx: i,
+        });
+    }
+    for k in etas {
+        out.push(ReadoutSynthParam {
+            name: format!("{READOUT_SYNTH_PREFIX}eta{k}"),
+            is_eta: true,
+            idx: k,
+        });
+    }
+    Ok(out)
+}
+
+/// Rewrite the bare `THETA(i)` / `ETA(k)` nodes that the #486 desugaring covered into
+/// `Variable(synthetic_name)`, so the readout compiles to `Op::PushVar` (an ordinary
+/// individual-parameter reference) instead of `Op::PushTheta` / `Op::PushEta`. Any θ/η
+/// not in `synth` is left intact (it then keeps the readout on the FD fallback via the
+/// `dual_evaluable` gate). Mirrors [`resolve_expr_indices`]'s recursive shape.
+fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
+    match expr {
+        Expression::Theta(i) => {
+            if let Some(s) = synth.iter().find(|s| !s.is_eta && s.idx == *i) {
+                *expr = Expression::Variable(s.name.clone());
+            }
+        }
+        Expression::Eta(i) => {
+            if let Some(s) = synth.iter().find(|s| s.is_eta && s.idx == *i) {
+                *expr = Expression::Variable(s.name.clone());
+            }
+        }
+        Expression::BinOp(l, _, r) => {
+            rewrite_readout_synth(l, synth);
+            rewrite_readout_synth(r, synth);
+        }
+        Expression::UnaryFn(_, a) => rewrite_readout_synth(a, synth),
+        Expression::Power(b, e) => {
+            rewrite_readout_synth(b, synth);
+            rewrite_readout_synth(e, synth);
+        }
+        Expression::Conditional(cond, t, e) => {
+            rewrite_readout_synth_cond(cond, synth);
+            rewrite_readout_synth(t, synth);
+            rewrite_readout_synth(e, synth);
+        }
+        Expression::Literal(_)
+        | Expression::Time
+        | Expression::Covariate(_)
+        | Expression::Variable(_)
+        | Expression::VariableIdx(_)
+        | Expression::CovariateIdx(_)
+        | Expression::NnOutput { .. } => {}
+    }
+}
+
+/// Condition-tree companion of [`rewrite_readout_synth`].
+fn rewrite_readout_synth_cond(cond: &mut Condition, synth: &[ReadoutSynthParam]) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            rewrite_readout_synth(l, synth);
+            rewrite_readout_synth(r, synth);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            rewrite_readout_synth_cond(l, synth);
+            rewrite_readout_synth_cond(r, synth);
+        }
+        Condition::Not(c) => rewrite_readout_synth_cond(c, synth),
+    }
+}
+
 /// Collect the sigma names referenced in a `ParsedErrorModel` (before index resolution).
 /// Collect the declared sigma names referenced anywhere in the `[error_model]`
 /// arguments. An argument may be a bare sigma name or a magnitude expression
@@ -11299,10 +11485,12 @@ pub struct OdeOutputProgram {
     /// in the individual-parameter dual basis the ODE provider seeds (#540).
     cov_names: Vec<String>,
     /// True when the expression references only states / individual parameters /
-    /// covariates / constants (no θ/η/NN terms) — the case the dual readout can
-    /// evaluate, threading the covariate snapshot in while leaving θ/η empty.
-    /// θ/η referenced *directly* in the readout would need extra chain terms the
-    /// ODE provider does not yet assemble, so those stay on the FD fallback.
+    /// covariates / constants — the case the dual readout can evaluate, threading
+    /// the covariate snapshot in while leaving θ/η empty. A θ/η referenced
+    /// *directly* in the readout is desugared at parse time into a synthetic
+    /// individual parameter (`__ferx_ro_*`, #486), so it reaches the readout as an
+    /// ordinary `PushVar` and rides the individual-parameter sensitivity chain;
+    /// only an NN output (`PushNnOutput`) leaves the readout on the FD fallback.
     dual_evaluable: bool,
 }
 
@@ -21157,19 +21345,71 @@ if (WT > 70) {
         };
 
         let state = vec![0.0, 50.0];
-        let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
-        pk[0] = 1.0;
-        pk[1] = 50.0;
-        pk[2] = 1.0;
         let theta = vec![3.0, 50.0, 1.0]; // [TVCL=3, TVV=50, TVKA=1]
         let eta = vec![0.0];
         let cov = HashMap::new();
-        let y = out_fn(&state, &pk, &theta, &eta, &cov);
+        // The bare `TVCL` in the readout is desugared (#486) into a synthetic
+        // individual parameter, so its value flows through the PK-parameter vector
+        // `pk_param_fn` fills (the production readout call path) — not the bare
+        // `theta` slice. Build `pk` the same way production does.
+        let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
+        let y = out_fn(&state, &pk.values, &theta, &eta, &cov);
         // central/V * TVCL = 50/50 * 3 = 3.
         assert!(
             (y - 3.0).abs() < 1e-12,
             "expected 3.0 (TVCL must resolve to theta[0]=3), got {}",
             y
+        );
+    }
+
+    /// #486: a Form-C readout referencing θ/η directly is desugared into synthetic
+    /// individual parameters (`__ferx_ro_*`), which makes the readout analytic
+    /// (`is_dual_evaluable`) without adding any new random effect, and the synthetic
+    /// names are suppressed from user-facing EBE output.
+    #[test]
+    fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            // Bare θ (`TVCL`) and bare η (`ETA_CL`) directly in the readout.
+            Some("  y = central / V * TVCL + ETA_CL\n"),
+        );
+        let model = parse_model_string(&src).expect("direct θ/η readout parses");
+
+        // Two synthetic individual parameters were appended (θ and η source).
+        let synth: Vec<&String> = model
+            .indiv_param_names
+            .iter()
+            .filter(|n| is_synthetic_readout_param(n))
+            .collect();
+        assert_eq!(synth.len(), 2, "one synthetic param per distinct θ/η ref");
+        assert_eq!(model.indiv_param_names.len(), model.pk_indices.len());
+
+        // The desugared readout carries no bare θ/η ops, so it is dual-evaluable.
+        let ode = model.ode_spec.as_ref().unwrap();
+        let prog = ode
+            .readout_program
+            .as_ref()
+            .expect("uniform Form-C readout has a sensitivity program");
+        assert!(
+            prog.is_dual_evaluable(),
+            "a θ/η readout must be analytic after desugaring (#486)"
+        );
+
+        // The `ETA_CL` reference reuses the existing random effect — no new omega.
+        assert_eq!(
+            model.n_eta, 1,
+            "desugaring an η reference adds no random effect"
+        );
+
+        // The synthetic parameters are load-bearing (read by the readout), so the
+        // "computed but never used" census must not flag them.
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "synthetic readout params must not trip the unused-parameter census, got: {:?}",
+            model.parse_warnings
         );
     }
 

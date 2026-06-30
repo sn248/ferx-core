@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
+  **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
+  analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
+  (#486). The parser desugars each bare `THETA(i)`/`ETA(k)` in the readout into a
+  hidden individual parameter, so its `∂y/∂θ`/`∂y/∂η` (and the 2nd-order blocks)
+  ride the same validated individual-parameter sensitivity chain as `central/V1`;
+  the prediction value is unchanged and the synthetic parameters never appear in
+  EBE / sdtab output. (A readout referencing a neural-network output stays on the
+  FD fallback.)
 - `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
   expressions and direct analytical `pk(...=TIME)` mappings, enabling
   NONMEM-style time-dependent PK parameter switches without declaring `TIME` as

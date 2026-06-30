@@ -2345,16 +2345,23 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
-        // Valid if it's a covariate, indiv param, or derived name
+        // Valid if it's a covariate, indiv param, or derived name. Synthetic
+        // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
-            || model
-                .indiv_param_names
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(col))
+            || model.indiv_param_names.iter().any(|p| {
+                !crate::parser::model_parser::is_synthetic_readout_param(p)
+                    && p.eq_ignore_ascii_case(col)
+            })
             || derived_names.iter().any(|d| d.eq_ignore_ascii_case(col));
         if !known {
             let mut candidates: Vec<&str> = cov_names.iter().map(|s| s.as_str()).collect();
-            candidates.extend(model.indiv_param_names.iter().map(|s| s.as_str()));
+            candidates.extend(
+                model
+                    .indiv_param_names
+                    .iter()
+                    .filter(|p| !crate::parser::model_parser::is_synthetic_readout_param(p))
+                    .map(|s| s.as_str()),
+            );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
             diags.push(Diagnostic::error(
@@ -2432,13 +2439,42 @@ pub fn tafd_tad_for_subject(
 // ── Step 8: post-fit extra column computation ────────────────────────────────
 
 /// Build a per-observation HashMap mapping `model.indiv_param_names` to their
-/// values from `pk`.
+/// values from `pk`. Individual parameters the parser synthesized for a direct-θ/η
+/// Form-C readout (`__ferx_ro_*`, #486) are internal — they are skipped so they never
+/// surface as a user-facing EBE / sdtab column.
 fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> HashMap<String, f64> {
     names
         .iter()
         .zip(pk_indices.iter())
+        .filter(|(name, _)| !crate::parser::model_parser::is_synthetic_readout_param(name))
         .map(|(name, &idx)| (name.clone(), pk.values[idx]))
         .collect()
+}
+
+#[cfg(test)]
+mod build_indiv_map_tests {
+    use super::*;
+    use crate::types::PkParams;
+
+    /// #486: individual parameters the parser synthesized for a direct-θ/η Form-C
+    /// readout (`__ferx_ro_*`) are internal and must never appear in the user-facing
+    /// per-observation EBE map.
+    #[test]
+    fn synthetic_readout_params_hidden_from_indiv_map() {
+        let mut pk = PkParams::default();
+        pk.values[0] = 1.5; // real CL
+        pk.values[2] = 3.0; // synthetic readout slot
+        let names = vec!["CL".to_string(), "__ferx_ro_th0".to_string()];
+        let pk_indices = vec![0usize, 2usize];
+        let map = build_indiv_map(&pk, &names, &pk_indices);
+        assert_eq!(map.len(), 1, "only the real parameter is exposed");
+        assert_eq!(map.get("CL"), Some(&1.5));
+        assert!(
+            !map.keys()
+                .any(|k| crate::parser::model_parser::is_synthetic_readout_param(k)),
+            "synthetic readout params must be hidden from the EBE map"
+        );
+    }
 }
 
 /// Trapezoid integration over (time, value) pairs.

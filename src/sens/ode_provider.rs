@@ -4107,6 +4107,128 @@ mod tests {
   ode_abstol = 1e-11
 "#;
 
+    // 2-cpt ODE whose Form C readout references a θ and an η **directly** (#486):
+    // a multiplicative `ETA_CL` on the concentration plus an additive baseline
+    // `TVBASE`. The parser desugars each bare θ/η into a synthetic individual
+    // parameter (`__ferx_ro_*`), so the readout's ∂y/∂θ, ∂y/∂η ride the
+    // individual-parameter sensitivity chain. `ETA_CL` is multiplicative AND also
+    // drives `CL`, so the analytic gradient must capture both the explicit term and
+    // the cross-coupling through the state — the 2nd-order blocks are non-trivial.
+    const TWOCPT_ODE_READOUT_DIRECT_THETA_ETA: &str = r#"
+[parameters]
+  theta TVCL(4.0,   0.1, 100.0)
+  theta TVV1(12.0,  1.0, 500.0)
+  theta TVQ(2.0,    0.01, 100.0)
+  theta TVV2(25.0,  1.0, 500.0)
+  theta TVBASE(0.5, 0.0, 100.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1 * (1.0 + ETA_CL) + TVBASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// #486: a Form C readout referencing a θ/η directly is now analytic — the parser
+    /// desugars each into a synthetic individual parameter, so the provider gradient
+    /// (value, ∂f/∂η, ∂f/∂θ) and the 2nd-order blocks must match production + FD.
+    #[test]
+    fn ode_provider_form_c_direct_theta_eta_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_READOUT_DIRECT_THETA_ETA).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "Form C readout referencing θ/η directly should be analytic (#486)"
+        );
+        // The two synthetic readout parameters extend the individual-parameter set.
+        assert_eq!(
+            model.pk_indices.len(),
+            6,
+            "4 real + 2 synthetic (__ferx_ro_th4, __ferx_ro_eta0) individual parameters"
+        );
+        let theta = vec![4.0, 12.0, 2.0, 25.0, 0.5];
+        let eta = vec![0.12, -0.08];
+        let times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+
+        let subj = bolus_subject(&times);
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    // Direct θ/η readout (#486) combined with a time-varying covariate (`FREE`), so
+    // the subject routes through the (θ,η)-basis TV-cov walk (`run_subject_tvcov`)
+    // rather than the individual-parameter-basis static walk. The synthetic readout
+    // parameters must serve the analytic gradient on that path too.
+    const TWOCPT_ODE_READOUT_DIRECT_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(4.0,   0.1, 100.0)
+  theta TVV1(12.0,  1.0, 500.0)
+  theta TVQ(2.0,    0.01, 100.0)
+  theta TVV2(25.0,  1.0, 500.0)
+  theta TVBASE(0.5, 0.0, 100.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  y = central / V1 * (1.0 + ETA_CL) + (1.0 - FREE) * TVBASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// #486 + #540: a direct θ/η readout whose subject also carries a time-varying
+    /// covariate routes through the TV-cov `(θ,η)`-basis walk. The desugared synthetic
+    /// parameters must match production + FD there as well.
+    #[test]
+    fn ode_provider_form_c_direct_theta_eta_tvcov_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_READOUT_DIRECT_TVCOV).expect("parse");
+        let theta = vec![4.0, 12.0, 2.0, 25.0, 0.5];
+        let eta = vec![0.12, -0.08];
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0];
+
+        let mut subj = bolus_subject(&times);
+        subj.obs_covariates = (0..times.len())
+            .map(|i| HashMap::from([("FREE".to_string(), (i % 2) as f64)]))
+            .collect();
+        assert!(
+            subj.has_tv_covariates(),
+            "alternating FREE must register as time-varying"
+        );
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "TV-cov direct-θ/η Form C readout should be analytic (#486)"
+        );
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
     /// #540: a Form C readout referencing a covariate is now analytic. With the
     /// covariate held constant per subject (`obs_covariates` empty → the static
     /// walk), the provider gradient must match production + FD for both the total

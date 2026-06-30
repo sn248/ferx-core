@@ -6962,6 +6962,76 @@ mod tests {
         );
     }
 
+    /// 1-cpt IV IOV `[odes]` model whose Form-C readout references a θ (`TVBASE`) **and**
+    /// an η (`ETA_CL`) directly (#486). The parser desugars each bare θ/η into a synthetic
+    /// individual parameter (`__ferx_ro_*`); under IOV those synthetics ride the stacked
+    /// `(θ, η_bsv, κ)` chain like any other individual parameter. `ETA_CL` is the BSV η that
+    /// also carries the per-occasion κ, so the readout's `∂y/∂η_cl` couples the explicit
+    /// `(1 + ETA_CL)` term with the κ-driven state — exercising the synthetic-param seeding
+    /// on the IOV walk (the path the #631 review flagged as previously FD-only).
+    const WARFARIN_IOV_ODE_DIRECT_THETA_ETA: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBASE(0.5, 0.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V * (1.0 + ETA_CL) + TVBASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// #486 + #439: a direct-θ/η Form-C readout under **IOV** must take the analytic ODE
+    /// IOV path and match FD of `predict_iov` (value, η-Hessian, θ-grad, η×θ cross). Before
+    /// #631 such a readout was not `dual_evaluable`, so `ode_iov_supported` returned false
+    /// and the subject fell back to finite differences; this confirms the synthetic
+    /// readout parameters seed the stacked `(θ, η_bsv, κ)` chain correctly on the IOV walk.
+    #[test]
+    fn ode_iov_form_c_direct_theta_eta_matches_production() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_DIRECT_THETA_ETA)
+            .expect("parse ODE IOV direct θ/η");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some());
+        // 2 real (CL, V) + 2 synthetic (__ferx_ro_th2, __ferx_ro_eta0) individual params,
+        // and no new omega for the direct η reference.
+        assert_eq!(
+            model.n_eta, 2,
+            "direct ETA_CL reuses the existing BSV η (no new omega)"
+        );
+        assert_eq!(
+            model.pk_indices.len(),
+            4,
+            "CL, V + 2 synthetic readout params"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "direct-θ/η Form-C readout under IOV should be analytic (#486)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1]; θ = [TVCL, TVV, TVBASE].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     /// The light **inner** IOV walk (`Dual1`, via the `subject_eta_grad_iov` dispatch —
     /// ODE or closed-form) must produce the same per-observation value and
     /// `∂f/∂(stacked-η)` as the **outer** walk (`Dual2`, `subject_sensitivities_iov`),

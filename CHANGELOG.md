@@ -292,6 +292,14 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
+- **Estimation-method chains now run the covariance step only once, at the end of
+  the chain** (#615). When a chain ended in a *default (estimating)* IMP stage
+  (e.g. `methods = [saem, imp]`), both the preceding estimator and the IMP stage
+  computed the (expensive) finite-difference covariance matrix — the trailing-IMP
+  heuristic incorrectly treated every trailing IMP as an evaluation-only stage.
+  The covariance / SIR step now runs only on the last *estimating* stage;
+  evaluation-only IMP (`imp_eval_only`) still cedes the step to the preceding
+  estimator as before. Plain chains without IMP were already correct.
 - **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).
   A drug-driven `hazard =` expression is unconstrained, so a sign-flipped hazard could make
   the cumulative hazard *decrease* — implying a survival `S(t) > 1`. The right-censored and

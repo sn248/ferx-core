@@ -8693,6 +8693,17 @@ fn build_pk_param_fn(
         n_eta_extended,
     );
 
+    // Detect use of the `TIME` built-in BEFORE `resolve_variable_indices`
+    // bytecode-compiles the statements: that pass replaces each `Expression::Time`
+    // node with an `Op::PushTime` bytecode op and an `Expression::Literal(0.0)`
+    // placeholder, after which `stmts_use_time_builtin` (an AST walker) can no
+    // longer see it. Computing the flag here, on the intact AST, is what makes a
+    // time-dependent individual parameter expressed as a conditional RHS
+    // (`STEP = if (TIME > 5) 1 else 0`) route through the per-event evaluation
+    // path. (A genuine `if`-statement block survives resolution and was detected
+    // either way; the conditional-expression form regressed silently — #610.)
+    let stmts_use_time = stmts_use_time_builtin(&stmts_resolved);
+
     resolve_variable_indices(&mut stmts_resolved, &var_idx, &cov_idx, None);
 
     let stmts_owned = stmts_resolved;
@@ -8820,7 +8831,7 @@ fn build_pk_param_fn(
         ode_assignment_mapping.clone()
     };
     let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
-    let uses_time_builtin = stmts_use_time_builtin(&stmts_owned) || !pk_time_mapping.is_empty();
+    let uses_time_builtin = stmts_use_time || !pk_time_mapping.is_empty();
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
@@ -17194,6 +17205,56 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("unknown covariate type"), "got: {err}");
+    }
+
+    #[test]
+    fn test_time_builtin_in_conditional_rhs_sets_uses_time_flag() {
+        // Regression: the `TIME` built-in used inside a conditional-expression
+        // RHS (`STEP = if (TIME > 5) 1 else 0`) must flag the model as using
+        // TIME, so a time-dependent individual parameter routes through the
+        // per-event evaluation path. The flag was computed AFTER
+        // `resolve_variable_indices` bytecode-compiled the statements, which
+        // erased the `Expression::Time` node the scan looks for — so it read
+        // false and the analytical path evaluated PK params once at t=0 (the
+        // parameter never switched; e.g. infliximab's maintenance-phase CL
+        // multiplier became unidentifiable).
+        let model = "[parameters]\n  \
+                       theta TVCL (1.0, 0.01, 100.0)\n  \
+                       theta TVV (10.0, 0.1, 500.0)\n  \
+                       omega ETA_CL ~ 0.1\n  \
+                       sigma PROP ~ 0.1\n\
+                     [individual_parameters]\n  \
+                       STEP = if (TIME > 5) 1 else 0\n  \
+                       CL = TVCL * (1 + STEP) * exp(ETA_CL)\n  \
+                       V = TVV\n\
+                     [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+                     [error_model]\n  DV ~ proportional(PROP)\n";
+        let compiled = parse_model_string(model).unwrap();
+        assert!(
+            compiled_model_uses_time_builtin(&compiled),
+            "TIME inside a conditional-expression RHS must set uses_time_builtin"
+        );
+    }
+
+    #[test]
+    fn test_no_time_builtin_leaves_uses_time_flag_unset() {
+        // Counterpart: a model with no TIME reference must not be flagged (it
+        // stays on the cheap single-snapshot analytical path).
+        let model = "[parameters]\n  \
+                       theta TVCL (1.0, 0.01, 100.0)\n  \
+                       theta TVV (10.0, 0.1, 500.0)\n  \
+                       omega ETA_CL ~ 0.1\n  \
+                       sigma PROP ~ 0.1\n\
+                     [individual_parameters]\n  \
+                       CL = TVCL * exp(ETA_CL)\n  \
+                       V = TVV\n\
+                     [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+                     [error_model]\n  DV ~ proportional(PROP)\n";
+        let compiled = parse_model_string(model).unwrap();
+        assert!(
+            !compiled_model_uses_time_builtin(&compiled),
+            "a model with no TIME reference must not set uses_time_builtin"
+        );
     }
 
     #[test]

@@ -1465,8 +1465,8 @@ pub fn foce_subject_nll_iov(
     // censored subject was silently evaluated with η-interaction even under FOCE, mixing a
     // Sheiner–Beal marginal with a FOCEI censored term.) The censored rows are now routed
     // by the `interaction` flag alone — `foce_subject_nll_standard` carries the M3 `−logΦ`
-    // term for the non-interaction path — so there is no `m3_active` gate here (unlike the
-    // non-IOV `foce_subject_nll`, whose `m3_active` still feeds its survival branch).
+    // term for the non-interaction path — so there is no `m3_active` gate here (the non-IOV
+    // `foce_subject_nll`, including its TTE branch, drops the promotion the same way).
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
     } else {

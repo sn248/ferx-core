@@ -292,6 +292,33 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
+- **A time-dependent individual parameter written with the `TIME` built-in
+  inside a conditional-expression RHS now switches** (e.g.
+  `MAINT = if (TIME > 45) 1 else 0`). The "uses TIME" flag that routes such a
+  model through the per-event evaluation path was computed *after* the
+  individual-parameter statements were bytecode-compiled — a step that replaces
+  the `TIME` node with an `Op::PushTime` op the flag's AST scan can no longer
+  see. The flag therefore read `false`, the analytical path evaluated PK
+  parameters once at `t = 0`, and the parameter never changed over time (the
+  effect collapsed and its θ became unidentifiable). The flag is now computed on
+  the pre-compilation AST. A `TIME` reference inside a full `if { … }` statement
+  block was unaffected; only the conditional-expression form regressed
+  (introduced with the `TIME` built-in in #610).
+- **A trough observation listed before a same-TIME dose is now evaluated
+  pre-dose**, matching NONMEM's record-order semantics. The data reader ordered
+  events by time and, at an equal TIME, placed the dose first on every path (the
+  event-driven sort and the analytical superposition gate alike), so an
+  observation sharing a dose's timestamp was scored as a post-dose peak instead
+  of the pre-dose trough the data intended. On trough-rich datasets this railed
+  fits to their bounds. The reader now honors data record order: an observation
+  written before its coincident dose sorts just before that dose, while a
+  post-dose observation (dose row first) and steady-state doses are unchanged.
+  The raw user-clock TIME reported in sdtab/covtab and by
+  `predict()`/`simulate()` is unaffected. With both fixes the infliximab run55
+  benchmark — which had railed to its bounds (eval-at-NONMEM-estimates OFV 3751
+  vs NONMEM 662; FOCEI and SAEM both converging to nonsense) — reproduces NONMEM:
+  FOCEI OFV 664.0 vs 662.2, TVCL 0.198 vs 0.199, maintenance-phase CL multiplier
+  1.41 vs 1.40.
 - **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).
   A drug-driven `hazard =` expression is unconstrained, so a sign-flipped hazard could make
   the cumulative hazard *decrease* — implying a survival `S(t) > 1`. The right-censored and

@@ -1,6 +1,10 @@
 //! NONMEM cross-check for the **ODE** non-IOV time-varying-covariate path combined
-//! with an `EVID=2` covariate breakpoint **and** an η-dependent `ExpressionScale`
-//! `obs_scale` divisor — the two cells closed in #486.
+//! with an `EVID=2` covariate breakpoint **and** an `ExpressionScale` `obs_scale`
+//! divisor — the two cells closed in #486. This is a value-level (`predict`) check, so
+//! the divisor here is θ-only (`V1 = TVV1`, `obs_scale = V1`): it exercises the
+//! production `ExpressionScale` apply path against real NONMEM PREDs. The η-dependence of
+//! that quotient — the actual #486 gradient claim — is validated separately by the
+//! `sens::ode_provider` unit tests, which drive `obs_scale = expr(θ,η)` with non-zero η.
 //!
 //! This reuses the committed NONMEM reference from `tvcov_intermediate_nonmem.rs`
 //! (issue #455): the same dataset (`tests/nonmem/tvcov_intermediate_evid2.csv`, an

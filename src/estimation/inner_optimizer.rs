@@ -1327,14 +1327,16 @@ pub fn profile_report() {
 /// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
 /// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
 /// → `apply_expression_scale_inner`), and the ODE inner provider serves it on the static
-/// walk (#534/#486), so both run analytically. Two things keep this safe rather than
-/// re-introducing an analytic-inner-vs-FD-outer split: the **IOV** inner path still
-/// declines `ExpressionScale` through its own gate (`iov_analytical_supported` requires
+/// walk *and* the TV-cov event-driven walk (#534/#486 — the scale is subject-static even
+/// under time-varying covariates, so one post-walk quotient covers both), so both run
+/// analytically. Two things keep this safe rather than re-introducing an
+/// analytic-inner-vs-FD-outer split: the **IOV** inner path still declines
+/// `ExpressionScale` through its own gate (`iov_analytical_supported` requires
 /// `ScalingSpec::None`), and the **ODE** inner path does not consult this common bail at
 /// all — it has its own inline bail list in [`analytic_inner_grad_supported`] and its own
-/// per-subject scope (`ode_inner_grad_supported`, which only admits the static-walk
-/// `ExpressionScale` that the ODE provider actually applies). So dropping it here affects
-/// only the non-IOV closed-form route — exactly the one that now serves it.
+/// per-subject scope (`ode_inner_grad_supported`, which admits exactly the static-walk and
+/// TV-cov-walk `ExpressionScale` that the ODE provider actually applies). So dropping it
+/// here affects only the non-IOV closed-form route — exactly the one that now serves it.
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)

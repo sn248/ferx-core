@@ -288,13 +288,15 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // constant `ScalarScale` divisor (`f/k`), and the LTBS log (`ln f`). An η-dependent
     // `ExpressionScale` divisor (`obs_scale = expr(θ,η)`) is ALSO analytic now (#486):
     // it is applied on the final `(θ,η)`-space `SubjectSens` via the shared
-    // `apply_expression_scale_outer` (the closed-form provider's quotient rule), but
-    // only on the **static** walk — `ode_tvcov_supported` declines it (a TV-cov scale
-    // would be per-event, which the subject-static quotient does not carry) and it
-    // requires `!log_transform` (the walk applies LTBS in PK-param space *before* the
-    // η/θ chain, so the production scale-then-log order can't be reproduced by a
-    // post-walk quotient). Both compose with a Form-C readout (`y = state/V`), the other
-    // supported route. Allowlist (not denylist) so a future scaling variant can only
+    // `apply_expression_scale_outer` (the closed-form provider's quotient rule), on the
+    // **static** walk AND the **TV-cov event-driven** walk — the scale is subject-static
+    // even under time-varying covariates (production `apply_scaling` reads
+    // `subject.covariates`, not a per-event snapshot), so `ode_tvcov_supported` admits it
+    // and applies one subject-static quotient post-walk (#486). It still requires
+    // `!log_transform` (the walk applies LTBS in PK-param space *before* the η/θ chain, so
+    // the production scale-then-log order can't be reproduced by a post-walk quotient —
+    // LTBS keeps the FD fallback). Both compose with a Form-C readout (`y = state/V`), the
+    // other supported route. Allowlist (not denylist) so a future scaling variant can only
     // *narrow* the analytic scope, never silently admit an unhandled one.
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
@@ -816,10 +818,11 @@ pub fn ode_subject_sensitivities(
     }?;
     // η-dependent `ExpressionScale` divisor (#486): apply the subject-static quotient
     // on the final `(θ,η)`-space jet — the SAME `apply_expression_scale_outer` the
-    // closed-form provider uses, since both produce an identical `SubjectSens`. Only the
-    // static walk reaches here for an `ExpressionScale` model (`ode_tvcov_supported`
-    // declines it; `!log_transform` is gated), and `pd`/`pk.values` are already on hand.
-    // `slots = prog.pk_slots()` pairs with `pd` (built by `param_derivatives_from_prog`).
+    // closed-form provider uses, since both produce an identical `SubjectSens`. This is the
+    // **static** walk; the TV-cov event-driven walk applies the identical quotient at its
+    // own tail (`run_subject_tvcov`), since the scale is subject-static even under TV
+    // covariates (#486). `!log_transform` is gated (LTBS stays FD), and `pd`/`pk.values` are
+    // already on hand. `slots = prog.pk_slots()` pairs with `pd` (from `param_derivatives`).
     if let ScalingSpec::ExpressionScale {
         deriv: Some(prog), ..
     } = &model.scaling
@@ -4388,6 +4391,36 @@ mod tests {
         }
     }
 
+    /// Inner/outer parity guardrail: the light `Dual1` inner provider
+    /// (`ode_subject_eta_grad`) must reproduce the full `Dual2` outer provider's value
+    /// and `∂f/∂η` (`ode_subject_sensitivities`) exactly — both are exact analytic, only
+    /// the dual order differs (and `solve_ode_g` uses value-based step control, so the
+    /// trajectories match). This is what keeps the inner EBE loop's η-gradient consistent
+    /// with the outer gradient across every ODE variant (Form-C, per-CMT, TV-cov, EVID=2
+    /// pk-only, `ExpressionScale`); factored out so a tolerance change touches one site,
+    /// not every parity test.
+    fn check_inner_outer_eta_parity(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) {
+        let full = ode_subject_sensitivities(model, subject, theta, eta).expect("full outer sens");
+        let light = ode_subject_eta_grad(model, subject, theta, eta).expect("light inner grad");
+        assert_eq!(full.obs.len(), light.len());
+        for (a, b) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    a.df_deta[k],
+                    b.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+
     /// Validate the analytic 2nd-order blocks (`d2f_deta2`, `d2f_deta_dtheta`) against
     /// central finite differences of the analytic *first*-order gradient `df_deta` from the
     /// same provider — the Hessian must equal the derivative of the gradient.
@@ -4886,20 +4919,7 @@ mod tests {
         let subject = exprscale_tvcov_subject();
         let theta = vec![4.0, 12.0, 2.0, 25.0];
         let eta = vec![0.12, -0.08];
-        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
-        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("light");
-        assert_eq!(full.obs.len(), light.len());
-        for (a, b) in full.obs.iter().zip(light.iter()) {
-            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
-            for k in 0..model.n_eta {
-                approx::assert_relative_eq!(
-                    a.df_deta[k],
-                    b.df_deta[k],
-                    max_relative = 1e-9,
-                    epsilon = 1e-10
-                );
-            }
-        }
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     /// Build the TV-cov subject for the 1-cpt `ONECPT_ODE_TVCOV` model with an EVID=2
@@ -4944,20 +4964,7 @@ mod tests {
         let subject = tvcov_pkonly_subject();
         let theta = vec![1.0, 20.0, 0.75];
         let eta = vec![0.1];
-        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
-        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("light");
-        assert_eq!(full.obs.len(), light.len());
-        for (a, b) in full.obs.iter().zip(light.iter()) {
-            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
-            for k in 0..model.n_eta {
-                approx::assert_relative_eq!(
-                    a.df_deta[k],
-                    b.df_deta[k],
-                    max_relative = 1e-9,
-                    epsilon = 1e-10
-                );
-            }
-        }
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     /// The light `Dual1` inner provider's `f` / `∂f/∂η` must equal the full `Dual2`
@@ -4970,26 +4977,9 @@ mod tests {
     /// bioavailability `F` (`BIOAV_ODE` — the `f_bio` path + `ObsCmt` arm), and LTBS.
     #[test]
     fn ode_light_inner_eta_grad_matches_full_provider() {
-        fn check(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
-            let full = ode_subject_sensitivities(model, subject, theta, eta).expect("full");
-            let light = ode_subject_eta_grad(model, subject, theta, eta).expect("light");
-            assert_eq!(full.obs.len(), light.len());
-            for (a, b) in full.obs.iter().zip(light.iter()) {
-                approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
-                for k in 0..model.n_eta {
-                    approx::assert_relative_eq!(
-                        a.df_deta[k],
-                        b.df_deta[k],
-                        max_relative = 1e-9,
-                        epsilon = 1e-10
-                    );
-                }
-            }
-        }
-
         // Form-C readout, IV bolus.
         let m = parse_model_string(TWOCPT_ODE).expect("parse");
-        check(
+        check_inner_outer_eta_parity(
             &m,
             &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
             &[4.0, 12.0, 2.0, 25.0],
@@ -5000,23 +4990,23 @@ mod tests {
         let m = parse_model_string(INIT_ODE).expect("parse");
         let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         s.doses = vec![];
-        check(&m, &s, &[1.0, 20.0], &[0.1, -0.05]);
+        check_inner_outer_eta_parity(&m, &s, &[1.0, 20.0], &[0.1, -0.05]);
 
         // Estimated bioavailability F + ObsCmt readout, oral depot → `f_bio` path.
         let m = parse_model_string(BIOAV_ODE).expect("parse");
         let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
-        check(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
+        check_inner_outer_eta_parity(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
 
         // Compartment-indexed F1 (with IIV) → per-compartment `f_bio_slot` path (#486).
         let m = parse_model_string(F1_ODE).expect("parse");
         let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
-        check(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
+        check_inner_outer_eta_parity(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
 
         // LTBS output transform over the Dual1 readout.
         let m = parse_model_string(TWOCPT_ODE_LTBS).expect("parse");
-        check(
+        check_inner_outer_eta_parity(
             &m,
             &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
             &[4.0, 12.0, 2.0, 25.0],
@@ -5027,7 +5017,7 @@ mod tests {
         // (`apply_expression_scale_inner_dispatch`) must equal the full provider's
         // scaled `df_deta`.
         let m = parse_model_string(TWOCPT_ODE_EXPRSCALE).expect("parse");
-        check(
+        check_inner_outer_eta_parity(
             &m,
             &bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]),
             &[4.0, 12.0, 2.0, 25.0],
@@ -5043,7 +5033,7 @@ mod tests {
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
         ];
-        check(&m, &s, &[1.0, 10.0, 0.5], &[0.1, 0.05]);
+        check_inner_outer_eta_parity(&m, &s, &[1.0, 10.0, 0.5], &[0.1, 0.05]);
     }
 
     /// The inner EBE loop must actually *resolve* to the analytic η-gradient for an
@@ -6605,20 +6595,7 @@ mod tests {
         let subject = percmt_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0], &[1, 2, 1, 2, 1, 2]);
         let theta = vec![4.0, 12.0, 2.0, 25.0];
         let eta = vec![0.12, -0.08];
-        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
-        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("light");
-        assert_eq!(full.obs.len(), light.len());
-        for (a, b) in full.obs.iter().zip(light.iter()) {
-            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
-            for k in 0..model.n_eta {
-                approx::assert_relative_eq!(
-                    a.df_deta[k],
-                    b.df_deta[k],
-                    max_relative = 1e-9,
-                    epsilon = 1e-10
-                );
-            }
-        }
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     // Time-varying covariate (#439): WT on CL changes across observations, so the
@@ -6907,20 +6884,7 @@ mod tests {
         let subject = tvcov_subject();
         let theta = vec![1.0, 20.0, 0.75];
         let eta = vec![0.1];
-        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("outer tvcov");
-        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("inner tvcov");
-        assert_eq!(full.obs.len(), light.len());
-        for (a, b) in full.obs.iter().zip(light.iter()) {
-            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
-            for k in 0..model.n_eta {
-                approx::assert_relative_eq!(
-                    a.df_deta[k],
-                    b.df_deta[k],
-                    max_relative = 1e-9,
-                    epsilon = 1e-10
-                );
-            }
-        }
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     /// The **inner EBE gate** admits a TV-cov bolus subject (#449 review #2): before

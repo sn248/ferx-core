@@ -57,6 +57,14 @@ section of the SDLC for the versioning policy).
   `block_sigma` correlated residual error, `iiv_on_ruv`, an M3-BLOQ censored row,
   more than 16 thetas, and plain `method = foce` (non-interaction) still fall back
   to the (magnitude-aware) finite-difference gradient.
+- **`init(...)` initial conditions with time-varying covariates** now get exact analytic
+  FOCE/FOCEI sensitivities on the ODE path instead of finite differences (#486). The
+  event-driven walk seeds the dual initial state from the subject's first-record covariate
+  snapshot (matching the production predictor's `init_pk`), so a covariate- or η-dependent
+  baseline (e.g. `init(central) = BASE / V`) carries `∂/∂(θ,η)`. Analytic for the plain-bolus
+  subset; `init(...)` combined with an EVID 3/4 reset, an estimated lagtime, a finite
+  infusion, a built-in input-rate forcing, steady-state, or a modeled-duration/rate dose
+  stays on the finite-difference fallback.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK

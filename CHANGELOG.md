@@ -458,6 +458,16 @@ section of the SDLC for the versioning policy).
   sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
   report the value in the data file; no per-subject time shift is applied.
 
+### Fixed
+- **Finite / modeled-duration infusions combined with a time-varying covariate that
+  changes across the infusion's end** now get an exact analytic second-order gradient
+  (#486). The rate-off boundary sits between records, so the RHS Jacobian jumps there;
+  the closed-form rate-off saltation assumed a single parameter set and dropped the
+  `(J⁺ − J⁻)·x` curvature term, biasing the FOCEI Hessian / covariance-step SEs by a few
+  percent (first-order gradient and OFV were unaffected). The infusion end now uses the
+  same general `g⁻ − g⁺` saltation as the zero-order window end. Cases without a covariate
+  varying across the infusion end are unchanged.
+
 ### Changed
 - For `block_sigma` correlated residual models, the SAEM reported OFV (the
   FOCE-approximation used for AIC/BIC) now follows the `interaction` flag like

@@ -1722,7 +1722,7 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // `analytical_supported_core` (not `analytical_supported`) so a `TIME` model doesn't
     // recurse: `analytical_supported` calls back here for the `uses_time_builtin` case
     // (#637 review #1).
-    if !analytical_supported_core(model) || model.has_lagtime() || model.log_transform {
+    if !analytical_supported_core(model) || model.has_lagtime() {
         return false;
     }
     // The TV-cov event-driven walk now layers the analytic `[initial_conditions]` impulse
@@ -1748,9 +1748,12 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // `subject_sensitivities_tvcov` / `subject_eta_grad_tvcov` (the same shared
     // `apply_expression_scale_outer` / `_inner_dispatch` the dose-superposition path uses,
     // #486 — closes the TV-cov + expression-scale gap). `scaling_supported` bounds the
-    // scale program to the dispatch table; `PerCmt` still routes to FD. LTBS is already
-    // declined above, so LTBS + `ExpressionScale` (whose scale-then-log order the post-walk
-    // quotient cannot reproduce) never reaches here.
+    // scale program to the dispatch table; `PerCmt` still routes to FD. LTBS is now admitted
+    // (#486): `subject_sensitivities_tvcov` applies the `ln(f)` jet transform LAST, after any
+    // scale quotient — reproducing production's scale-then-log order `ln(f/s)` exactly (the
+    // whole transform is post-walk on the closed-form path, unlike the ODE/IOV in-walk log).
+    // The inner EBE gradient stays on FD for LTBS (covariance stability,
+    // `analytic_inner_common_bail`), so only the outer θ/Ω/σ gradient is served here.
     if !scaling_supported(model) {
         return false;
     }
@@ -2132,6 +2135,11 @@ pub fn subject_sensitivities_tvcov(
     // `pk::apply_scaling` evaluates the scale once at the subject-static covariates and
     // `t = 0` params, mirrored inside the helper.
     apply_event_walk_expression_scale_outer(&mut sens, model, subject, prog, theta, eta)?;
+    // LTBS: transform the walked (and scaled) jet to `g = ln(f)` LAST, via the same shared
+    // helper the dose-superposition outer uses — so the two paths cannot drift, and the
+    // scale-then-log order matches production `ln(f/s)` (#486). The inner EBE gradient stays
+    // on FD for LTBS (covariance stability), so there is no inner counterpart.
+    apply_ltbs_transform_outer(&mut sens, model.log_transform);
     Some(sens)
 }
 
@@ -2347,6 +2355,14 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
     if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
+        return None;
+    }
+    // LTBS is served on the OUTER TV-cov gradient (`subject_sensitivities_tvcov` applies the
+    // post-walk `ln f`), but the inner EBE gradient deliberately stays on finite differences
+    // for LTBS (covariance-Hessian stability, `analytic_inner_common_bail`) — so this inner
+    // provider declines LTBS. In the estimation pipeline it is never reached for LTBS anyway
+    // (`analytic_inner_grad_supported` bails first); this guards direct callers (#486).
+    if model.log_transform {
         return None;
     }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
@@ -3939,58 +3955,69 @@ fn subject_sensitivities_impl(
             n_eta,
         );
     }
-    // LTBS: transform the full jet to `g = ln(f)` (after scaling), mirroring
-    // `pk::apply_log_transform`. With `inv = 1/f`:
-    //   g          = ln(f)
-    //   ∂g/∂x      = inv · ∂f/∂x
-    //   ∂²g/∂x∂y   = inv · ∂²f/∂x∂y − inv² · ∂f/∂x · ∂f/∂y     (x,y ∈ {η,θ})
-    // Second derivatives are computed from the *original* first derivatives, so
-    // those are read before `df_deta`/`df_dtheta` are overwritten. The value half
-    // goes through the shared `pk::ltbs_log_g` (same floor-then-log as the f64
-    // predictor and the ODE dual walk), applied after the jet is transformed
-    // (#451 review #5). Below the floor the transform clamps to a constant ⇒ all
-    // derivatives vanish.
-    if model.log_transform {
-        let n_eta = sens.obs.first().map_or(0, |o| o.df_deta.len());
-        let n_theta = sens.obs.first().map_or(0, |o| o.df_dtheta.len());
-        for o in sens.obs.iter_mut() {
-            if o.f > crate::pk::LTBS_FLOOR {
-                let inv = 1.0 / o.f;
-                let inv2 = inv * inv;
-                // η–η Hessian: g_kl = inv·f_kl − inv²·f_k·f_l.
-                for k in 0..n_eta {
-                    for l in 0..n_eta {
-                        let idx = k * n_eta + l;
-                        o.d2f_deta2[idx] =
-                            inv * o.d2f_deta2[idx] - inv2 * o.df_deta[k] * o.df_deta[l];
-                    }
-                }
-                // η–θ cross: g_km = inv·f_km − inv²·f_k(η)·f_m(θ).
-                for k in 0..n_eta {
-                    for m in 0..n_theta {
-                        let idx = k * n_theta + m;
-                        o.d2f_deta_dtheta[idx] =
-                            inv * o.d2f_deta_dtheta[idx] - inv2 * o.df_deta[k] * o.df_dtheta[m];
-                    }
-                }
-                for g in o.df_deta.iter_mut().chain(o.df_dtheta.iter_mut()) {
-                    *g *= inv;
-                }
-            } else {
-                for v in o
-                    .df_deta
-                    .iter_mut()
-                    .chain(o.d2f_deta2.iter_mut())
-                    .chain(o.df_dtheta.iter_mut())
-                    .chain(o.d2f_deta_dtheta.iter_mut())
-                {
-                    *v = 0.0;
+    // LTBS: transform the full jet to `g = ln(f)` (after scaling), via the shared helper
+    // that the TV-cov event-driven outer (`subject_sensitivities_tvcov`) also uses. Applied
+    // last, matching production's scale-then-log order.
+    apply_ltbs_transform_outer(&mut sens, model.log_transform);
+    Some(sens)
+}
+
+/// Apply the log-transform-both-sides (LTBS) `g = ln(f)` output transform to an outer
+/// [`SubjectSens`] jet in place, mirroring `pk::apply_log_transform`. With `inv = 1/f`:
+///   g          = ln(f)
+///   ∂g/∂x      = inv · ∂f/∂x
+///   ∂²g/∂x∂y   = inv · ∂²f/∂x∂y − inv² · ∂f/∂x · ∂f/∂y     (x, y ∈ {η, θ})
+/// The second derivatives read the *original* first derivatives, so they are computed
+/// before `df_deta`/`df_dtheta` are overwritten. The value half goes through the shared
+/// `pk::ltbs_log_g` (same floor-then-log as the f64 predictor and the ODE dual walk, #451),
+/// applied after the jet is transformed; below `LTBS_FLOOR` the transform clamps to a
+/// constant so all derivatives vanish. A no-op when `log_transform` is false. Shared by the
+/// dose-superposition outer (`subject_sensitivities_impl`) and the TV-cov event-driven outer
+/// (`subject_sensitivities_tvcov`), so the two paths cannot drift (#486). Applied last, after
+/// any `ScalarScale`/`ExpressionScale` quotient, matching production's scale-then-log order.
+/// The inner EBE gradient stays on finite differences for LTBS (covariance-Hessian stability,
+/// `analytic_inner_common_bail`), so no inner counterpart exists.
+fn apply_ltbs_transform_outer(sens: &mut SubjectSens, log_transform: bool) {
+    if !log_transform {
+        return;
+    }
+    let n_eta = sens.obs.first().map_or(0, |o| o.df_deta.len());
+    let n_theta = sens.obs.first().map_or(0, |o| o.df_dtheta.len());
+    for o in sens.obs.iter_mut() {
+        if o.f > crate::pk::LTBS_FLOOR {
+            let inv = 1.0 / o.f;
+            let inv2 = inv * inv;
+            // η–η Hessian: g_kl = inv·f_kl − inv²·f_k·f_l.
+            for k in 0..n_eta {
+                for l in 0..n_eta {
+                    let idx = k * n_eta + l;
+                    o.d2f_deta2[idx] = inv * o.d2f_deta2[idx] - inv2 * o.df_deta[k] * o.df_deta[l];
                 }
             }
-            o.f = crate::pk::ltbs_log_g(o.f);
+            // η–θ cross: g_km = inv·f_km − inv²·f_k(η)·f_m(θ).
+            for k in 0..n_eta {
+                for m in 0..n_theta {
+                    let idx = k * n_theta + m;
+                    o.d2f_deta_dtheta[idx] =
+                        inv * o.d2f_deta_dtheta[idx] - inv2 * o.df_deta[k] * o.df_dtheta[m];
+                }
+            }
+            for g in o.df_deta.iter_mut().chain(o.df_dtheta.iter_mut()) {
+                *g *= inv;
+            }
+        } else {
+            for v in o
+                .df_deta
+                .iter_mut()
+                .chain(o.d2f_deta2.iter_mut())
+                .chain(o.df_dtheta.iter_mut())
+                .chain(o.d2f_deta_dtheta.iter_mut())
+            {
+                *v = 0.0;
+            }
         }
+        o.f = crate::pk::ltbs_log_g(o.f);
     }
-    Some(sens)
 }
 
 /// Per-observation value/grad/Hessian chain at a right-sized dual width `N`
@@ -7041,6 +7068,80 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// **LTBS combined with time-varying covariates** (#486). LTBS on a TV-cov subject
+    /// previously routed BOTH loops to FD; the outer θ/Ω/σ gradient is now analytic on the
+    /// event-driven walk (`subject_sensitivities_tvcov` applies the shared post-walk `ln f`
+    /// transform LAST, after scaling — the same helper the dose-superposition outer uses).
+    /// Validated over plain LTBS and LTBS + an `ExpressionScale` `obs_scale = 1000/V` divisor
+    /// (production's scale-then-log order `ln(f/s)` is reproduced post-walk) against central
+    /// FD of the log-scale production predictor. The inner EBE gradient stays on FD for LTBS
+    /// (covariance stability), asserted below.
+    #[test]
+    fn ltbs_tvcov_outer_matches_production() {
+        let ltbs = |src: &str| {
+            src.replace(
+                "[error_model]\n  DV ~ proportional(PROP_ERR)",
+                "[error_model]\n  log(DV) ~ additive(PROP_ERR)",
+            )
+        };
+        // ExpressionScale (`obs_scale = 1000/V`) + LTBS + TV-cov: exercises scale-then-log.
+        const ONECPT_ORAL_TVCOV_EXPR: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = 1000 / V
+[covariates]
+  WT continuous
+[error_model]
+  log(DV) ~ additive(PROP_ERR)
+"#;
+        let subject = tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 72.0, 80.0, 85.0, 90.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        let theta = vec![0.2, 10.0, 1.5, 0.75];
+        let eta = vec![0.15, -0.10, 0.25];
+
+        for src in [ltbs(ONECPT_ORAL_TVCOV), ONECPT_ORAL_TVCOV_EXPR.to_string()] {
+            let model = parse_model_string(&src).expect("parse LTBS TV-cov");
+            assert!(model.log_transform && subject.has_tv_covariates());
+            assert!(
+                tvcov_analytical_supported(&model),
+                "LTBS + TV-cov must be on the analytic OUTER path now (#486)"
+            );
+            // Outer analytic vs FD of the log-scale production predictor.
+            check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+            // The full outer provider is served; the light inner provider declines LTBS
+            // (inner EBE gradient stays FD for covariance stability).
+            assert!(
+                subject_sensitivities(&model, &subject, &theta, &eta).is_some(),
+                "outer LTBS + TV-cov analytic"
+            );
+            assert!(
+                subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
+                "inner LTBS + TV-cov must route to FD"
+            );
         }
     }
 

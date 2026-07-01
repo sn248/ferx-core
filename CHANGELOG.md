@@ -44,6 +44,15 @@ section of the SDLC for the versioning policy).
   FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
+- **Log-transform-both-sides (LTBS) combined with time-varying covariates** now gets an exact
+  analytic FOCE/FOCEI **outer** (θ/Ω/σ) gradient on the closed-form (analytical 1-/2-/3-cpt)
+  models instead of finite differences (#486). The event-driven TV-cov walk applies the same
+  post-walk `g = ln(f)` jet transform the dose-superposition path already used — last, after
+  any `ScalarScale`/`ExpressionScale` quotient, reproducing production's scale-then-log order
+  `ln(f/s)` — so LTBS composes with a time-varying-covariate and an `ExpressionScale`
+  `obs_scale`. The inner EBE gradient stays on finite differences for LTBS (covariance-Hessian
+  stability), matching the dose-superposition path. Validated against FD of the log-scale
+  production predictor.
 - **Built-in absorption forcings (`zero_order(dur)`, `first_order`, and `mixed`) combined
   with inter-occasion variability (IOV)** now get exact analytic FOCE/FOCEI sensitivities on
   the ODE path instead of finite differences (#486), closing the last zero-order gap. The IOV

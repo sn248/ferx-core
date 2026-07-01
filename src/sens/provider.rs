@@ -549,6 +549,7 @@ fn lognormal_param_derivatives(
 /// both seed the same compiled `[individual_parameters]` program over the combined
 /// axes, then scatter onto a stacked-η dual; only the downstream walk (closed-form
 /// vs RK45) differs (#439 ODE IOV).
+#[derive(Clone)]
 pub(crate) struct CombinedDerivs {
     /// `∂p_i/∂(η_bsv, κ)`, row-major `n_rows × n_eff`.
     pub(crate) deta: Vec<Vec<f64>>,
@@ -954,6 +955,21 @@ fn build_iov_sources(
     let mut obs_src = vec![0usize; subject.obs_times.len()];
     let mut pkonly_src = vec![0usize; subject.pk_only_times.len()];
 
+    // `ExpressionScale` `obs_scale`: one `(pk, cd)` reference per occasion group at the
+    // subject-static covariate snapshot (`t = 0`) — the divisor depends on the group's κ
+    // through the PK params, but not on the per-event covariate/time, matching production
+    // `predict_iov`'s subject-static `apply_scaling` inside each occasion. Built (with
+    // `theta`/`combined_for`/`cd_at` in scope) branch-side and consumed dual-typed in the
+    // walk fns. In the static-covariate branch the per-group sources ARE that `t = 0`
+    // snapshot, so reuse them rather than recomputing `k_groups` full-order `cd_at`
+    // on every gradient call (#651 review #3); the per-event branch has no such snapshot
+    // in `sources` (those sit at each event's own covariate/time) and builds it fresh.
+    let want_scale = matches!(
+        &model.scaling,
+        ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+    );
+    let mut scale_groups: Option<Vec<(crate::types::PkParams, CombinedDerivs)>> = None;
+
     if per_event {
         for d in 0..subject.doses.len() {
             let occ = subject.dose_occasions.get(d).copied()?;
@@ -985,6 +1001,16 @@ fn build_iov_sources(
             pkonly_src[m] = sources.len();
             sources.push((pk, cd, None));
         }
+        if want_scale {
+            let mut groups = Vec::with_capacity(k_groups);
+            for g in 0..k_groups {
+                let combined = combined_for(g);
+                let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
+                let cd = cd_at(0.0, &combined, cov_static)?;
+                groups.push((pk, cd));
+            }
+            scale_groups = Some(groups);
+        }
     } else {
         // One source per occasion group, at the subject-static covariates.
         let mut group_source = vec![usize::MAX; k_groups];
@@ -1012,26 +1038,19 @@ fn build_iov_sources(
                 pkonly_src[m] = idx;
             }
         }
-    }
-
-    // `ExpressionScale` `obs_scale`: one `(pk, cd)` reference per occasion group at the
-    // subject-static covariate snapshot (`t = 0`) — the divisor depends on the group's κ
-    // through the PK params, but not on the per-event covariate/time, matching production
-    // `predict_iov`'s subject-static `apply_scaling` inside each occasion. Built here (with
-    // `theta`/`combined_for`/`cd_at` in scope) and consumed dual-typed in the walk fns.
-    let scale_groups = match &model.scaling {
-        ScalingSpec::ExpressionScale { deriv: Some(_), .. } => {
-            let mut groups = Vec::with_capacity(k_groups);
-            for g in 0..k_groups {
-                let combined = combined_for(g);
-                let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
-                let cd = cd_at(0.0, &combined, cov_static)?;
-                groups.push((pk, cd));
-            }
-            Some(groups)
+        if want_scale {
+            // Reuse the per-group static sources (identical `(pk, cd)` at `t = 0`) —
+            // clone is a Vec copy, far cheaper than re-evaluating the derivative program.
+            scale_groups = Some(
+                (0..k_groups)
+                    .map(|g| {
+                        let (pk, cd, _) = &sources[group_source[g]];
+                        (*pk, cd.clone())
+                    })
+                    .collect(),
+            );
         }
-        _ => None,
-    };
+    }
 
     Some(IovSources {
         sources,
@@ -1261,25 +1280,13 @@ fn run_obs_iov<const M: usize>(
         };
         let eta_bsv = &stacked_eta[..n_eta];
         let cov = &subject.covariates;
-        // Seed each group's stacked-axis PK duals (constants elsewhere), mirroring
-        // `seed_pk_dual2_iov`: the differentiated slots carry the `(θ, η_bsv, κ_g)` jet.
-        let groups: Vec<Vec<Dual2<M>>> = scale_groups
-            .iter()
-            .enumerate()
-            .map(|(g, (pk, cd))| {
-                let mut seeded: Vec<Dual2<M>> =
-                    pk.values.iter().map(|&v| Dual2::<M>::constant(v)).collect();
-                for slot in 0..N_PK {
-                    if let Some(i) = slot_row[slot] {
-                        seeded[slot] = seed(cd, Some(g), i, pk.values[slot]);
-                    }
-                }
-                seeded
-            })
-            .collect();
-        let group_scale = crate::sens::ode_provider::build_iov_scale_jets::<Dual2<M>>(
-            &groups,
+        // Per-group scale jets, seeding the `(θ, η_bsv, κ_g)` axes (mirroring
+        // `seed_pk_dual2_iov`) — shared with the inner walk via `build_iov_group_scale_jets`.
+        let group_scale = build_iov_group_scale_jets::<Dual2<M>>(
+            scale_groups,
+            slot_row,
             sprog.var_to_pk_slot(),
+            |cd, g, i, v| seed(cd, Some(g), i, v),
             |var_duals| sprog.eval_scale_dual::<M>(theta, eta_bsv, cov, var_duals),
         );
         let mut fk: Vec<f64> = Vec::with_capacity(n_stacked);
@@ -1419,23 +1426,13 @@ fn run_obs_iov_eta<const N: usize>(
         };
         let eta_bsv = &stacked_eta[..n_eta];
         let cov = &subject.covariates;
-        let groups: Vec<Vec<Dual1<N>>> = scale_groups
-            .iter()
-            .enumerate()
-            .map(|(g, (pk, cd))| {
-                let mut seeded: Vec<Dual1<N>> =
-                    pk.values.iter().map(|&v| Dual1::<N>::constant(v)).collect();
-                for slot in 0..N_PK {
-                    if let Some(i) = slot_row[slot] {
-                        seeded[slot] = seed(cd, Some(g), i, pk.values[slot]);
-                    }
-                }
-                seeded
-            })
-            .collect();
-        let group_scale = crate::sens::ode_provider::build_iov_scale_jets::<Dual1<N>>(
-            &groups,
+        // η-only per-group scale jets — same seeding as the outer walk (shared helper),
+        // over the stacked-η axes only.
+        let group_scale = build_iov_group_scale_jets::<Dual1<N>>(
+            scale_groups,
+            slot_row,
             sprog.var_to_pk_slot(),
+            |cd, g, i, v| seed(cd, Some(g), i, v),
             |var_duals| sprog.eval_scale_dual1::<N>(theta, eta_bsv, cov, var_duals),
         );
         for (j, o) in out.iter_mut().enumerate() {
@@ -2523,6 +2520,42 @@ pub(crate) fn apply_scale_quotient_grad_iov<const N: usize>(
         o.df_deta[k] = o.df_deta[k] * inv - f * s.grad[k] * inv2;
     }
     o.f = f * inv;
+}
+
+/// Build one `ExpressionScale` scale jet per occasion group for the closed-form IOV
+/// walk. For each group's static-snapshot `(pk, cd)` it seeds a slot-indexed PK-param
+/// dual vector — constant everywhere except the slots that carry a random effect
+/// (`slot_row[slot] = Some(row)`), which are differentiated via `seed_slot(cd, group,
+/// row, value)` — then hands the vector to the shared [`build_iov_scale_jets`] to
+/// evaluate the scale program's dual. Single source for the per-group seeding shared by
+/// the `Dual2` outer ([`run_obs_iov`]) and `Dual1` inner ([`run_obs_iov_eta`]) walks, so
+/// a change to how a group's scale jet is seeded (a new PK slot, a snapshot fix) applies
+/// to both at once and the inner/outer scale handling cannot silently diverge (#651
+/// review #2). `seed_slot` and `eval` supply the dual-type-specific pieces (θ+η+κ vs
+/// η-only seeding; `eval_scale_dual` vs `eval_scale_dual1`).
+///
+/// [`build_iov_scale_jets`]: crate::sens::ode_provider::build_iov_scale_jets
+fn build_iov_group_scale_jets<T: crate::sens::num::PkNum>(
+    scale_groups: &[(crate::types::PkParams, CombinedDerivs)],
+    slot_row: &[Option<usize>; N_PK],
+    var_to_pk_slot: &[usize],
+    seed_slot: impl Fn(&CombinedDerivs, usize, usize, f64) -> T,
+    eval: impl FnMut(&[T]) -> T,
+) -> Vec<T> {
+    let groups: Vec<Vec<T>> = scale_groups
+        .iter()
+        .enumerate()
+        .map(|(g, (pk, cd))| {
+            let mut seeded: Vec<T> = pk.values.iter().map(|&v| T::from_f64(v)).collect();
+            for slot in 0..N_PK {
+                if let Some(i) = slot_row[slot] {
+                    seeded[slot] = seed_slot(cd, g, i, pk.values[slot]);
+                }
+            }
+            seeded
+        })
+        .collect();
+    crate::sens::ode_provider::build_iov_scale_jets::<T>(&groups, var_to_pk_slot, eval)
 }
 
 /// Apply an `ExpressionScale` divisor to a subject's `(θ, η)`-space [`SubjectSens`],

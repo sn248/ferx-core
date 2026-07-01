@@ -6482,4 +6482,195 @@ mod tests {
             }
         }
     }
+
+    /// **Closed-form IOV + M3 BLOQ + `ExpressionScale` `obs_scale = V`** (#651 review #1):
+    /// the new gate arm admits an `ExpressionScale` divisor orthogonally to the M3-censoring
+    /// clause the gate already allowed, so this triple now routes to the analytic packed
+    /// gradient with no FD fallback. The two features compose at different layers — the scale
+    /// is a per-occasion post-walk quotient over the `(θ, stacked-η)` jet **including its
+    /// second-order derivatives**, and the M3 `−logΦ(z)` tail-probability coefficient enters
+    /// the FOCEI `log|H̃|` over that already-scaled jet keyed on `subject.cens[j]`. If the
+    /// scaled second-order sensitivities fed the censored curvature inconsistently, the SEs /
+    /// OFV would be silently wrong. The full `[θ, Ω_bsv, σ, Ω_iov]` analytic packed gradient
+    /// must match Richardson reconverged FD of the FOCEI IOV marginal on both censoring
+    /// tails — the closed-form twin of `iov_m3_ode_expression_scale_packed_gradient_matches_reconverged_fd`.
+    #[test]
+    fn iov_m3_expression_scale_packed_gradient_matches_reconverged_fd() {
+        const WARFARIN_IOV_M3_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let mut model =
+            parse_model_string(WARFARIN_IOV_M3_EXPRSCALE).expect("parse IOV + M3 + obs_scale");
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(
+            matches!(
+                model.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ),
+            "fixture must carry an expression obs_scale"
+        );
+        assert!(
+            crate::sens::provider::iov_analytical_supported(&model),
+            "closed-form IOV + M3 + ExpressionScale obs_scale must be analytic (#651)"
+        );
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+
+        for right in [false, true] {
+            let subject = if right {
+                iov_m3_subject_right(&model, &theta)
+            } else {
+                iov_m3_subject(&model, &theta)
+            };
+            assert!(
+                subject.cens.iter().any(|&c| c != 0),
+                "subject must be censored"
+            );
+            let template = params.clone();
+            let x = crate::estimation::parameterization::pack_params(&params);
+
+            let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+            let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+                .expect("IOV + M3 + obs_scale packed gradient supported");
+
+            let f = |xx: &[f64]| -> f64 {
+                let p = unpack_params(xx, &template);
+                marginal_nll_iov(&model, &subject, &p)
+            };
+            for i in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[i].abs());
+                let fd_at = |hh: f64| -> f64 {
+                    let mut xp = x.clone();
+                    xp[i] += hh;
+                    let mut xm = x.clone();
+                    xm[i] -= hh;
+                    (f(&xp) - f(&xm)) / (2.0 * hh)
+                };
+                let f1 = fd_at(h);
+                let f2 = fd_at(h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                eprintln!(
+                    "iov+m3+exprscale (right={right}) packed x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[i],
+                    fd,
+                    (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+                );
+                approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+            }
+        }
+    }
+
+    /// **Closed-form IOV + `iiv_on_ruv` + `ExpressionScale` `obs_scale = V`** (#651 review #1),
+    /// plus the **triple** with M3 censoring. `iiv_on_ruv` scales the residual variance by
+    /// `exp(2·η_ruv)` and rides a zero `∂f/∂η_ruv` structural column applied downstream by the
+    /// provider-agnostic `prepare_stacked` assembly, independently of the post-walk scale
+    /// quotient — but the combination was untested when the gate began admitting `obs_scale`.
+    /// The production FOCEI packed gradient must match Richardson reconverged FD of the scaled
+    /// FOCEI IOV marginal over every packed coordinate (incl. the `Ω_RUV` block), with and
+    /// without censored rows. Closed-form twin of the ODE `iov_iiv_on_ruv` / `iov_m3_iiv_on_ruv`
+    /// packed-gradient tests.
+    #[test]
+    fn iov_iiv_on_ruv_expression_scale_packed_gradient_matches_reconverged_fd() {
+        const WARFARIN_IOV_RUV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let mut model = parse_model_string(WARFARIN_IOV_RUV_EXPRSCALE)
+            .expect("parse IOV + iiv_on_ruv + obs_scale");
+        assert_eq!(model.residual_error_eta, Some(3));
+        assert!(
+            crate::sens::provider::iov_analytical_supported(&model),
+            "closed-form IOV + iiv_on_ruv + ExpressionScale obs_scale must be analytic (#651)"
+        );
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+
+        // Plain iiv_on_ruv + obs_scale, then the triple with M3-censored occasion-2 tail.
+        for m3 in [false, true] {
+            if m3 {
+                model.bloq_method = crate::types::BloqMethod::M3;
+            }
+            let subject = if m3 {
+                iov_m3_ruv_subject(&model, &theta)
+            } else {
+                iov_ruv_subject(&model, &theta)
+            };
+            let template = params.clone();
+            let x = crate::estimation::parameterization::pack_params(&params);
+
+            let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+            let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+                .expect("IOV + iiv_on_ruv + obs_scale packed gradient supported");
+
+            let f = |xx: &[f64]| -> f64 {
+                let p = unpack_params(xx, &template);
+                marginal_nll_iov(&model, &subject, &p)
+            };
+            for i in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[i].abs());
+                let fd_at = |hh: f64| -> f64 {
+                    let mut xp = x.clone();
+                    xp[i] += hh;
+                    let mut xm = x.clone();
+                    xm[i] -= hh;
+                    (f(&xp) - f(&xm)) / (2.0 * hh)
+                };
+                let f1 = fd_at(h);
+                let f2 = fd_at(h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                eprintln!(
+                    "iov+ruv+exprscale (m3={m3}) packed x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                    analytic[i],
+                    fd,
+                    (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+                );
+                approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+            }
+        }
+    }
 }

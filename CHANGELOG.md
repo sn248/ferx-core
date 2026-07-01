@@ -77,6 +77,23 @@ section of the SDLC for the versioning policy).
   subject covariate snapshot), and the EVID=2 breakpoint rides the event-driven
   walk that already carried it — closing the matching cells the IOV path gained in
   #590/#591. LTBS-combined `obs_scale` stays on the FD fallback.
+- **Built-in absorption input-rate forcing** (`igd`/`transit`/`weibull`/`first_order`/
+  `zero_order`, incl. `mixed`) combined with an **EVID 3/4 reset** now gets exact
+  analytic FOCE/FOCEI sensitivities instead of finite differences (#486): the fix
+  threads the already-tracked `reset_floor` into the shared forcing helper (turning
+  off a dose's pre-reset tail, matching the infusion rule) kind-agnostically, so
+  `zero_order`'s own separate per-segment window mechanism (#530) inherits it too.
+  `igd`/`transit`/`weibull`/`first_order` (but not `zero_order`/`mixed`) also now get
+  exact analytic sensitivities combined with **time-varying covariates**, via the
+  same helper wired into the event-driven walk, hoisting the forcing's
+  dose-invariant constants fresh per segment as the PK snapshot changes. Combined
+  with an **estimated lagtime**, `igd`/`transit`/`first_order` are also now
+  analytic: the continuous `∂R_in/∂lag` flows through the walk's dual
+  time-after-dose, and the forcing's onset at the dose's lagged arrival is
+  injected as an exact rate-on saltation. `weibull` stays on the FD fallback when
+  combined with lagtime (its onset can diverge for shape `β < 1`), as does
+  `zero_order`'s own moving-boundary cutoff combined with TV-cov or lagtime (a
+  separate per-segment mechanism not yet ported to the event-driven walk).
 - **Analytic transit-compartment absorption** (#386). A new `pk one_cpt_transit(cl, v, n, mtt)`
   structural model evaluates Savic (2007) transit absorption into a one-compartment disposition as
   an exponential-tilting closed form (the incomplete-gamma `convolve_1cpt`), with exact `Dual2`

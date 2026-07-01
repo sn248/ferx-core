@@ -38,6 +38,17 @@ section of the SDLC for the versioning policy).
   jet, and the moving infusion-end boundary carries `∂/∂{θ,η,κ}` — including when the
   modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`). Steady-state modeled doses
   stay on the finite-difference fallback for now.
+- A structural parameter that reads the event-time built-in `TIME`/`time` (a
+  NONMEM-style `$PK IF (TIME.GE.45) CL=…` time-dependent switch) now gets exact
+  analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
+  (#486 / #610). The per-event time is threaded into the same event-driven `Dual2`
+  (outer) / `Dual1` (inner EBE) walk used for time-varying covariates, so the
+  gradient is exact and faster. Covers closed-form (1-/2-/3-cpt) and ODE models,
+  with and without inter-occasion variability, including together with an
+  η-dependent `obs_scale` expression (the event-driven walk now applies the scale
+  quotient — which also makes time-varying-covariate + expression-scale models
+  analytic). Only the direct `pk(...=TIME)` mapping still falls back to finite
+  differences.
 - A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
   **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
@@ -411,7 +422,24 @@ section of the SDLC for the versioning policy).
   notice — which described the now-removed promotion ("evaluated with η-interaction") — is
   reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
 
+### Removed
+- The `covariance_ofv_hessian` fit option and the analytical-gradient covariance
+  R-matrix stencil it selected (`covariance_ofv_hessian = false`) have been removed.
+  The covariance R-matrix is now **always** built from second differences of the
+  reconverged marginal OFV — the accurate, envelope-free stencil that recomputes the
+  full marginal curvature (`a = ∂f/∂η` and the `log|H̃|` EBE-response) at every
+  perturbed point. The old analytical stencil held `a` fixed and biased the SE of
+  weakly-identified structural parameters; its exact form requires third-order
+  sensitivities (tracked separately). Models that set `covariance_ofv_hessian` should
+  drop the key (it is now an unknown option) (#639).
+
 ### Fixed
+- **Optimizer trace is now flushed to disk after every row** so live consumers
+  (e.g. the ferx-r trace UI) see iterations as they happen. The `TraceWriter`
+  wrapped the file in a `BufWriter` and only flushed at `finish()`; high-volume
+  methods (SAEM) filled the buffer and streamed incidentally, but gradient
+  methods (FOCE/FOCEI/GN) emit few rows (smaller than the buffer) so the trace
+  file did not appear until the fit completed.
 - **Gradient optimizers no longer fail on a first-step overshoot into the EBE guard**
   (#486). When the outer optimizer's inner EBE loop rejected a trial step (too many
   unconverged subjects, or a non-finite OFV), the objective was clamped to a flat `1e20`

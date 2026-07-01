@@ -9099,7 +9099,18 @@ fn build_pk_param_fn(
     };
 
     let pk_var_slots = if is_analytical_pk {
-        pk_assignment_mapping.clone()
+        // Structural PK params (CL, V, …) plus any modeled-dose `D{cmt}`/`R{cmt}`
+        // slots (#486). The latter are not read by the closed-form kernels, but the
+        // analytic-sensitivity chain needs their `∂/∂(θ,η)` (+ 2nd order) rows so the
+        // event-driven walk can seed the modeled infusion rate/window dual
+        // (`pk_slot_dual_outer` looks the slot up in `pk_slots`). Appended after the
+        // structural slots so the row order stays stable; empty for a model with no
+        // modeled dose, so this is a no-op there. A fixed-dose subject of such a model
+        // routes to superposition, where the extra slot is seeded but unread (its
+        // kernel derivative is 0), so it is harmless.
+        let mut m = pk_assignment_mapping.clone();
+        m.extend(analytical_extra_mapping.iter().copied());
+        m
     } else {
         ode_assignment_mapping.clone()
     };

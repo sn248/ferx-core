@@ -44,6 +44,18 @@ section of the SDLC for the versioning policy).
   FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
+- **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) on the analytical
+  (closed-form 1-/2-/3-cpt) models** now get exact analytic FOCE/FOCEI sensitivities
+  instead of finite differences (#486), closing the largest closed-form-vs-ODE gap (the
+  ODE path already had this via #630/#635). The modeled infusion window resolves from the
+  PK parameters, so the infusion *end* is a moving boundary in `D`/`R`; the closed-form
+  event-driven walk now carries it exactly (to second order) via the dual window length,
+  the sign-mirror of the existing lagtime dose-*start* handling. Covers non-IOV and IOV
+  (per-occasion windows, including κ-coupled slots), on both the outer θ/Ω/σ gradient and
+  the inner EBE η-gradient. Validated against finite differences of the production
+  predictor and against the independently NONMEM-anchored ODE twin. Modeled-dose ×
+  steady-state and rate-defined (`RATE=-1`) infusion under `F ≠ 1` remain on finite
+  differences (as on the ODE path).
 - **An `ExpressionScale` `obs_scale` divisor (e.g. `obs_scale = V`) combined with IOV on a
   closed-form (analytical 1-/2-/3-cpt) model** now gets exact analytic FOCE/FOCEI
   sensitivities on both the outer and inner loops instead of finite differences (#486). The

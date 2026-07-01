@@ -410,6 +410,17 @@ section of the SDLC for the versioning policy).
   notice — which described the now-removed promotion ("evaluated with η-interaction") — is
   reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
 
+### Removed
+- The `covariance_ofv_hessian` fit option and the analytical-gradient covariance
+  R-matrix stencil it selected (`covariance_ofv_hessian = false`) have been removed.
+  The covariance R-matrix is now **always** built from second differences of the
+  reconverged marginal OFV — the accurate, envelope-free stencil that recomputes the
+  full marginal curvature (`a = ∂f/∂η` and the `log|H̃|` EBE-response) at every
+  perturbed point. The old analytical stencil held `a` fixed and biased the SE of
+  weakly-identified structural parameters; its exact form requires third-order
+  sensitivities (tracked separately). Models that set `covariance_ofv_hessian` should
+  drop the key (it is now an unknown option) (#639).
+
 ### Fixed
 - **Optimizer trace is now flushed to disk after every row** so live consumers
   (e.g. the ferx-r trace UI) see iterations as they happen. The `TraceWriter`

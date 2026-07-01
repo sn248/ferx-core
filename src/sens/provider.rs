@@ -1640,19 +1640,16 @@ fn resolve_eff_doses<'a>(
 
 /// Shared FD-fallback gate for modeled `RATE=-1/-2` doses on the analytic closed-form
 /// walk (#486, deduped from the per-provider guards). Returns `false` (⇒ decline to
-/// FD) when either:
-/// - the subject mixes a modeled dose with a steady-state dose — the closed-form dual
-///   SS equilibration (`equilibrate_ss_g`) carries no modeled-window jet, so the
-///   moving infusion-end boundary would be dropped. (Unlike the ODE provider, whose
-///   `equilibrate_ss_state_g` *does* thread that jet and serves SS+modeled
-///   analytically per #486 — this decline is closed-form-specific.); or
-/// - a modeled dose has no backing `D{cmt}`/`R{cmt}` slot — an invalid model
-///   `check_model_data` rejects upstream, guarded here so the provider declines rather
-///   than panics in [`DoseEvent::resolve_rate`].
+/// FD) when a modeled dose has no backing `D{cmt}`/`R{cmt}` slot — an invalid model
+/// `check_model_data` rejects upstream, guarded here so the provider declines rather
+/// than panics in [`DoseEvent::resolve_rate`].
+///
+/// A modeled dose combined with a **steady-state** dose is now analytic too (#486):
+/// [`crate::sens::propagate::equilibrate_ss_g`] threads the per-dose modeled-window dual
+/// `(rate_bare, dur_bare)` into each equilibration cycle's active/quiet split, so the
+/// moving infusion-end jet flows through the SS trough exactly as it does through the
+/// current pulse (matching the ODE provider's `equilibrate_ss_state_g`).
 fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subject) -> bool {
-    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
-        return false;
-    }
     modeled_doses_resolvable(model, subject)
 }
 
@@ -5781,6 +5778,135 @@ mod tests {
             }
             for (x, y) in a.d2f_deta2.iter().zip(b.d2f_deta2.iter()) {
                 approx::assert_relative_eq!(x, y, max_relative = 1e-4, epsilon = 1e-6);
+            }
+        }
+    }
+
+    /// **Closed-form modeled-duration dose × steady state** (#486 — the last modeled-dose
+    /// gap after #652). The SS trough is equilibrated by `equilibrate_ss_g`, which now threads
+    /// the modeled window dual `(rate_bare, dur_bare)` into each cycle's active/quiet split, so
+    /// the moving infusion-end jet (`∂D1`) flows through the SS trough exactly as it does
+    /// through the current pulse. `D1 ≈ 2.1 < II = 12`; obs straddle the window end within the
+    /// SS interval (0.5, 1.5 inside; 3, 6, 11 after). Validated vs central FD of the production
+    /// predictor (`compute_predictions_with_tv`, which resolves `D1` per evaluation and
+    /// equilibrates the same SS train).
+    #[test]
+    fn provider_modeled_duration_ss_matches_fd_of_production() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0, 11.0],
+        );
+        assert!(subject.has_periodic_ss_dose());
+        assert!(
+            subject_sensitivities(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05])
+                .is_some(),
+            "modeled-duration + SS must be served analytically now (#486)"
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// Modeled **rate** (`RATE=-1`) × steady state — the sign-mirror of the duration case,
+    /// same `equilibrate_ss_g` window-jet path (`duration = amt/R1` moves the SS window end).
+    #[test]
+    fn provider_modeled_rate_ss_matches_fd_of_production() {
+        const ONECPT_IV_MODELED_RATE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_R1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  R1 = TVR1 * exp(ETA_R1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(ONECPT_IV_MODELED_RATE).expect("parse");
+        // amt=1000, R1≈500 → window ≈ 2h < II = 12. Obs straddle the SS window end.
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledRate,
+            ),
+            &[0.5, 1.5, 3.0, 6.0, 11.0],
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 500.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// **Bit-parity cross-check vs the ODE twin for SS + modeled-duration.** The ODE
+    /// `[odes]` SS + modeled-duration path is already analytic (#642) and independently
+    /// NONMEM-anchored, so its outer `(η, θ)` jets are a strong oracle for the closed-form
+    /// SS window-jet just added — they must agree to ODE integration tolerance (#486).
+    #[test]
+    fn provider_modeled_duration_ss_matches_ode_twin() {
+        const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse cf");
+        let ode = parse_model_string(ODE_TWIN).expect("parse ode twin");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0, 11.0],
+        );
+        let theta = [10.0, 50.0, 2.0];
+        let eta = [0.12, -0.08, 0.05];
+        let s_cf = subject_sensitivities(&cf, &subject, &theta, &eta).expect("cf some");
+        let s_ode = subject_sensitivities(&ode, &subject, &theta, &eta).expect("ode some");
+        assert_eq!(s_cf.obs.len(), s_ode.obs.len());
+        for (a, b) in s_cf.obs.iter().zip(s_ode.obs.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-6, epsilon = 1e-8);
+            for (x, y) in a.df_deta.iter().zip(b.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
+            }
+            for (x, y) in a.df_dtheta.iter().zip(b.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
             }
         }
     }

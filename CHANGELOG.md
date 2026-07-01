@@ -44,6 +44,24 @@ section of the SDLC for the versioning policy).
   FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
+- **Built-in absorption forcings (`zero_order(dur)`, `first_order`, and `mixed`) combined
+  with inter-occasion variability (IOV)** now get exact analytic FOCE/FOCEI sensitivities on
+  the ODE path instead of finite differences (#486), closing the last zero-order gap. The IOV
+  analytic walk is the same event-driven walk as the non-IOV time-varying-covariate path, so
+  each forcing's rate and moving-boundary window are rebuilt from that dose's own
+  per-occasion PK jet — the κ (occasion) sensitivity rides through exactly as η/θ do.
+  Validated against finite differences of the production `predict_iov` (value, gradient, and
+  Hessian over the stacked `[η, κ]` vector), including a κ-coupled `DUR` axis-placement check.
+  Other input-rate kinds (igd / transit / weibull / parallel) under IOV, and any built-in
+  forcing combined with a steady-state dose under IOV, remain on finite differences.
+- **Modeled-duration/rate doses (`RATE=-1`/`-2`) combined with steady-state dosing on the
+  closed-form (analytical 1-/2-/3-cpt) models** now get exact analytic FOCE/FOCEI
+  sensitivities instead of finite differences (#486), the last modeled-dose gap after #652
+  (the ODE path had it via #642). The closed-form dual steady-state equilibration threads the
+  modeled infusion-window jet `(rate, dur)` into each cycle's active/quiet split, so the
+  moving infusion-end flows through the steady-state trough exactly as it does through the
+  current pulse. Validated against finite differences of the production predictor and against
+  the independently NONMEM-anchored ODE steady-state modeled-dose twin.
 - **Zero-order absorption (`zero_order(dur)`, and the `zero_order` leg of a `mixed` model)
   combined with time-varying covariates or an estimated lagtime** now gets exact analytic
   FOCE/FOCEI sensitivities on the ODE event-driven walk instead of finite differences

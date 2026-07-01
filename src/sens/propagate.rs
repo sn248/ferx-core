@@ -966,7 +966,12 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
 /// `event_driven::equilibrate_ss_state_event_driven` for the 1-/2-cpt models;
 /// overlapping SS infusions (`T_inf > II`) return the empty state, matching
 /// production's reject.
-fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEvent) -> Vec<T> {
+fn equilibrate_ss_g<T: PkNum>(
+    pk_model: PkModel,
+    pk: &PkDual<T>,
+    dose: &DoseEvent,
+    inf: Option<(T, T)>,
+) -> Vec<T> {
     let (n_states, _) = state_layout_g(pk_model);
     let mut state = vec![T::from_f64(0.0); n_states];
     if dose.ii <= 0.0 || dose.cmt == 0 {
@@ -988,6 +993,12 @@ fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEven
         Vec::new()
     };
     let synthetic_lag: Vec<f64> = if is_inf { vec![0.0] } else { Vec::new() };
+    // #486: for a **modeled** SS infusion (`RATE=-1/-2`), thread the window dual
+    // `(rate_bare, dur_bare)` so each equilibration cycle's active/quiet split carries the
+    // moving infusion-end jet (`∂D`/`∂R`) through `propagate_bounds_g`'s `dual_pos`, exactly
+    // as the main walk does for the current pulse — closing the closed-form SS × modeled-dose
+    // gap. `None` (a fixed-window infusion) recovers the pre-#486 f64 window behaviour.
+    let synthetic_inf: Vec<Option<(T, T)>> = if is_inf { vec![inf] } else { Vec::new() };
     let bounds: Vec<f64> = if is_inf {
         vec![0.0, dose.duration, dose.ii]
     } else {
@@ -1009,7 +1020,7 @@ fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEven
             pk_model,
             &synthetic_dose,
             &synthetic_lag,
-            &[],
+            &synthetic_inf,
             f64::NEG_INFINITY,
         );
         cycles_run = cycle + 1;
@@ -1117,7 +1128,11 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
             EventKind::Dose => {
                 let d = &eff_doses[ev.orig_idx];
                 if d.ss && d.ii > 0.0 {
-                    state = equilibrate_ss_g(pk_model, &pk_now, d);
+                    // #486: forward this dose's modeled-window dual (if any) so the SS
+                    // equilibration threads `∂D`/`∂R` into the trough, matching the current
+                    // pulse handled by the main walk. `None` for a fixed infusion / bolus.
+                    let inf = dose_inf_dual.get(ev.orig_idx).copied().flatten();
+                    state = equilibrate_ss_g(pk_model, &pk_now, d, inf);
                 }
                 if d.rate <= 0.0 {
                     let cmt_idx = d.cmt.saturating_sub(1);

@@ -13703,7 +13703,8 @@ mod tests {
         use std::collections::HashMap;
         assert!(MAX_RUV_MAG_AXES >= 17, "cap must be raised past the old 16");
         let cov = HashMap::new();
-        for n in [1usize, 16, 17, 24, MAX_RUV_MAG_AXES] {
+        // Every axis count up to the cap — exercises each `Dual1<M>` dispatch arm.
+        for n in 1..=MAX_RUV_MAG_AXES {
             let expr = Expression::BinOp(
                 Box::new(Expression::Theta(n - 1)),
                 BinOp::Mul,

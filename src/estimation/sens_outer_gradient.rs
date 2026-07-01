@@ -461,6 +461,11 @@ fn prepare(
 /// per-`(sigma, θ)` gradient. Diagonal-`R` only (`block_sigma` correlations force
 /// FD upstream via `analytic_outer_gradient_available`). Shared by the FOCEI
 /// (`prepare_stacked`) and FOCE (`subject_packed_gradient_foce{,_iov}`) paths.
+/// Returns `dr_dtheta` (the `∂R/∂θ` vector); if `dd_dtheta` is `Some`, also
+/// accumulates the `f`-derivative `∂d/∂θ` into it. The FOCEI `prepare_stacked`
+/// path needs both; the FOCE (Sheiner–Beal) marginal only reads `∂R/∂θ`, so it
+/// passes `None` and skips the `slopes` lookup and the `4·coeff·coeff'·…`
+/// accumulation entirely (#486 review).
 #[allow(clippy::too_many_arguments)]
 fn mag_variance_dtheta(
     error_spec: &crate::types::ErrorSpec,
@@ -471,28 +476,39 @@ fn mag_variance_dtheta(
     mult_grad_row: &[Vec<f64>],
     n_theta: usize,
     ruv_scale: f64,
-) -> (Vec<f64>, Vec<f64>) {
+    mut dd_dtheta: Option<&mut Vec<f64>>,
+) -> Vec<f64> {
     let loadings = error_spec.sigma_loadings(cmt, f, sigma.len());
-    let slopes = error_spec.sigma_loading_slopes(cmt, sigma.len());
+    let slopes = if dd_dtheta.is_some() {
+        error_spec.sigma_loading_slopes(cmt, sigma.len())
+    } else {
+        Vec::new()
+    };
     let mut dr_dtheta = vec![0.0f64; n_theta];
-    let mut dd_dtheta = vec![0.0f64; n_theta];
     for &(idx, coeff) in &loadings {
-        let coeff_p = slopes
-            .iter()
-            .find(|&&(i, _)| i == idx)
-            .map(|&(_, s)| s)
-            .unwrap_or(0.0);
         let sg = sigma.get(idx).copied().unwrap_or(0.0);
         let mv = mult_row.get(idx).copied().unwrap_or(1.0);
-        if let Some(dmi) = mult_grad_row.get(idx) {
-            for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
-                let dmdt = dmdt_raw * ruv_scale;
-                dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
-                dd_dtheta[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
+        let Some(dmi) = mult_grad_row.get(idx) else {
+            continue;
+        };
+        let coeff_p = if dd_dtheta.is_some() {
+            slopes
+                .iter()
+                .find(|&&(i, _)| i == idx)
+                .map(|&(_, s)| s)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
+            let dmdt = dmdt_raw * ruv_scale;
+            dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
+            if let Some(dd) = dd_dtheta.as_deref_mut() {
+                dd[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
             }
         }
     }
-    (dr_dtheta, dd_dtheta)
+    dr_dtheta
 }
 
 /// The magnitude direct-θ derivative of the data-term coefficient `α` for one
@@ -707,7 +723,8 @@ fn prepare_stacked(
         // same bilinear shape `residual_error::diag_self_deriv` uses for the
         // `f`-derivative, just chain-ruled through `mult(θ)` instead of `f`.
         if let (Some(m), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
-            let (dr_dtheta, dd_dtheta) = mag_variance_dtheta(
+            let mut dd_dtheta = vec![0.0f64; n_theta];
+            let dr_dtheta = mag_variance_dtheta(
                 &model.error_spec,
                 cmt,
                 f,
@@ -716,6 +733,7 @@ fn prepare_stacked(
                 mg_row,
                 n_theta,
                 ruv_scale,
+                Some(&mut dd_dtheta),
             );
             t.dr_dtheta = dr_dtheta;
             t.dd_dtheta = dd_dtheta;
@@ -1781,8 +1799,9 @@ pub fn subject_packed_gradient_foce(
             None => model.error_spec.dvar_df(cmt, f0act, sigma),
         };
         if let (Some(mm), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
-            // `R⁰` at f(η=0), so `ruv_scale = 1` (no `iiv_on_ruv` on this path).
-            let (dr, _dd) = mag_variance_dtheta(
+            // `R⁰` at f(η=0), so `ruv_scale = 1` (no `iiv_on_ruv` on this path); the
+            // Sheiner–Beal marginal only needs `∂R/∂θ`, so skip the `∂d/∂θ` accumulation.
+            let dr = mag_variance_dtheta(
                 &model.error_spec,
                 cmt,
                 f0act,
@@ -1791,6 +1810,7 @@ pub fn subject_packed_gradient_foce(
                 mg_row,
                 n_theta,
                 1.0,
+                None,
             );
             dr0_dtheta[i] = dr;
         }
@@ -2080,7 +2100,9 @@ pub fn subject_eta_dx_iov(
     // Custom-magnitude support (#576/#486): `mult(θ)` adds a direct-θ term to the
     // inner `∂²l/∂η∂θ` (θ block) and makes `∂R/∂σ` magnitude-scaled (σ block below);
     // `None` for a bare-sigma model. See the non-IOV `subject_eta_dx` for the rationale.
-    let mult = model.ruv_obs_mult(subject, &params.theta);
+    // Reused from `Prep` (built once in `prepare_stacked`) — recomputing re-walks
+    // every magnitude expression per observation (#486 review).
+    let mult = &prep.mult;
 
     // θ coords.
     for m in 0..n_theta {
@@ -2325,7 +2347,8 @@ pub fn subject_packed_gradient_foce_iov(
             None => model.error_spec.dvar_df(cmt, f0act, sigma),
         };
         if let (Some(mm), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
-            let (dr, _dd) = mag_variance_dtheta(
+            // Sheiner–Beal marginal only needs `∂R/∂θ` → skip the `∂d/∂θ` accumulation.
+            let dr = mag_variance_dtheta(
                 &model.error_spec,
                 cmt,
                 f0act,
@@ -2334,6 +2357,7 @@ pub fn subject_packed_gradient_foce_iov(
                 mg_row,
                 n_theta,
                 1.0,
+                None,
             );
             dr0_dtheta[i] = dr;
         }
@@ -2553,7 +2577,9 @@ pub fn subject_eta_dx(
     // Custom-magnitude σ derivatives (#576/#486): `∂R/∂σ`/`∂d/∂σ` below must be taken
     // of the *scaled* variance (`et.r`/`et.d` already carry `mult`), else the σ
     // EBE-response is inconsistent for a magnitude model. `None` for a bare-sigma model.
-    let mult = model.ruv_obs_mult(subject, &params.theta);
+    // Reused from `Prep` (built once in `prepare`) rather than recomputed — `ruv_obs_mult`
+    // re-walks every magnitude expression per observation (#486 review).
+    let mult = &prep.mult;
 
     // Ω coords: M_L = −Ω⁻¹(e_row·(v·z) + v·z_row), v = L[:,col]; ×L_kk for diag-log.
     let z = &prep.omega_inv * DVector::from_column_slice(eta_hat);
@@ -7288,6 +7314,54 @@ mod tests {
             );
             approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
         }
+    }
+
+    /// A 1-cpt oral **user-`[odes]`** model with a TIME-varying proportional σ magnitude.
+    /// The closed-form magnitude tests above exercise only the *analytical* provider;
+    /// this pins the FOCE magnitude gradient on the **ODE provider path** — which the
+    /// gate change (`analytic_outer_gradient_for_interaction` no longer narrowing FOCE
+    /// magnitude to FD) newly routes to the analytic Sheiner–Beal gradient (#486 review).
+    const ONECPT_ODE_RUV_MAG: &str = r#"
+[parameters]
+  theta TVCL(0.2,  0.001, 10.0)
+  theta TVV(10.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+  theta RUV_LATE(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+[fit_options]
+  method     = foce
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// FOCE σ-magnitude on the **ODE** provider path: the analytic packed gradient
+    /// (`population_gradient_sens_foce` over the event-driven `Dual1`/`Dual2` ODE walk)
+    /// must match reconverged-FD of the magnitude-aware FOCE marginal, every coordinate
+    /// — pins the path the gate change enabled but the closed-form tests don't cover.
+    #[test]
+    fn magnitude_foce_ode_packed_matches_fd() {
+        let model = parse_model_string(ONECPT_ODE_RUV_MAG).expect("parse ODE magnitude");
+        assert!(model.is_ode_based(), "must be on the ODE provider path");
+        assert!(model.has_custom_ruv_magnitude());
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "ODE FOCE magnitude must route to the analytic outer gradient"
+        );
+        run_packed_check_foce(&model, &[0.22, 11.0, 1.4, 1.6]);
     }
 
     /// Regression guard (#578-style): a bare-sigma (no custom magnitude) subject's

@@ -4228,6 +4228,11 @@ mod tests {
             for (x, y) in a.d2f_deta2.iter().zip(b.d2f_deta2.iter()) {
                 approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
             }
+            // The mixed η-θ second derivative feeds the FOCEI Laplace `log|H̃|`
+            // θ-gradient this work targets, so it must match too.
+            for (x, y) in a.d2f_deta_dtheta.iter().zip(b.d2f_deta_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
         }
     }
 

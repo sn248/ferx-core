@@ -480,13 +480,17 @@ The two paths differ in what keeps them analytic. A **modeled-duration / -rate d
 stays analytic when composed with an estimated lagtime (the start *and* end
 saltations carry the combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying
 covariates, or multiple doses — only a *steady-state* modeled dose or one under IOV
-falls back to finite differences. The **`zero_order(dur)` forcing** rides the static
-walk, which has a narrower analytic scope: it stays analytic across multiple doses,
-a mixed (zero- + first-order) pathway, and an EVID 3/4 reset (#486 — the reset case
-is kind-agnostic, so `zero_order` inherits it too), but reverts to
-**finite differences** when combined with an estimated lagtime or time-varying
-covariates (its moving-boundary cutoff is a per-segment mechanism not yet ported to
-the event-driven walk that carries those two features).
+falls back to finite differences. The **`zero_order(dur)` forcing** is analytic across
+multiple doses, a mixed (zero- + first-order) pathway, and an EVID 3/4 reset (#486 —
+the reset case is kind-agnostic, so `zero_order` inherits it too) on the static walk,
+and its moving-boundary window is now also carried on the **event-driven** walk, so it
+stays analytic combined with an estimated **lagtime** or **time-varying covariates**
+(#486): the constant `F·amt·frac/dur` window is delivered per segment there, its
+moving end `d.time + lag + dur` (and, under lagtime, its moving start) injected as the
+same rate-on / rate-off saltations used for infusions. Under a covariate that varies
+*across* the window end the rate-off uses the general `g⁻ − g⁺` saltation (the RHS
+Jacobian jumps across the boundary too, not just the forcing). Only `zero_order` under
+**IOV** stays on finite differences.
 See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 
 The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
@@ -581,14 +585,16 @@ alongside a `first_order` one) keep **exact analytic** (`Dual2`) FOCE/FOCEI
 gradients — including the derivatives with respect to the pathway fraction and the
 zero-order **duration**: the moving-boundary `∂/∂dur` is carried by the rate-off
 saltation at the cutoff
-([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)). The two families now
-diverge in scope (#486): **`parallel`** (two `first_order` terms, no `zero_order`) is
-analytic combined with an EVID 3/4 reset, time-varying covariates, *or* an estimated
-lagtime — every forcing feeding the compartment is a smooth density, so the same
-rate-on onset saltation covers it. **`mixed`** is analytic combined with an EVID 3/4
-reset too (kind-agnostic, exactly as for a plain `zero_order` model), but still
-reverts to finite differences combined with time-varying covariates or an estimated
-lagtime — its `zero_order` term's moving-boundary cutoff is the limiting factor there.
+([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)). Both families are now
+analytic combined with an EVID 3/4 reset, **time-varying covariates**, *or* an
+estimated **lagtime** (#486): **`parallel`** (two `first_order` terms, no `zero_order`)
+because every forcing feeding the compartment is a smooth density carried on the
+event-driven walk; **`mixed`** because that walk now also carries the `zero_order`
+term's moving-boundary window (delivered as a per-segment constant, with rate-on /
+rate-off saltations at its moving start / end). In the `mixed` case the two forcings
+switch on together at the lagged arrival, so their onset saltations sum on the shared
+compartment. Only the **IOV** path keeps a `zero_order`/`mixed` model on finite
+differences.
 
 ### Worked examples
 

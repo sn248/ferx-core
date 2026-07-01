@@ -348,8 +348,12 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // finite `ka·dose`. `Weibull`'s onset **diverges** for shape `β < 1` (an
     // integrable spike, not a finite jump) — no closed-form saltation exists there,
     // so a model combining lagtime with `Weibull` stays on the FD fallback.
-    // `ZeroOrder`'s own moving-boundary cutoff is a separate mechanism (#530) not yet
-    // ported to the event-driven walk, so lagtime + `zero_order` also stays FD.
+    // `ZeroOrder`'s moving-boundary window is now carried on the event-driven walk too
+    // (#486): its two boundaries — the rate-on at the lagged arrival `t_dose + lag` and
+    // the rate-off at `t_dose + lag + dur` — both shift with `lag`, injected as the
+    // rate-on / rate-off saltations `integrate_tvcov_g` already uses for infusions (the
+    // rate-off additionally carries `∂/∂dur`). So `zero_order` + lagtime is admitted,
+    // leaving only `Weibull` (whose onset diverges for shape `β < 1`) on the FD fallback.
     if model.has_lagtime()
         && ode.input_rate.iter().any(|f| {
             !matches!(
@@ -357,6 +361,7 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
                 crate::pk::absorption::InputRateKind::Transit
                     | crate::pk::absorption::InputRateKind::InverseGaussian
                     | crate::pk::absorption::InputRateKind::FirstOrder
+                    | crate::pk::absorption::InputRateKind::ZeroOrder
             )
         })
     {
@@ -544,19 +549,14 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // combined lagtime + input-rate saltation is gated separately by
     // `ode_analytical_supported` (which this function calls above), so a model
     // reaching here with both already carries only the boundary-safe kinds.
-    // `ZeroOrder`'s own moving-boundary cutoff (#530) is a *per-segment constant*
-    // delivery this walk doesn't carry (only `integrate_g`'s `zero_windows` does) —
-    // admitting it here would silently drop the forcing entirely
-    // (`add_prepared_input_rate_forcing` skips `ZeroOrder` by design, expecting the
-    // caller to deliver it separately), so a model using it stays on the FD
-    // fallback until that machinery is ported (tracked as a stretch goal, #486).
-    if ode
-        .input_rate
-        .iter()
-        .any(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
-    {
-        return false;
-    }
+    // `ZeroOrder`'s moving-boundary window (`#530`) is now ported to this walk too (#486):
+    // `integrate_tvcov_g` rebuilds the constant `F·amt·frac/dur` window from each dose's own
+    // PK snapshot and delivers it as a per-segment constant (`active_zero`, mirroring
+    // `integrate_g`'s `zero_windows` and production's `active_zero_order_inputs`), with the
+    // rate-off saltation at the moving window end `d.time+lag+dur` (and, under an estimated
+    // lagtime, the rate-on saltation at the moving start). `add_prepared_input_rate_forcing`
+    // still skips `ZeroOrder` — the per-segment constant channel owns its delivery, exactly
+    // as on the static walk — so there is no longer any dropped forcing to guard against.
     // The bolus walk seeds compartments at zero; `init(...)` needs the seeded
     // initial-state machinery the static path uses, so route those to FD.
     if ode.init_fn.is_some() {
@@ -3509,6 +3509,54 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         Vec::new()
     };
 
+    // #486: zero-order absorption windows on the event-driven walk — the port of the static
+    // `integrate_g`'s `zero_windows` (and the dual mirror of production's `zero_order_windows`
+    // + `active_zero_order_inputs`). A dose feeding a `zero_order(dur)` forcing delivers a
+    // constant `F·amt·frac/dur` over `[d.time+lag, d.time+lag+dur]` — mechanically an
+    // infusion, but with the window END (and, under an estimated lagtime, the START) a moving
+    // boundary in the estimated `dur`/`lag`. The constant rate and window are fixed from the
+    // dose's OWN PK snapshot (`pk_at_dose[k]` / `f_bio_at_dose[k]`), matching production (the
+    // rate is mass-exact even when `dur` rides a time-varying covariate — a per-segment
+    // recompute would drift). Delivered as a per-segment constant (`active_zero` below), with
+    // the moving boundaries carried by the rate-on (`K_DOSE`, lagtime only) and rate-off
+    // (`K_ZO_END`) saltations. Stored as `(cmt, rate_jet, w_start, w_end, dur_jet, dose_idx)`.
+    // Empty for the common non-zero-order subject (every downstream read is then skipped).
+    let has_zero_order = has_input_rate
+        && ode
+            .input_rate
+            .iter()
+            .any(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder);
+    let zero_windows: Vec<(usize, T, f64, f64, T, usize)> = if !has_zero_order {
+        Vec::new()
+    } else {
+        subject
+            .doses
+            .iter()
+            .enumerate()
+            .filter_map(|(k, d)| {
+                if d.amt <= 0.0 {
+                    return None;
+                }
+                // One zero-order forcing per dose compartment (the parser rejects > 1),
+                // matching production's `zero_order_dur_and_frac_for_dose` `find_map`.
+                let f = ode.input_rate.iter().find(|f| {
+                    f.kind == crate::pk::absorption::InputRateKind::ZeroOrder && f.cmt + 1 == d.cmt
+                })?;
+                let dur = match f.prepare_dual::<T>(&pk_at_dose[k])? {
+                    crate::pk::absorption::PreparedInputRate::ZeroOrder { dur, .. } => dur,
+                    _ => return None,
+                };
+                // `frac` = 1 for an unfractioned `zero_order`; the declared pathway fraction
+                // for a `mixed` `FR*zero_order` leg (#505) — a linear multiplier on the rate.
+                let frac = f.frac::<T>(&pk_at_dose[k]);
+                let rate = f_bio_at_dose[k] * T::from_f64(d.amt) * frac / dur;
+                let w_start = d.time + lag_val(k);
+                let w_end = w_start + dur.val();
+                Some((d.cmt.saturating_sub(1), rate, w_start, w_end, dur, k))
+            })
+            .collect()
+    };
+
     // Whether dose `k` is a periodic steady-state dose (`SS=1`, `II>0`) — single source of
     // truth for the walk, mirroring `Subject::has_periodic_ss_dose`'s per-dose predicate.
     let is_ss_dose = |d: &crate::types::DoseEvent| -> bool { d.ss && d.ii > 0.0 };
@@ -3539,6 +3587,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     const K_PKONLY: u8 = 3;
     const K_OBS: u8 = 4;
     const K_INF_END: u8 = 5;
+    // #486: zero-order absorption window end. Sorts after `K_OBS` (like `K_INF_END`) so an
+    // observation exactly at the window end reads the constant rate still on, matching the
+    // static walk and production's `active_zero_order_inputs` full-containment convention.
+    const K_ZO_END: u8 = 6;
     // Capacity includes one `K_INF_END` slot per infusion (each dose adds its window-end
     // event below) and one `K_SS_SEED` slot per lagged SS dose, matching production's
     // timeline reservation. `n_infusion_ends` was computed once above (and reused for
@@ -3555,7 +3607,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             + subject.pk_only_times.len()
             + subject.reset_times.len()
             + n_infusion_ends
-            + n_ss_seeds,
+            + n_ss_seeds
+            + zero_windows.len(),
     );
     for &rt in &subject.reset_times {
         tl.push((rt, K_RESET, 0));
@@ -3584,6 +3637,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     }
     for (m, &t) in subject.pk_only_times.iter().enumerate() {
         tl.push((t, K_PKONLY, m));
+    }
+    // #486: break at each zero-order window end `w_end` (idx = the `zero_windows` index) so
+    // every segment is fully inside or outside every window — the invariant the per-segment
+    // full-containment filter (`active_zero`) relies on — and the rate-off saltation lands on
+    // an exact break. Mirrors production's `Kind::InfusionEnd` break for a zero-order cutoff.
+    for (wi, &(_, _, _, w_end, _, _)) in zero_windows.iter().enumerate() {
+        tl.push((w_end, K_ZO_END, wi));
     }
     tl.sort_by(|a, b| {
         a.0.partial_cmp(&b.0)
@@ -3636,7 +3696,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
-    for &(t_event, kind, idx) in &tl {
+    for p in 0..tl.len() {
+        let (t_event, kind, idx) = tl[p];
         // Segment `[cur_t, t_event]` uses the params evaluated at `t_event` (NONMEM
         // end-of-interval convention); a reset reuses the previous record's params.
         let params: &[T] = match kind {
@@ -3706,6 +3767,28 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     .map(|(k, d)| (d.cmt.saturating_sub(1), inf_eff[k].0))
                     .collect()
             };
+            // #486: zero-order windows fully containing this segment add their constant
+            // `F·amt·frac/dur` jet — the same full-containment test production's
+            // `active_zero_order_inputs` uses (`w_start ≤ cur_t`, `w_end ≥ t_event`), made
+            // artifact-free by the `w_end` timeline break above (every segment is wholly
+            // inside or outside each window). Reset-aware: a window opened before the most
+            // recent EVID 3/4 reset (`w_start < reset_floor`) is off, matching the infusion
+            // rule and the static walk. The post-cutoff segment (right end past `w_end`) is
+            // excluded here — the rate turns off there, its boundary derivative supplied by
+            // the rate-off saltation at `K_ZO_END`.
+            let active_zero: Vec<(usize, T)> = if !has_zero_order {
+                Vec::new()
+            } else {
+                zero_windows
+                    .iter()
+                    .filter(|&&(_, _, w_start, w_end, _, _)| {
+                        w_start >= reset_floor
+                            && w_start <= cur_t + crate::ode::predictions::INFUSION_EPS
+                            && w_end >= t_event - crate::ode::predictions::INFUSION_EPS
+                    })
+                    .map(|&(cmt, rate, _, _, _, _)| (cmt, rate))
+                    .collect()
+            };
             let rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                 eval_rhs_anchored::<T>(
                     program,
@@ -3721,6 +3804,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 for &(cmt, fr) in &active_inf {
                     if cmt < du.len() {
                         du[cmt] = du[cmt] + fr;
+                    }
+                }
+                // #486: zero-order windows delivered as a per-segment constant (like an
+                // infusion), NOT pointwise — `add_prepared_input_rate_forcing` skips
+                // `ZeroOrder` (it `continue`s) precisely so this constant-rate delivery
+                // (matching the f64 path) owns the moving-boundary cutoff.
+                for &(cmt, rate) in &active_zero {
+                    if cmt < du.len() {
+                        du[cmt] = du[cmt] + rate;
                     }
                 }
                 // R_in(tad), via the shared generic helper — `dose_lagtimes_dual`
@@ -3809,6 +3901,18 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 if f.cmt == cmt_idx {
                                     onset = onset
                                         + f.frac(&pk_at_dose[idx]) * prep.rate_at_zero(dose_mass);
+                                }
+                            }
+                            // #486: a zero-order window feeding this compartment also switches
+                            // on at the lagged arrival — its constant rate is the window's
+                            // rate-on `Δr` (`rate_at_zero` is zero for `ZeroOrder`, so the loop
+                            // above contributed nothing for it). One window per dose, so match
+                            // this dose's own window (`zk == idx`); a `mixed` biphasic dose
+                            // (first-order + zero-order on one compartment) sums both onsets
+                            // here, exactly as the two forcings switch on together.
+                            for &(zcmt, zrate, _, _, _, zk) in &zero_windows {
+                                if zk == idx && zcmt == cmt_idx {
+                                    onset = onset + zrate;
                                 }
                             }
                             inject_rate_saltation::<T>(
@@ -4112,6 +4216,134 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                     &mut d1_vars,
                     &mut d1_stack,
                 );
+            }
+        } else if kind == K_ZO_END {
+            // #486: zero-order window end (`idx` = the `zero_windows` index). The constant
+            // rate turns off (the next segment's `active_zero` excludes it). The window end
+            // `w_end = d.time + lag + dur` is a moving boundary: it shifts with `dur` (always)
+            // and, under an estimated lagtime, with `lag`. Only fired if the window is still
+            // active — one turned off by an intervening EVID 3/4 reset (`w_start < reset_floor`)
+            // was already dropped from `active_zero`, so its rate-off correction must not.
+            //
+            // The state is continuous across `w_end`; only `du/dt` jumps. But unlike the static
+            // walk (one param set) or a lagtime-only walk, TV covariates make the walk break at
+            // `w_end` (which is NOT a record) with the *previous* record's params on the pre-side
+            // (`last_params`) and the *next* record's params on the post-side (NONMEM
+            // end-of-interval convention) — so the RHS **Jacobian jumps** across `w_end` too, not
+            // just the forcing. A forcing-only saltation (`inject_rate_saltation`, which assumes
+            // one param set) would miss the `(J⁺−J⁻)·x` term (empirically a several-percent
+            // error under a covariate that varies across `w_end`). So use the **general**
+            // `g⁻−g⁺` event-time saltation (the rate-boundary twin of the bolus one): with the
+            // state continuous (`x⁻ = x⁺ = u`),
+            //   u += D·δ + (½ẋ̇⁻ + ½ẋ̇⁺ − J⁺·ẋ⁻)·δ²,
+            // where `D = g⁻ − g⁺`, `g⁻ =` RHS(u, pre-params) + rate·e_cmt (forcing on), `g⁺ =`
+            // RHS(u, post-params) (forcing off), `ẋ̇± = J(pre/post)·g±`, and `δ = δlag + δdur`.
+            // When the pre/post params match (static walk / no TV-cov, or `w_end` between equal
+            // covariate records) this reduces exactly to the forcing-only `+rate·δ` form.
+            let (cmt, rate, w_start, dur, k) = {
+                let w = &zero_windows[idx];
+                (w.0, w.1, w.2, w.4, w.5)
+            };
+            if w_start >= reset_floor && cmt < n_states {
+                let dlag = if has_lagtime {
+                    jet_only(pk_at_dose[k][dose_lag_slot[k]])
+                } else {
+                    T::from_f64(0.0)
+                };
+                let d_off = dlag + jet_only(dur);
+                // Pre-boundary params = the segment ending at `w_end` (`last_params`, since
+                // `w_end` is not a record). Post-boundary params = the segment starting at
+                // `w_end` = the next timeline event's params (look-ahead), mirroring the
+                // top-of-loop `params` selection.
+                let pre_params = last_params;
+                let post_params: &[T] = match tl.get(p + 1) {
+                    Some(&(_, nk, ni)) => match nk {
+                        K_DOSE | K_SS_SEED => &pk_at_dose[ni],
+                        K_PKONLY => &pk_at_pk_only[ni],
+                        K_OBS => &pk_at_obs[ni],
+                        _ => last_params,
+                    },
+                    None => last_params,
+                };
+                // g⁻ (forcing on, pre-params) and g⁺ (forcing off, post-params) at `t_event`.
+                let mut g_minus = vec![T::from_f64(0.0); n_states];
+                eval_rhs_anchored::<T>(
+                    program,
+                    &u,
+                    pre_params,
+                    t_event,
+                    first_dose_time,
+                    last_dose_eff,
+                    &mut g_minus,
+                    &mut vars_cell.borrow_mut(),
+                    &mut stack_cell.borrow_mut(),
+                );
+                g_minus[cmt] = g_minus[cmt] + rate;
+                let mut g_plus = vec![T::from_f64(0.0); n_states];
+                eval_rhs_anchored::<T>(
+                    program,
+                    &u,
+                    post_params,
+                    t_event,
+                    first_dose_time,
+                    last_dose_eff,
+                    &mut g_plus,
+                    &mut vars_cell.borrow_mut(),
+                    &mut stack_cell.borrow_mut(),
+                );
+                // Second-order `J·g` directional evals (Dual1), with pre/post params. The
+                // constant forcing has zero Jacobian, so `program`'s Jacobian is the full one.
+                let pre_d1: Vec<Dual1<1>> = pre_params
+                    .iter()
+                    .map(|x| Dual1::constant(x.val()))
+                    .collect();
+                let post_d1: Vec<Dual1<1>> = post_params
+                    .iter()
+                    .map(|x| Dual1::constant(x.val()))
+                    .collect();
+                let jg_minus = jdotg_value::<T>(
+                    program,
+                    n_states,
+                    &u,
+                    &g_minus,
+                    &pre_d1,
+                    t_event,
+                    first_dose_time,
+                    last_dose_eff,
+                    &mut d1_vars,
+                    &mut d1_stack,
+                );
+                let jg_plus = jdotg_value::<T>(
+                    program,
+                    n_states,
+                    &u,
+                    &g_plus,
+                    &post_d1,
+                    t_event,
+                    first_dose_time,
+                    last_dose_eff,
+                    &mut d1_vars,
+                    &mut d1_stack,
+                );
+                // Cross term J⁺·ẋ⁻ = J(post)·g⁻ (post-side Jacobian along the pre-side velocity).
+                let jg_cross = jdotg_value::<T>(
+                    program,
+                    n_states,
+                    &u,
+                    &g_minus,
+                    &post_d1,
+                    t_event,
+                    first_dose_time,
+                    last_dose_eff,
+                    &mut d1_vars,
+                    &mut d1_stack,
+                );
+                let d_off2 = d_off * d_off;
+                for c in 0..n_states {
+                    // δ² coefficient = ½ẋ̇⁻ + ½ẋ̇⁺ − J⁺·ẋ⁻.
+                    let coef2 = T::from_f64(0.5 * (jg_minus[c] + jg_plus[c]) - jg_cross[c]);
+                    u[c] = u[c] + (g_minus[c] - g_plus[c]) * d_off + coef2 * d_off2;
+                }
             }
         } else {
             // EVID 3/4 reset: zero every compartment's full jet (post-reset state is 0
@@ -8858,14 +9090,7 @@ mod tests {
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
-    /// Gate-scope regression: `zero_order()` + a TV covariate must stay on the FD
-    /// fallback (#486 Open Questions — the stretch). Its own moving-boundary cutoff
-    /// is a *per-segment constant* delivery (`integrate_g`'s `zero_windows`) that the
-    /// event-driven walk doesn't carry; admitting it here would silently drop the
-    /// forcing (`add_prepared_input_rate_forcing` skips `ZeroOrder` by design).
-    #[test]
-    fn ode_provider_zero_order_tvcov_stays_on_fd_fallback() {
-        const ZERO_ORDER_ODE_TVCOV: &str = r#"
+    const ZERO_ORDER_ODE_TVCOV: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
   theta TVV(50.0, 5.0, 500.0)
@@ -8887,19 +9112,98 @@ mod tests {
 [error_model]
   DV ~ proportional(PROP)
 [fit_options]
+  method     = focei
   ode_reltol = 1e-9
   ode_abstol = 1e-11
 "#;
+
+    /// `zero_order(dur)` + a time-varying covariate (#486): the event-driven walk now
+    /// carries the moving-boundary window — the port of the static `integrate_g`'s
+    /// `zero_windows`. The constant `F·amt·frac/dur` rate is delivered as a per-segment
+    /// constant (`active_zero`, rebuilt per dose from `pk_at_dose[k]` as `CL` rides `WT`),
+    /// and the rate-off saltation at the moving end `d.time + dur` carries `∂/∂DUR` (hence
+    /// `∂/∂ETA_DUR` and `∂/∂TVDUR`). Value / `∂f/∂η` / `∂f/∂θ` must match the production
+    /// predictor + central FD, inner `Dual1` must reproduce the outer `Dual2` η-gradient,
+    /// and the 2nd-order blocks (the rate-off `coef2`) must match FD of the analytic gradient.
+    #[test]
+    fn ode_provider_zero_order_tvcov_matches_production() {
         let model = parse_model_string(ZERO_ORDER_ODE_TVCOV).expect("parse");
+        // Obs times avoid landing on the window end `w_end ≈ TVDUR·exp(ETA_DUR) ≈ 4.2`, where
+        // the prediction has a genuine kink in `dur`: central FD there would average the two
+        // one-sided derivatives instead of probing the right-continuous analytic convention.
         let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 10.0]);
         let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
         subject.dose_covariates = vec![wt(60.0)];
         subject.obs_covariates = vec![wt(60.0), wt(65.0), wt(70.0), wt(75.0)];
         assert!(subject.has_tv_covariates());
         assert!(
-            !ode_tvcov_supported(&model, &subject),
-            "zero_order()+TV-cov must stay on FD until the moving-boundary cutoff is ported \
-             to the event-driven walk (#486 stretch)"
+            ode_tvcov_supported(&model, &subject),
+            "zero_order()+TV-cov must be analytic on the event-driven walk (#486)"
         );
+        let theta = vec![5.0, 50.0, 4.0, 0.75];
+        let eta = vec![0.1, 0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        // The rate-off saltation's δdur² coefficient (`coef2`) is live here (`ETA_DUR`/`TVDUR`
+        // carry IIV/θ into the moving boundary), so validate the analytic 2nd-order blocks
+        // against FD of the analytic first-order gradient — the value/1st-order parity above
+        // does not exercise `coef2`.
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+    }
+
+    const ZERO_ORDER_ALAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  DUR   = TVDUR * exp(ETA_DUR)
+  ALAG1 = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// `zero_order(dur)` + an estimated compartment-indexed lag (#486): the sharpest check of
+    /// the two coupled moving boundaries. The window is `[t_dose+lag, t_dose+lag+dur]`, so a
+    /// rate-on saltation (`Δr = F·amt/dur`, the same constant `active_zero` rate) fires at the
+    /// lagged arrival and a rate-off saltation (offset `δlag + δdur`) at the window end. Both
+    /// the value / `∂f/∂η` / `∂f/∂θ` (incl. `∂f/∂TVLAG`, `∂f/∂TVDUR`) and the 2nd-order blocks
+    /// must match the production predictor + FD, and the inner `Dual1` walk must reproduce the
+    /// outer `Dual2` η-gradient exactly.
+    ///
+    /// Observation times avoid landing exactly on the lagged arrival (`lag = 0.3`) and the
+    /// window end (`lag + dur ≈ 4.5`), where the prediction has a genuine kink in `lag`/`dur`.
+    #[test]
+    fn ode_provider_zero_order_lagtime_matches_production() {
+        let model = parse_model_string(ZERO_ORDER_ALAG_ODE).expect("parse");
+        assert!(model.has_lagtime());
+        let subj = bolus_subject(&[0.1, 0.2, 0.5, 1.0, 2.0, 6.0, 10.0]);
+        assert!(
+            !ode_subject_supported(&model, &subj),
+            "lagtime routes off the static walk"
+        );
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "zero_order()+lagtime: the event-driven walk now carries the moving window (#486)"
+        );
+        let theta = vec![5.0, 50.0, 4.0, 0.3];
+        let eta = vec![0.1, 0.05];
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
     }
 }

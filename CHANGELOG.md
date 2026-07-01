@@ -32,6 +32,14 @@ section of the SDLC for the versioning policy).
   (Sheiner–Beal) is a distinct objective and is unchanged.
 
 ### Added
+- **Zero-order absorption (`zero_order(dur)`, and the `zero_order` leg of a `mixed` model)
+  combined with time-varying covariates or an estimated lagtime** now gets exact analytic
+  FOCE/FOCEI sensitivities on the ODE event-driven walk instead of finite differences
+  (#486). The constant `F·amt·frac/dur` window is delivered per integration segment, with
+  its moving end `d.time + lag + dur` (and, under lagtime, its moving start) carried by
+  rate-off / rate-on saltations; the rate-off uses the general `g⁻ − g⁺` form so a
+  covariate that varies across the window end stays exact. Only `zero_order` under IOV
+  remains on finite differences.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK

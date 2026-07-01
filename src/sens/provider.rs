@@ -726,15 +726,16 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     ) {
         return false;
     }
-    // Output scaling: `None` (raw jet) or a differentiable `ExpressionScale` `obs_scale`
-    // divisor whose (θ, η) axis counts match the model and fit the scale dispatch table.
-    // The `ExpressionScale` quotient is a per-occasion-group post-walk step in
-    // `run_obs_iov` / `run_obs_iov_eta` (the closed-form twin of the ODE-IOV path,
-    // #575/#590). `ScalarScale` still declines (the IOV walk has no constant-divisor step)
-    // and LTBS declines below (the in-walk log can't compose with the post-walk quotient),
-    // matching the ODE-IOV gate `expression_scale_axes_admissible` (#486).
+    // Output scaling: `None` (raw jet), a constant `ScalarScale` divisor, or a differentiable
+    // `ExpressionScale` `obs_scale` divisor whose (θ, η) axis counts match the model and fit
+    // the scale dispatch table. The `ExpressionScale` quotient is a per-occasion-group
+    // post-walk step in `run_obs_iov` / `run_obs_iov_eta` (the closed-form twin of the ODE-IOV
+    // path, #575/#590); a constant `ScalarScale k` is the trivial case of that quotient — a
+    // covariate/η/κ-independent `f/k` applied uniformly to every jet entry (#486 IOV-scope
+    // parity, mirroring the non-IOV `f_scaled = f/k`). LTBS declines below (the in-walk log
+    // can't compose with the post-walk quotient).
     match &model.scaling {
-        ScalingSpec::None => {}
+        ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
             if p.n_theta_axis() == model.n_theta
                 && p.n_eta_axis() == model.n_eta
@@ -1467,6 +1468,20 @@ fn run_obs_iov<const M: usize>(
         }
     }
 
+    // Constant `ScalarScale` output divisor `f/k`: covariate/η/κ-independent, so every jet
+    // entry (value, gradient, Hessian) divides by the same `k` — the IOV twin of the non-IOV
+    // `f_scaled = f/k` and production `apply_scaling` (#486 IOV-scope parity).
+    if let ScalingSpec::ScalarScale(k) = model.scaling {
+        let inv = 1.0 / k;
+        for o in obs_out.iter_mut() {
+            o.f *= inv;
+            o.df_deta.iter_mut().for_each(|x| *x *= inv);
+            o.df_dtheta.iter_mut().for_each(|x| *x *= inv);
+            o.d2f_deta2.iter_mut().for_each(|x| *x *= inv);
+            o.d2f_deta_dtheta.iter_mut().for_each(|x| *x *= inv);
+        }
+    }
+
     Some(SubjectSens { obs: obs_out })
 }
 
@@ -1696,6 +1711,16 @@ fn run_obs_iov_eta<const N: usize>(
         for (j, o) in out.iter_mut().enumerate() {
             let g = sources[obs_src[j]].2?;
             apply_scale_quotient_grad_iov::<N>(o, &group_scale[g], n_stacked);
+        }
+    }
+
+    // Constant `ScalarScale` output divisor `f/k` (first-order): `f` and each `∂f/∂stacked-η`
+    // divide by `k` (#486 IOV-scope parity — the inner twin of the `run_obs_iov` step).
+    if let ScalingSpec::ScalarScale(k) = model.scaling {
+        let inv = 1.0 / k;
+        for o in out.iter_mut() {
+            o.f *= inv;
+            o.df_deta.iter_mut().for_each(|x| *x *= inv);
         }
     }
 
@@ -8519,13 +8544,33 @@ mod tests {
             !iov_analytical_supported(&ltbs),
             "ExpressionScale + LTBS under closed-form IOV must fall back to FD"
         );
-        // A constant `ScalarScale` under IOV still declines (the IOV walk has no
-        // constant-divisor step; that combination stays FD as before).
+        // A constant `ScalarScale` under IOV is now analytic too (#486 IOV-scope parity):
+        // `f/k` is the trivial covariate/η/κ-independent case of the post-walk quotient,
+        // divided uniformly into every jet entry — matching the non-IOV `f_scaled = f/k`.
         let mut scalar = parse_model_string(WARFARIN_IOV).expect("parse");
         scalar.scaling = ScalingSpec::ScalarScale(2.0);
         assert!(
-            !iov_analytical_supported(&scalar),
-            "ScalarScale under closed-form IOV stays FD"
+            iov_analytical_supported(&scalar),
+            "ScalarScale under closed-form IOV is now on the analytic path (#486 parity)"
+        );
+    }
+
+    /// **Closed-form IOV + constant `ScalarScale` `obs_scale`** (#486 IOV-scope parity). A
+    /// uniform output divisor `f/k` under IOV, validated (value + gradient + Hessian over the
+    /// stacked `[η, κ]` vector + θ) against central FD of `predict_iov` (whose `apply_scaling`
+    /// applies the same `pred /= k`). Before this fix, `ScalarScale × IOV` declined to FD even
+    /// though the constant divide is strictly simpler than the `ExpressionScale` quotient the
+    /// IOV walk already applies.
+    #[test]
+    fn iov_analytical_scalar_scale_matches_fd() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse WARFARIN_IOV");
+        model.scaling = ScalingSpec::ScalarScale(2.5);
+        assert!(iov_analytical_supported(&model));
+        check_iov_provider_vs_fd(
+            &model,
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
         );
     }
 
@@ -9307,8 +9352,8 @@ mod tests {
     /// **Still-FD edge: built-in absorption + steady state under IOV** (#486). The dual SS
     /// equilibration (`equilibrate_ss_state_g`) seeds a bolus/infusion trough and does not
     /// spread a periodic zero-order window (or a first-order `R_in` tail) over the cycle, so
-    /// a `zero_order` + SS subject routes to FD on BOTH loops. Also pins that a non-admitted
-    /// forcing kind (`weibull`) under IOV stays FD at the model gate.
+    /// a `zero_order` + SS subject routes to FD on BOTH loops. (The `weibull` + lagtime FD
+    /// case is pinned separately by `ode_iov_weibull_lagtime_falls_back_to_fd`.)
     #[test]
     fn ode_iov_zero_order_ss_falls_back_to_fd() {
         let model = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
@@ -9330,39 +9375,6 @@ mod tests {
             crate::sens::ode_provider::ode_subject_eta_grad_iov(&model, &subject, &theta, &stacked)
                 .is_none(),
             "zero_order + SS must route to FD under IOV (inner, scope parity)"
-        );
-        // A non-admitted input-rate kind (weibull) stays FD at the model gate.
-        const WEIBULL_IOV: &str = r#"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVTD(2.0, 0.05, 24.0)
-  theta TVBETA(1.5, 0.1, 10.0)
-  omega ETA_CL   ~ 0.09
-  omega ETA_BETA ~ 0.04
-  kappa KAPPA_CL ~ 0.01
-  sigma PROP_ERR ~ 0.2 (sd)
-[individual_parameters]
-  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
-  V    = TVV
-  TD   = TVTD
-  BETA = TVBETA * exp(ETA_BETA)
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V)*central
-[scaling]
-  y = central / V
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  method     = focei
-  iov_column = OCC
-"#;
-        let weibull = parse_model_string(WEIBULL_IOV).expect("parse weibull IOV");
-        assert!(
-            !crate::sens::ode_provider::ode_iov_supported(&weibull),
-            "weibull forcing under IOV stays FD (#486 scope)"
         );
     }
 
@@ -9424,8 +9436,8 @@ mod tests {
     /// non-IOV path admits `first_order` + lagtime (#643 onset saltation `Δr = R_in(0⁺)`);
     /// the IOV walk is the same, so it must too. Pins that the per-occasion rate-on onset
     /// saltation at the lagged arrival stays analytic under κ (FD of `predict_iov` is the
-    /// oracle). A **bare** `LAGTIME` is used — a compartment-indexed `ALAGn` is a distinct
-    /// per-dose shift the single-slot IOV walk cannot represent and is declined upstream.
+    /// oracle). Uses a **bare** `LAGTIME`; the compartment-indexed `ALAG{cmt}` case is now
+    /// analytic too and covered by `ode_iov_indexed_lag_and_f_match_fd_of_predict_iov`.
     #[test]
     fn ode_iov_first_order_lagtime_matches_fd_of_predict_iov() {
         const FO_LAG_IOV: &str = r#"
@@ -9488,6 +9500,183 @@ mod tests {
             &subject,
             &[0.2, 10.0, 5.0],
             &[0.12, -0.08, 0.05, 0.05, -0.10],
+        );
+    }
+
+    // #486 IOV-scope parity: build a 1-cpt-depot ODE IOV model whose depot is fed by one
+    // smooth-density absorption forcing `<forcing>`, κ on CL. These were declined under IOV
+    // before the gate mirrored the non-IOV `supported_over_dual()` allowlist.
+    fn smooth_forcing_iov_model(forcing: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVP(1.5, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+  PP = TVP
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = {forcing} - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#
+        )
+    }
+
+    /// **ODE IOV + `igd` / `transit` / `weibull` absorption** (#486 IOV-scope parity). The
+    /// non-IOV gate admits every input-rate kind via the kind-agnostic `supported_over_dual()`;
+    /// the IOV walk is the *same* `integrate_tvcov_g`, so it must too. Before this parity fix
+    /// the IOV gate hard-restricted to `{ZeroOrder, FirstOrder}`, declining these smooth
+    /// densities for no technical reason. Each is validated (value + gradient + Hessian over
+    /// the stacked `[η, κ]` vector) against central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_smooth_density_forcings_match_fd_of_predict_iov() {
+        for forcing in [
+            "igd(mat=PP, cv2=KA)",
+            "transit(n=PP, mtt=KA)",
+            "weibull(td=KA, beta=PP)",
+        ] {
+            let src = smooth_forcing_iov_model(forcing);
+            let model = parse_model_string(&src).unwrap_or_else(|e| panic!("parse {forcing}: {e}"));
+            assert!(
+                crate::sens::ode_provider::ode_iov_supported(&model),
+                "{forcing} must be admitted under IOV (#486 parity)"
+            );
+            let subject = iov_subject();
+            // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+            check_iov_provider_vs_fd(
+                &model,
+                &subject,
+                &[0.2, 10.0, 1.0, 1.5],
+                &[0.12, -0.08, 0.06, -0.11],
+            );
+        }
+    }
+
+    /// **`weibull` + estimated lagtime stays FD under IOV** (#486 parity — the one input-rate
+    /// kind that stays FD with lagtime on every path, its onset diverging for shape `β < 1`).
+    /// Mirrors the non-IOV decline; pins that broadening the IOV input-rate allowlist did not
+    /// accidentally admit this divergent combination.
+    #[test]
+    fn ode_iov_weibull_lagtime_falls_back_to_fd() {
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVTD(2.0, 0.05, 24.0)
+  theta TVBETA(1.5, 0.1, 10.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL + KAPPA_CL)
+  V       = TVV  * exp(ETA_V)
+  TD      = TVTD
+  BETA    = TVBETA
+  LAGTIME = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let model = parse_model_string(src).expect("parse weibull+lag IOV");
+        assert!(model.has_lagtime());
+        assert!(
+            !crate::sens::ode_provider::ode_iov_supported(&model),
+            "weibull + lagtime must stay FD under IOV (β<1 onset divergence, #486)"
+        );
+    }
+
+    /// **ODE IOV + compartment-indexed `ALAG{cmt}` / `F{cmt}`** (#486 IOV-scope parity). The
+    /// old gate declined indexed lag/F under IOV on the (mistaken) premise that the walk uses
+    /// a single `PK_IDX_LAGTIME`/F slot; in fact `integrate_tvcov_readout` resolves each dose's
+    /// own compartment slot (`f_bio_slot`/`lag_slot`), and the non-IOV path already serves
+    /// both. An oral (depot→central) model with `ALAG1` (lag on the depot) and `F1` (depot
+    /// bioavailability), κ on CL, validated against central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_indexed_lag_and_f_match_fd_of_predict_iov() {
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.4, 0.01, 5.0)
+  theta TVF1(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL + KAPPA_CL)
+  V     = TVV  * exp(ETA_V)
+  KA    = TVKA
+  ALAG1 = TVLAG
+  F1    = TVF1
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) =  KA*depot - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(src).expect("parse indexed-lag/F IOV");
+        assert!(model.has_lagtime());
+        assert!(
+            model
+                .active_dose_attr_map()
+                .has_indexed_attr(crate::types::DoseAttr::Lag),
+            "model must declare an indexed ALAG1"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "indexed ALAG1/F1 must be admitted under IOV (#486 parity)"
+        );
+        let mut subject = iov_subject();
+        // Dose into the depot (cmt 1) so ALAG1/F1 apply.
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        // stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.0, 0.4, 0.7],
+            &[0.12, -0.08, 0.06, -0.11],
         );
     }
 

@@ -50,6 +50,23 @@ section of the SDLC for the versioning policy).
   per-event `TIME` already carries the absorption `R_in` forcing (since #643) and seeds the
   `init(...)` state (since #662), so the model-level decline for those combinations was stale;
   it has been removed. Validated against finite differences of the production predictor.
+- **Several inter-occasion-variability (IOV) analytic-gradient cells that were arbitrarily
+  narrower than their non-IOV counterparts are now analytic** (#486, "IOV-scope parity"),
+  closing gates that were more restrictive than the walk actually required:
+  - **All built-in absorption input-rate kinds under IOV** — the smooth densities
+    `igd`/`transit`/`weibull` now get exact analytic FOCE/FOCEI sensitivities under IOV, not
+    just `zero_order`/`first_order`/`mixed`/`parallel`. The IOV gate now mirrors the non-IOV
+    kind-agnostic rule exactly; only `weibull` + estimated lagtime (β<1 onset divergence) and
+    any forcing combined with a steady-state dose remain on finite differences.
+  - **Compartment-indexed bioavailability `F{cmt}` and lagtime `ALAG{cmt}` under IOV** — the
+    event-driven walk already resolves each dose's own compartment slot, so these no longer
+    fall back to finite differences.
+  - **A constant `ScalarScale` `obs_scale` divisor under IOV on the closed-form (analytical
+    1-/2-/3-cpt) models** — the trivial covariate-independent case of the `ExpressionScale`
+    quotient the IOV walk already applies, now divided uniformly into the jet.
+
+  All validated against finite differences of the production `predict_iov` (value, gradient,
+  and Hessian over the stacked `[η, κ]` vector).
 - **Built-in absorption forcings (`zero_order(dur)`, `first_order`, and `mixed`) combined
   with inter-occasion variability (IOV)** now get exact analytic FOCE/FOCEI sensitivities on
   the ODE path instead of finite differences (#486), closing the last zero-order gap. The IOV

@@ -741,27 +741,33 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // Built-in absorption input-rate forcing under IOV (#486). The shared
     // `integrate_tvcov_g` walk delivers each forcing per-occasion — its rate/window is
     // rebuilt from that dose's own occasion-seeded `pk_at_dose[k]` jet, so κ rides through
-    // exactly as η/θ do — so `zero_order(dur)` and `first_order` are analytic under IOV,
-    // and hence so is any composition of them: a `mixed` `FR·first_order + FR·zero_order`
-    // dose and a `parallel` two-`first_order` pathway (both encoded as multiple
-    // `ZeroOrder`/`FirstOrder` forcings), mirroring the non-IOV TV-cov walk (#653/#586).
-    // Only the smooth-density kinds (igd / transit / weibull) under IOV stay unaudited → FD;
-    // the SS × input-rate combination is declined per subject in `ode_iov_subject_supported`
-    // (the SS dual equilibration's zero-order/forcing handling is not yet validated under κ).
-    if ode.input_rate.iter().any(|f| {
-        !matches!(
-            f.kind,
-            crate::pk::absorption::InputRateKind::ZeroOrder
-                | crate::pk::absorption::InputRateKind::FirstOrder
-        )
-    }) {
+    // exactly as η/θ do. So EVERY kind the non-IOV gate carries is analytic under IOV too:
+    // the smooth densities `igd`/`transit`/`weibull`/`first_order` (pointwise `R_in`), the
+    // moving-window `zero_order`, and any composition (`mixed`, `parallel`). Mirror the
+    // non-IOV `ode_analytical_supported`'s kind-agnostic `supported_over_dual()` gate exactly,
+    // so the IOV input-rate scope tracks the non-IOV scope rather than an arbitrary
+    // `{ZeroOrder, FirstOrder}` subset (#486 IOV-scope parity). (The SS × input-rate
+    // combination is still declined per subject in `ode_iov_subject_supported` — the SS dual
+    // equilibration has no built-in-forcing channel; that is a real gap, not this decision.)
+    if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
-    // No constant `ScalarScale`/LTBS, no per-cmt/indexed F, no seeded initial state (the
-    // bolus walk seeds compartments at zero). Estimated **lagtime IS supported**: the IOV
-    // walk runs through `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the
-    // dose-time shift + event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
-    // (`ode_analytical_supported` excludes indexed `ALAGn`. The per-subject gate
+    // `Weibull` + estimated lagtime stays FD on every path (IOV included): its onset diverges
+    // for shape `β < 1` (an integrable spike, no finite rate-on saltation), exactly as the
+    // non-IOV gate declines it above. Every other kind composes with lagtime under IOV.
+    if model.has_lagtime()
+        && ode
+            .input_rate
+            .iter()
+            .any(|f| f.kind == crate::pk::absorption::InputRateKind::Weibull)
+    {
+        return false;
+    }
+    // No constant `ScalarScale`/LTBS output transform. Estimated **lagtime IS supported**
+    // (bare and compartment-indexed `ALAG{cmt}`, see below): the IOV walk runs through
+    // `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the dose-time shift +
+    // event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
+    // (The per-subject gate
     // `ode_iov_subject_supported` now ADMITS finite-duration infusions, EVID 3/4 resets,
     // and EVID=2 pk-only breakpoints
     // — the shared `integrate_tvcov_g` walk carries the rate-boundary saltation and the
@@ -785,17 +791,13 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
             if expression_scale_axes_admissible(p, model) => {}
         _ => return false,
     }
-    // Bare lagtime only — a compartment-indexed `ALAGn` gives per-dose differing shifts
-    // the single `PK_IDX_LAGTIME` walk cannot represent (same as indexed `F`).
-    if model
-        .active_dose_attr_map()
-        .has_indexed_attr(crate::types::DoseAttr::F)
-        || model
-            .active_dose_attr_map()
-            .has_indexed_attr(crate::types::DoseAttr::Lag)
-    {
-        return false;
-    }
+    // Compartment-indexed bioavailability `F{cmt}` and lagtime `ALAG{cmt}` ARE supported under
+    // IOV (#486 IOV-scope parity): the shared `integrate_tvcov_readout`/`integrate_tvcov_g`
+    // walk resolves each dose's own compartment slot — `f_bio_slot(ode, d.cmt)` and
+    // `dose_lag_slot = attr_map.lag_slot(d.cmt)` — exactly as the non-IOV
+    // `ode_analytical_supported` walk does (an indexed slot is an ordinary individual-parameter
+    // output seeded per occasion by `seed_pk_dual2_iov`). The old bail here assumed a single
+    // `PK_IDX_LAGTIME` slot the walk never actually used.
     // `init(...)` initial conditions are analytic on the ODE IOV walk too (#486): the IOV
     // outer/inner (`run_subject_iov` / `_eta`) run through the SAME `integrate_tvcov_readout`
     // the non-IOV walk uses, which seeds `init` via `tvcov_init_state` at the first-record

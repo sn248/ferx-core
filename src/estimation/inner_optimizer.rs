@@ -916,10 +916,12 @@ fn find_ebe_iov(
     // now served analytically too (#575): `ode_iov_supported` admits a non-LTBS
     // `ExpressionScale` divisor, so `iov_sens_supported` is `true` and the
     // `analytic_iov_inner` path applies the per-occasion-group post-walk quotient
-    // (`apply_expression_scale_iov`). Constant `ScalarScale` and LTBS still route IOV
-    // to FD — LTBS via `analytic_inner_common_bail` (`log_transform`), `ScalarScale`
-    // via the `ode_iov_supported` allowlist (its in-walk transform isn't validated for
-    // the IOV path). Without these guards a joint IOV + `iiv_on_ruv` / IOV + TTE /
+    // (`apply_expression_scale_iov`). A constant `ScalarScale` divisor is now analytic on the
+    // **closed-form** IOV path too (#486 parity — `run_obs_iov{,_eta}` divide the jet by `k`),
+    // though it still routes to FD on the **ODE** IOV path (`ode_iov_supported`'s scale
+    // allowlist has no constant-divisor step yet). LTBS still routes IOV to FD via
+    // `analytic_inner_common_bail` (`log_transform`). Without these guards a joint IOV +
+    // `iiv_on_ruv` / IOV + TTE /
     // `gradient = fd` fit would converge EBEs against an incomplete gradient.
     let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
         && omega_iov_ref.is_some()

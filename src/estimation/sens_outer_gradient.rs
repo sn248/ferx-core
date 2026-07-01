@@ -230,6 +230,12 @@ struct Prep {
     /// lift the σ-block's central-FD `∂R/∂σ` / `∂d/∂σ` (taken on the *unscaled*
     /// error functions) onto the scaled variance.
     ruv_scale: f64,
+    /// Total `f`-derivatives (through `v(f)`) of the censored residual-eta `H̃`
+    /// coefficients `C·z` / `C·m` per observation (0 on quantified rows). Computed
+    /// once in `prepare` (FD of the kernel) and reused by `theta_block`'s censored
+    /// residual-eta `log|H̃|` θ-derivative. Empty when no `ruv`.
+    cens_dcz_df: Vec<f64>,
+    cens_dcm_df: Vec<f64>,
 }
 
 /// Residual-eta coupling `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²` — the `f`-derivative
@@ -316,6 +322,11 @@ fn prepare_stacked(
     } else {
         (Vec::new(), Vec::new())
     };
+    let (mut cens_dcz_df, mut cens_dcm_df) = if ruv.is_some() {
+        (vec![0.0f64; n_obs], vec![0.0f64; n_obs])
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     for obs in sens.obs.iter() {
@@ -334,16 +345,25 @@ fn prepare_stacked(
         let is_cens = m3 && cens != 0;
         // For a censored row the data term is `−logΦ(z)`: store its f-derivatives
         // as `alpha = 2·g1`, `alpha_p = 2·g2` (so the assembly's `½α`, `½α'` recover
-        // `∂L/∂f`, `∂²L/∂f²`) and force `p = β = 0` (excluded from `H̃` / `log|H̃|`).
+        // `∂L/∂f`, `∂²L/∂f²`). Censored rows now enter `H̃`/`log|H̃|` consistently at
+        // FOCEI order: the structural block `g2·a·aᵀ` has the SAME form as a quantified
+        // row's `p·a·aᵀ`, so we set `p = g2` and `β = dg2/df` (total, through `v(f)`).
+        // The existing `p`/`β` machinery in `theta_block`/`g_eta`/`sigma_block` then
+        // produces the censored structural `log|H̃|` derivatives with no extra code; the
+        // residual-eta `C·z`/`C·m` derivatives are handled in their dedicated blocks.
         let t = if is_cens {
-            // `r`/`d`/`d2` carry `ruv_scale`, so the censored scalars are evaluated at
-            // the scaled variance (#4c). M3 + `iiv_on_ruv` is now analytic: the
-            // censored × residual-eta cross coefficients `(C·z, C·m)` are stored for the
-            // true inner Hessian / mixed / σ blocks; the `H̃`/`log|H̃|` residual-eta
-            // blocks still exclude censored rows (they exclude *all* censored rows,
-            // matching `gaussian_foce_accum`).
-            // One kernel eval for all four censored coefficients.
             let (g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2, cens);
+            // dg2/df, total derivative through the f-dependent variance `v(f)=variance(f)·s`,
+            // by central FD of the scalar kernel (analytic 3rd-order of `−logΦ` is messy;
+            // this mirrors the existing censored σ-block FD approach).
+            let hf = 1e-5 * (1.0 + f.abs());
+            let g2_at = |ff: f64| -> f64 {
+                let rr_ = model.error_spec.variance_at(cmt, ff, sigma) * ruv_scale;
+                let dd = model.error_spec.dvar_df(cmt, ff, sigma) * ruv_scale;
+                let dd2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
+                m3_censored_outer(y, ff, rr_, dd, dd2, cens).1
+            };
+            let dg2_df = (g2_at(f + hf) - g2_at(f - hf)) / (2.0 * hf);
             let (ruv_cz, ruv_cm) = if ruv.is_some() { (cz, cm) } else { (0.0, 0.0) };
             ErrTerms {
                 r,
@@ -351,8 +371,8 @@ fn prepare_stacked(
                 eps: y - f,
                 alpha: 2.0 * g1,
                 alpha_p: 2.0 * g2,
-                p: 0.0,
-                beta: 0.0,
+                p: g2,
+                beta: dg2_df,
                 ruv_cz,
                 ruv_cm,
                 censored: true,
@@ -376,16 +396,21 @@ fn prepare_stacked(
         // `H[ruv,ruv] += 2ε²/R` and `H[ruv,l] += κⱼ a_{jl}`.
         if let Some(rr) = ruv {
             if t.censored {
-                // Censored row: excluded from `H̃`/`log|H̃|` (so `g_ruv`/`gp_ruv` stay 0),
-                // but its residual-eta second derivatives DO enter the true inner Hessian:
-                // `H[ruv,ruv] += C·z`, `H[ruv,l] += C·m·a_l` (#4c).
+                // Censored row's residual-eta second derivatives enter BOTH the true inner
+                // Hessian AND `H̃`/`log|H̃|` (consistent inclusion): `[ruv,ruv] += C·z`,
+                // `[ruv,l] += C·m·a_l` (#4c). `g_ruv`/`gp_ruv` stay 0 (the `∂p/∂η_ruv`
+                // quantified term doesn't apply); the censored `log|H̃|` derivative is added
+                // separately below.
                 h_inner[(rr, rr)] += t.ruv_cz;
+                htilde[(rr, rr)] += t.ruv_cz;
                 for l in 0..n_eta {
                     if l == rr {
                         continue;
                     }
                     h_inner[(rr, l)] += t.ruv_cm * a[l];
                     h_inner[(l, rr)] += t.ruv_cm * a[l];
+                    htilde[(rr, l)] += t.ruv_cm * a[l];
+                    htilde[(l, rr)] += t.ruv_cm * a[l];
                 }
             } else {
                 let eps = t.eps;
@@ -453,12 +478,69 @@ fn prepare_stacked(
                 }
                 g_eta[l] += 2.0 * (gp * wjr * obs.df_deta[l] + g * sa);
             }
-            // Censored rows carry no `c̃` residual-eta column in `H̃` (excluded, like
-            // all censored rows), so they contribute nothing to its log-det derivative
-            // either (#4c). `g`/`gp` are already 0 for them; gate the `∂p/∂η_ruv` term too.
+            // The quantified `∂p/∂η_ruv = −2/R` term (the `c̃[ruv,ruv]=2` is constant).
+            // Censored rows have their own residual-eta `log|H̃|` derivative (below).
             if !et[j].censored {
                 g_eta[rr] += -2.0 * q[j] / et[j].r;
             }
+        }
+        // Censored residual-eta `log|H̃|` η-derivative: `H̃` carries `C·z` on (rr,rr) and
+        // `C·m·a_l` on (rr,l). Trace `H̃⁻¹·∂[·]/∂η` with FD-of-kernel scalars (`dC·z/df`
+        // total through `v(f)`, and via the scale `s=exp(2η_ruv)` for the `η_ruv` axis)
+        // and analytic `a`/`d2f`.
+        for (j, obs) in sens.obs.iter().enumerate() {
+            if !et[j].censored {
+                continue;
+            }
+            let f = obs.f;
+            let cmt = subject.obs_cmts[j];
+            let y = subject.observations[j];
+            let cens = et[j].cens_sign;
+            let a = obs.df_deta.as_slice();
+            let cm = et[j].ruv_cm;
+            let kern_scaled = |ff: f64, ss: f64| -> (f64, f64, f64) {
+                let r = model.error_spec.variance_at(cmt, ff, sigma) * ss;
+                let d = model.error_spec.dvar_df(cmt, ff, sigma) * ss;
+                let d2 = model.error_spec.d2var_df2(cmt, sigma) * ss;
+                let (_g1, g2, cz, cm) = m3_censored_outer(y, ff, r, d, d2, cens);
+                (g2, cz, cm)
+            };
+            let hf = 1e-5 * (1.0 + f.abs());
+            let (_, czp, cmp) = kern_scaled(f + hf, ruv_scale);
+            let (_, czm, cmm) = kern_scaled(f - hf, ruv_scale);
+            let (dcz_df, dcm_df) = ((czp - czm) / (2.0 * hf), (cmp - cmm) / (2.0 * hf));
+            cens_dcz_df[j] = dcz_df;
+            cens_dcm_df[j] = dcm_df;
+            let hs = 1e-5f64;
+            let (g2sp, czsp, cmsp) = kern_scaled(f, ruv_scale * (2.0 * hs).exp());
+            let (g2sm, czsm, cmsm) = kern_scaled(f, ruv_scale * (-2.0 * hs).exp());
+            let (dcz_drr, dcm_drr) = ((czsp - czsm) / (2.0 * hs), (cmsp - cmsm) / (2.0 * hs));
+            // Censored STRUCTURAL `g2·a·aᵀ` also has an `η_ruv` derivative through the
+            // variance scale `s=exp(2η_ruv)` (the `p`/`β` machinery only captures the
+            // `f`-direction, and `a_{rr}=0`): `∂(g2·a·aᵀ)/∂η_ruv` traced = `(dg2/dη_ruv)·q`.
+            let dg2_drr = (g2sp - g2sm) / (2.0 * hs);
+            g_eta[rr] += dg2_drr * q[j];
+            let hinv_rr = htilde_inv[(rr, rr)];
+            for l in 0..n_eta {
+                if l == rr {
+                    continue;
+                }
+                let mut s = dcz_df * a[l] * hinv_rr;
+                for lp in 0..n_eta {
+                    if lp != rr {
+                        let da = dcm_df * a[l] * a[lp] + cm * obs.d2f_deta2[lp * n_eta + l];
+                        s += 2.0 * htilde_inv[(rr, lp)] * da;
+                    }
+                }
+                g_eta[l] += s;
+            }
+            let mut s = dcz_drr * hinv_rr;
+            for lp in 0..n_eta {
+                if lp != rr {
+                    s += 2.0 * htilde_inv[(rr, lp)] * dcm_drr * a[lp];
+                }
+            }
+            g_eta[rr] += s;
         }
     }
 
@@ -476,6 +558,8 @@ fn prepare_stacked(
         g_ruv,
         gp_ruv,
         ruv_scale,
+        cens_dcz_df,
+        cens_dcm_df,
     })
 }
 
@@ -523,6 +607,16 @@ fn theta_block(prep: &Prep, sens: &SubjectSens, n_theta: usize) -> Vec<f64> {
                     sb += prep.htilde_inv[(rr, l)] * obs.d2f_deta_dtheta[l * n_theta + m];
                 }
                 g += prep.gp_ruv[j] * obs.df_dtheta[m] * prep.w[j][rr] + prep.g_ruv[j] * sb;
+                // Censored residual-eta `log|H̃|` θ-derivative: `H̃` carries `C·z` on
+                // (rr,rr) and `C·m·a_l` on (rr,l). Using `a_{rr}=0` ⇒ `Σ_{l≠rr}H̃⁻¹_{rr,l}a_l
+                // = w_{rr}` and `B_{rr,m}=0` ⇒ `Σ_{l≠rr}H̃⁻¹_{rr,l}B_{l,m}=sb`:
+                //   ½·(dC·z/df)·bₘ·H̃⁻¹_{rr,rr} + (dC·m/df)·bₘ·w_{rr} + C·m·sb.
+                if prep.et[j].censored {
+                    let b = obs.df_dtheta[m];
+                    g += 0.5 * prep.cens_dcz_df[j] * b * prep.htilde_inv[(rr, rr)]
+                        + prep.cens_dcm_df[j] * b * prep.w[j][rr]
+                        + prep.et[j].ruv_cm * sb;
+                }
             }
         }
         // EBE response: ½ g_eta · dη̂/dθₘ,  dη̂/dθₘ = −H⁻¹ M[:,m].
@@ -736,6 +830,25 @@ fn sigma_block(
                     prep.et[j].cens_sign,
                 );
                 fixed += l_sig;
+                // Censored `log|H̃|` σ-terms (`g2 = p` for censored + residual-eta `C·z`/`C·m`),
+                // all by central FD of the kernel at σ±h:
+                //   structural: ½·(∂g2/∂σ)·q
+                //   residual-eta: ½·(∂C·z/∂σ)·H̃⁻¹_{rr,rr} + (∂C·m/∂σ)·w_{rr}  (`a_{rr}=0`)
+                let kern_at = |sa: &[f64]| -> (f64, f64, f64) {
+                    let r = model.error_spec.variance_at(cmt, f, sa) * prep.ruv_scale;
+                    let d = model.error_spec.dvar_df(cmt, f, sa) * prep.ruv_scale;
+                    let d2 = model.error_spec.d2var_df2(cmt, sa) * prep.ruv_scale;
+                    let (_g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2, prep.et[j].cens_sign);
+                    (g2, cz, cm)
+                };
+                let (g2p, czp, cmp) = kern_at(&sp);
+                let (g2m, czm, cmm) = kern_at(&sm);
+                fixed += 0.5 * (g2p - g2m) / (2.0 * h) * prep.q[j];
+                if let Some(rr) = prep.ruv {
+                    let dcz_ds = (czp - czm) / (2.0 * h);
+                    let dcm_ds = (cmp - cmm) / (2.0 * h);
+                    fixed += 0.5 * dcz_ds * prep.htilde_inv[(rr, rr)] + dcm_ds * prep.w[j][rr];
+                }
                 for m in 0..n_eta {
                     m_vec[m] += dg1 * obs.df_deta[m];
                 }

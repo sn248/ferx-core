@@ -1264,7 +1264,7 @@ pub fn foce_subject_nll_interaction(
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
     // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.  log|H̃| via Cholesky.
-    let htilde = g.hrh + 0.5 * g.ctc + &omega.inv;
+    let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => return 1e20,
@@ -1481,11 +1481,12 @@ fn foce_subject_nll_interaction_with_tte(
     let hrh = g.hrh + tte_hessian;
 
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it.
+    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. Censored
+    // rows enter `H̃` (structural `g2·a·aᵀ` + residual-eta) for both — consistency.
     let htilde = if interaction {
-        hrh + 0.5 * g.ctc + &omega.inv
+        hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv
     } else {
-        hrh + &omega.inv
+        hrh + &g.cens_hess + &omega.inv
     };
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
@@ -1505,6 +1506,15 @@ struct GaussianFoceTerms {
     ctc: DMatrix<f64>,
     /// Σⱼ censored normal-tail terms (M3 method).
     bloq_term: f64,
+    /// Σⱼ censored rows' contribution to `H̃` at FOCEI (Gauss-Newton) order:
+    /// the structural curvature `g2·aⱼ'aⱼ` (`g2 = ∂²(−logΦ)/∂f²`) plus, under
+    /// `iiv_on_ruv`, the residual-eta cross terms `C·z` (diagonal) and `C·m·a`
+    /// (η_ruv coupling). This is `precise_ebe`'s censored inner-Hessian block
+    /// **minus** the `g1·d2f` term FOCEI legitimately drops (that drop is the
+    /// FOCEI-vs-LAPLACE difference; excluding the *rows* was an inconsistency).
+    /// Added directly (unscaled) to `H̃`, so censored rows enter `log|H̃|`
+    /// consistently with quantified rows. Zero when no censored rows.
+    cens_hess: DMatrix<f64>,
 }
 
 /// Shared Gaussian accumulation loop for the FOCE/FOCEI interaction path.
@@ -1609,23 +1619,60 @@ fn gaussian_foce_accum(
         }
     }
 
-    // Censored contributions at η̂ (ipred-based variance).
+    // Censored contributions at η̂ (ipred-based variance). Censored rows enter both
+    // the data term (`bloq_term`) AND `H̃` (`cens_hess`) — consistently with quantified
+    // rows — at FOCEI (Gauss-Newton) order (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`,
+    // dropping only the `g1·d2f` piece FOCEI drops for every row).
     let mut bloq_term = 0.0;
+    let mut cens_hess = DMatrix::<f64>::zeros(n_eta, n_eta);
     for &j in &bloq_idx {
         let limit = subject.observations[j];
         let f = ipreds[j];
-        let v = match mult_row(j) {
-            Some(m) => {
+        let (v, d, d2) = match mult_row(j) {
+            Some(m) => (
                 error_spec.variance_at_scaled(subject.obs_cmts[j], f, sigma_values, &[], m)
-                    * ruv_scale
-            }
-            None => error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+                    * ruv_scale,
+                error_spec.dvar_df_scaled(subject.obs_cmts[j], f, sigma_values, m) * ruv_scale,
+                error_spec.d2var_df2(subject.obs_cmts[j], sigma_values) * ruv_scale,
+            ),
+            None => (
+                error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+                error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+                error_spec.d2var_df2(subject.obs_cmts[j], sigma_values) * ruv_scale,
+            ),
         };
         if !(v.is_finite() && v > 0.0) {
             return None;
         }
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         bloq_term += -2.0 * m3_logcdf(limit, f, v.sqrt(), cens);
+
+        // Censored curvature for `H̃` (`L = −logΦ`): `g2 = ∂²L/∂f²`, and under
+        // `iiv_on_ruv` the residual-eta coupling `C·z` / `C·m` (`C = h(z²+hz−1)`).
+        let (h, z, m) = crate::stats::special::m3_censored_kernel(limit, f, v, d, cens);
+        let sgn = if cens < 0 { -1.0 } else { 1.0 };
+        let w = v.sqrt();
+        let dm_df = sgn
+            * ((-2.0 * d + (limit - f) * d2) / (2.0 * v * w)
+                - 3.0 * (limit - f) * d * d / (4.0 * v * v * w));
+        let g2 = h * (h + z) * m * m + h * dm_df;
+        let aj = h_matrix.row(j);
+        for a in 0..n_eta {
+            let ga = g2 * aj[a];
+            for b in 0..n_eta {
+                cens_hess[(a, b)] += ga * aj[b];
+            }
+        }
+        if let Some(rr) = residual_error_eta {
+            let c = h * (z * z + h * z - 1.0);
+            cens_hess[(rr, rr)] += c * z;
+            for l in 0..n_eta {
+                if l != rr {
+                    cens_hess[(rr, l)] += c * m * aj[l];
+                    cens_hess[(l, rr)] += c * m * aj[l];
+                }
+            }
+        }
     }
 
     Some(GaussianFoceTerms {
@@ -1633,6 +1680,7 @@ fn gaussian_foce_accum(
         hrh,
         ctc,
         bloq_term,
+        cens_hess,
     })
 }
 

@@ -9167,6 +9167,17 @@ impl ModelTimeGuard {
         let prev = MODEL_TIME.with(|cell| cell.replace(time));
         ModelTimeGuard(prev)
     }
+
+    /// Enter the guard only when `cond` holds (typically `uses_time_builtin`),
+    /// returning `Some(guard)` that restores on drop or `None` when the model does
+    /// not read the `TIME` built-in. Collapses the repeated
+    /// `cond.then(|| ModelTimeGuard::enter(time))` idiom at the per-event seed seams so a
+    /// future widening of the gating condition (e.g. the direct `pk(...=TIME)` mapping)
+    /// updates one call each and can't silently miss a seam (#637 review #7).
+    #[inline]
+    pub(crate) fn enter_if(cond: bool, time: f64) -> Option<Self> {
+        cond.then(|| Self::enter(time))
+    }
 }
 
 impl Drop for ModelTimeGuard {

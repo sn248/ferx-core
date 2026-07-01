@@ -1813,6 +1813,35 @@ impl ErrorSpec {
         }
     }
 
+    /// `d²(residual variance)/d(prediction f)²` with a per-observation custom
+    /// magnitude (#484) — the second-derivative analogue of [`dvar_df_scaled`].
+    ///
+    /// The proportional loading carries the multiplier `m_prop`, so the variance's
+    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`,
+    /// i.e. [`d2var_df2`] scaled by `m_prop²` — exactly the `m²` factor
+    /// [`dvar_df_scaled`] applies to `dvar_df`. Keeping the same scaling here lets
+    /// the M3 censored curvature (which differentiates the same `v(f)`) stay
+    /// internally consistent under a custom RUV magnitude. A `mult` of all ones
+    /// reproduces [`d2var_df2`].
+    ///
+    /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
+    /// [`dvar_df`]: ErrorSpec::dvar_df
+    /// [`d2var_df2`]: ErrorSpec::d2var_df2
+    pub fn d2var_df2_scaled(&self, cmt: usize, sigma: &[f64], mult: &[f64]) -> f64 {
+        let prop_slot = match self {
+            ErrorSpec::Single(_) => 0,
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => match ep.sigma_idx.first() {
+                    Some(&i) => i,
+                    None => return 0.0,
+                },
+                None => return 0.0,
+            },
+        };
+        let m = mult.get(prop_slot).copied().unwrap_or(1.0);
+        self.d2var_df2(cmt, sigma) * m * m
+    }
+
     /// `d(residual variance)/d(log σ_k)` for one observation at `cmt`, where
     /// `k` indexes the flat global sigma vector. Zero when `σ_k` does not enter
     /// this observation's endpoint, so the SAEM sigma-gradient can sum this over
@@ -6046,6 +6075,22 @@ mod tests {
         let base = combined.dvar_df(1, f, &sigma);
         let scaled = combined.dvar_df_scaled(1, f, &sigma, &[3.0, 1.0]);
         assert!((scaled - base * 9.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn d2var_df2_scaled_scales_by_mprop_squared() {
+        // d2var_df2 takes the same m² proportional-loading factor as dvar_df_scaled,
+        // so the M3 censored curvature is built from a consistent v(f). A unit mult
+        // reproduces the unscaled value; additive stays 0 at any mult.
+        let combined = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.3, 2.0];
+        let base = combined.d2var_df2(1, &sigma);
+        assert!((combined.d2var_df2_scaled(1, &sigma, &[3.0, 1.0]) - base * 9.0).abs() < 1e-12);
+        assert!((combined.d2var_df2_scaled(1, &sigma, &[1.0, 1.0]) - base).abs() < 1e-12);
+        assert_eq!(
+            ErrorSpec::Single(ErrorModel::Additive).d2var_df2_scaled(1, &[0.5], &[4.0]),
+            0.0
+        );
     }
 
     #[test]

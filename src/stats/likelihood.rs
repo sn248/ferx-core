@@ -1126,7 +1126,8 @@ pub fn foce_subject_nll_standard(
     // This keeps FOCE a consistent Sheiner–Beal (linearized-marginal) objective —
     // matching Monolix's linearization likelihood and first-order/Tobit theory —
     // in contrast to FOCEI (`foce_subject_nll_interaction`), a conditional Laplace
-    // method whose censored term stays at `f(η̂)`/`R⁰` and enters `H̃`.
+    // method whose censored term stays at the conditional `f(η̂)`/`R⁰` and instead
+    // folds the censored curvature into `H̃` (see `cens_hess`, #486).
     let m3 = matches!(bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let quant: Vec<usize> = if m3 {
         (0..n_obs)
@@ -1229,9 +1230,13 @@ fn model_n_eta(h_matrix: &DMatrix<f64>) -> usize {
 /// small (the negative-EPS-shrinkage symptom on jasmine peds vanco). See
 /// `[[focei-laplace-not-sheiner-beal]]` memory.
 ///
-/// With `bloq_method == M3`, censored observations are dropped from the
-/// Gaussian residual sum and the H̃ accumulation, and instead contribute
-/// the matching normal-tail likelihood evaluated at η̂.
+/// With `bloq_method == M3`, censored observations leave the Gaussian residual
+/// sum and contribute the matching normal-tail likelihood `−logΦ` evaluated at η̂
+/// (the `bloq_term`). They also enter `H̃`/`log|H̃|` at FOCEI (Gauss–Newton) order —
+/// the structural `g2·a·aᵀ` plus, under `iiv_on_ruv`, the residual-eta `C·z`/`C·m`
+/// cross terms (`cens_hess`) — consistently with the quantified rows, matching
+/// NONMEM's LAPLACE M3 Hessian (only the `g1·d2f` piece FOCEI drops for every row
+/// is dropped here too).
 pub fn foce_subject_nll_interaction(
     subject: &Subject,
     ipreds: &[f64],
@@ -1270,8 +1275,9 @@ pub fn foce_subject_nll_interaction(
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.  log|H̃| via Cholesky.
-    let htilde = g.hrh + 0.5 * g.ctc + &omega.inv;
+    // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + cens_hess + Ω⁻¹.  log|H̃| via Cholesky.
+    // (`cens_hess` = 0 unless the subject has M3-censored rows.)
+    let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => return 1e20,
@@ -1488,9 +1494,14 @@ fn foce_subject_nll_interaction_with_tte(
     let hrh = g.hrh + tte_hessian;
 
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it.
+    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. The censored
+    // `cens_hess` (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`) is FOCEI-order
+    // curvature — its `g2` folds in `∂v/∂f`/`∂²v/∂f²`, and the `C·z`/`C·m` terms are
+    // pure `iiv_on_ruv` interaction — so it is gated to the interaction branch, exactly
+    // as `½·g.ctc` is. Plain FOCE (non-interaction) leaves censored rows out of `H̃`,
+    // matching `foce_subject_nll_standard`.
     let htilde = if interaction {
-        hrh + 0.5 * g.ctc + &omega.inv
+        hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv
     } else {
         hrh + &omega.inv
     };
@@ -1512,6 +1523,15 @@ struct GaussianFoceTerms {
     ctc: DMatrix<f64>,
     /// Σⱼ censored normal-tail terms (M3 method).
     bloq_term: f64,
+    /// Σⱼ censored rows' contribution to `H̃` at FOCEI (Gauss-Newton) order:
+    /// the structural curvature `g2·aⱼ'aⱼ` (`g2 = ∂²(−logΦ)/∂f²`) plus, under
+    /// `iiv_on_ruv`, the residual-eta cross terms `C·z` (diagonal) and `C·m·a`
+    /// (η_ruv coupling). This is `precise_ebe`'s censored inner-Hessian block
+    /// **minus** the `g1·d2f` term FOCEI legitimately drops (that drop is the
+    /// FOCEI-vs-LAPLACE difference; excluding the *rows* was an inconsistency).
+    /// Added directly (unscaled) to `H̃`, so censored rows enter `log|H̃|`
+    /// consistently with quantified rows. Zero when no censored rows.
+    cens_hess: DMatrix<f64>,
 }
 
 /// Shared Gaussian accumulation loop for the FOCE/FOCEI interaction path.
@@ -1616,23 +1636,63 @@ fn gaussian_foce_accum(
         }
     }
 
-    // Censored contributions at η̂ (ipred-based variance).
+    // Censored contributions at η̂ (ipred-based variance). Censored rows enter both
+    // the data term (`bloq_term`) AND `H̃` (`cens_hess`) — consistently with quantified
+    // rows — at FOCEI (Gauss-Newton) order (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`,
+    // dropping only the `g1·d2f` piece FOCEI drops for every row).
     let mut bloq_term = 0.0;
+    let mut cens_hess = DMatrix::<f64>::zeros(n_eta, n_eta);
     for &j in &bloq_idx {
         let limit = subject.observations[j];
         let f = ipreds[j];
-        let v = match mult_row(j) {
-            Some(m) => {
-                error_spec.variance_at_scaled(subject.obs_cmts[j], f, sigma_values, &[], m)
-                    * ruv_scale
-            }
-            None => error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+        let cmt = subject.obs_cmts[j];
+        // `v_resid`/`d`/`d2` all carry the same proportional-loading (`m²`) and
+        // `exp(2·η_ruv)` scaling, so the censored curvature is built from mutually
+        // consistent derivatives of one `v(f)`.
+        let (v_resid, d, d2) = match mult_row(j) {
+            Some(m) => (
+                error_spec.variance_at_scaled(cmt, f, sigma_values, &[], m) * ruv_scale,
+                error_spec.dvar_df_scaled(cmt, f, sigma_values, m) * ruv_scale,
+                error_spec.d2var_df2_scaled(cmt, sigma_values, m) * ruv_scale,
+            ),
+            None => (
+                error_spec.variance_at(cmt, f, sigma_values) * ruv_scale,
+                error_spec.dvar_df(cmt, f, sigma_values) * ruv_scale,
+                error_spec.d2var_df2(cmt, sigma_values) * ruv_scale,
+            ),
         };
+        // Inflate by the EKF process-noise term exactly as the quantified rows do
+        // (line above), so a censored row's `v` — in both the data term and `H̃` —
+        // matches its subject's Gaussian rows under an SDE model. `p_obs` is
+        // f-independent, so `d`/`d2` (∂v/∂f, ∂²v/∂f²) are unchanged.
+        let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
             return None;
         }
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         bloq_term += -2.0 * m3_logcdf(limit, f, v.sqrt(), cens);
+
+        // Censored curvature for `H̃` (`L = −logΦ`): structural `g2·a·aᵀ` plus, under
+        // `iiv_on_ruv`, the residual-eta coupling `C·z` on (rr,rr) and `C·m·a_l` on the
+        // (rr,l) cross terms. Single-sourced via `m3_censored_outer` (shared with the
+        // analytic outer gradient) so the two curvature copies cannot drift.
+        let (_g1, g2, cz, cm) = crate::stats::special::m3_censored_outer(limit, f, v, d, d2, cens);
+        let aj = h_matrix.row(j);
+        for a in 0..n_eta {
+            let ga = g2 * aj[a];
+            for b in 0..n_eta {
+                cens_hess[(a, b)] += ga * aj[b];
+            }
+        }
+        if let Some(rr) = residual_error_eta {
+            cens_hess[(rr, rr)] += cz;
+            for l in 0..n_eta {
+                if l != rr {
+                    cens_hess[(rr, l)] += cm * aj[l];
+                    cens_hess[(l, rr)] += cm * aj[l];
+                }
+            }
+        }
     }
 
     Some(GaussianFoceTerms {
@@ -1640,6 +1700,7 @@ fn gaussian_foce_accum(
         hrh,
         ctc,
         bloq_term,
+        cens_hess,
     })
 }
 

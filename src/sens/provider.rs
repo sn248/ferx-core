@@ -384,9 +384,19 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
         && model.residual_correlations.is_empty()
         && !model.has_tte()
-        // Custom residual-error magnitude (#484): θ-dependent variance not yet in
-        // the analytic outer θ/σ kernels — FD gradient only (it is magnitude-aware).
-        && !model.has_custom_ruv_magnitude()
+        // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
+        // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
+        // now carries via a `Dual1`-differentiated direct-θ channel — bounded by the
+        // same `Dual1<M>` dispatch table `ScaleDerivProgram`/`ExpressionScale` uses
+        // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with `iiv_on_ruv`
+        // (whose residual-eta `c̃`-column coupling `d/R` would need its own direct-θ
+        // chain, not yet assembled — see `prepare_stacked`), still routes to FD.
+        // (An M3-censored row's `−logΦ(z)` direct-θ chain is a *per-subject* gap
+        // `prepare_stacked` bails at runtime — see its own doc — not a model-level
+        // one, so it is not gated here.)
+        && (!model.has_custom_ruv_magnitude()
+            || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
+                && model.residual_error_eta.is_none()))
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))

@@ -32,6 +32,19 @@ section of the SDLC for the versioning policy).
   (Sheiner–Beal) is a distinct objective and is unchanged.
 
 ### Added
+- **Custom / time-varying residual-error magnitude (`[error_model]` σ-scaling expression)
+  now gets an exact analytic gradient** on both loops instead of finite differences
+  (#484/#576/#486). The magnitude is η-independent, so the inner EBE gradient just
+  threads the per-observation multiplier into the residual variance and its
+  `f`-derivative; the FOCEI outer θ/σ population gradient additionally
+  dual-differentiates the compiled magnitude program w.r.t. θ, adding a new
+  *direct*-θ term to `∂R/∂θ` for any theta the magnitude expression references
+  (e.g. a late-phase RUV inflation `PROP_ERR * (1 + RUV_LATE * TIME/48)`).
+  Validated against a live NONMEM FOCEI fit (OFV and every estimate, including
+  `RUV_LATE`, match to ~4-5 significant figures — see `examples/warfarin_ruv_magnitude.ferx`).
+  `block_sigma` correlated residual error, `iiv_on_ruv`, an M3-BLOQ censored row,
+  more than 16 thetas, and plain `method = foce` (non-interaction) still fall back
+  to the (magnitude-aware) finite-difference gradient.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK

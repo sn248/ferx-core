@@ -2318,17 +2318,19 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Compile per-sigma magnitude multipliers now that covariate names are
     // known (they validate the magnitude expressions). `None` for the common
     // case of bare sigmas — the legacy variance path is then taken verbatim.
-    {
+    let ruv_magnitude_used_thetas: std::collections::HashSet<usize> = {
         let ruv_theta_names = model.theta_names.clone();
         let ruv_eta_names = model.eta_names.clone();
-        model.ruv_magnitude = build_ruv_magnitude(
+        let (rm, used_thetas) = build_ruv_magnitude(
             &single_error_args,
             &ruv_sigma_names,
             &ruv_theta_names,
             &ruv_eta_names,
             &covariate_decls,
         )?;
-    }
+        model.ruv_magnitude = rm;
+        used_thetas
+    };
 
     // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
     // Unnamed: `[event_model]` — one TTE endpoint.
@@ -2391,7 +2393,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
-    // reported as unused in mixed PK+TTE models.
+    // reported as unused in mixed PK+TTE models. A theta referenced only from a
+    // custom RUV magnitude expression (#484/#576, e.g. `RUV_LATE`) is unioned in
+    // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
+    // now carries its direct-θ channel), just never seen by `indiv_stmts`.
+    event_model_used_thetas.extend(ruv_magnitude_used_thetas);
     // #486 — surface the FD fallback when a direct-θ/η readout could not be
     // desugared because the PK-slot layout was full (see the headroom check above).
     if let Some(note) = readout_fd_fallback_note.take() {
@@ -8733,31 +8739,74 @@ fn validate_ruv_expr(
     }
 }
 
+/// Lower a parsed magnitude expression to a `Dual1`-differentiable
+/// [`RuvMagDerivProgram`] over `θ` only (#576/#486): the magnitude is validated
+/// ([`validate_ruv_expr`]) to never reference `η`, an individual parameter, or an
+/// NN output, so — unlike [`compile_scale_deriv_program`] — there is no `η` axis
+/// and no `var_to_pk_slot` to feed in. The scaled sigma resolves to var slot `0`,
+/// pinned to the constant `1.0` at eval time (mirroring the runtime closure's
+/// `vars.insert(sigma_name, 1.0)`); covariates are sorted cov slots; `TIME` reads
+/// the event-time built-in. The input `expr` is cloned, so the caller keeps its
+/// AST for the runtime closure.
+fn compile_ruv_mag_deriv_program(
+    expr: &Expression,
+    sigma_name: &str,
+    n_theta: usize,
+) -> RuvMagDerivProgram {
+    let mut e = expr.clone();
+    let var_idx: HashMap<String, usize> = [(sigma_name.to_string(), 0)].into_iter().collect();
+    let mut cov_set = std::collections::HashSet::new();
+    collect_covariates(&e, &mut cov_set);
+    let mut cov_names: Vec<String> = cov_set.into_iter().collect();
+    cov_names.sort();
+    let cov_idx: HashMap<String, usize> = cov_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+    RuvMagDerivProgram {
+        bc: compile_bytecode(&e),
+        n_theta,
+        cov_names,
+    }
+}
+
 /// Build the custom residual-error magnitude (#484) from the single-endpoint
-/// `[error_model]` arguments, once covariate names are known. Returns `None`
+/// `[error_model]` arguments, once covariate names are known. Returns `(None, {})`
 /// when every argument is a bare sigma (the legacy variance path is then taken
 /// verbatim). Each non-bare argument compiles to a per-observation multiplier
-/// closure over `(theta, observation covariates, TIME)`.
+/// closure over `(theta, observation covariates, TIME)`, plus a `Dual1`
+/// θ-derivative program (#576/#486) so the analytic outer θ/σ gradient can
+/// differentiate the magnitude exactly instead of falling back to FD.
+///
+/// The second element is the set of theta indices any magnitude expression
+/// references — a theta that appears *only* in `[error_model]` (e.g. `RUV_LATE`)
+/// would otherwise trip `check_unused_parameters`'s "not referenced" warning,
+/// mirroring how `[event_model]` thetas are unioned in.
 fn build_ruv_magnitude(
     single_error_args: &Option<(ErrorModel, Vec<String>)>,
     sigma_names: &[String],
     theta_names: &[String],
     eta_names: &[String],
     covariate_decls: &Option<Vec<CovariateDecl>>,
-) -> Result<Option<RuvMagnitude>, String> {
+) -> Result<(Option<RuvMagnitude>, std::collections::HashSet<usize>), String> {
+    let mut used_thetas = std::collections::HashSet::new();
     let Some((_em, args)) = single_error_args else {
-        return Ok(None);
+        return Ok((None, used_thetas));
     };
     let allowed_covs: Option<Vec<String>> = covariate_decls
         .as_ref()
         .map(|d| d.iter().map(|c| c.name.clone()).collect());
     let mut per_sigma: Vec<Option<RuvMagFn>> = Vec::with_capacity(args.len());
+    let mut per_sigma_deriv: Vec<Option<RuvMagDerivProgram>> = Vec::with_capacity(args.len());
     let mut any = false;
     for arg in args {
         let sigma_name = arg_sigma_name(arg, sigma_names)?;
         let trimmed = arg.trim();
         if trimmed == sigma_name {
             per_sigma.push(None);
+            per_sigma_deriv.push(None);
             continue;
         }
         any = true;
@@ -8776,6 +8825,16 @@ fn build_ruv_magnitude(
         let expr = parse_scalar_expression(trimmed, ctx)
             .map_err(|e| format!("[error_model] magnitude `{}`: {}", trimmed, e))?;
         validate_ruv_expr(&expr, &sigma_name, allowed_covs.as_deref())?;
+        visit_expr_nodes(&expr, &mut |e: &Expression| {
+            if let Expression::Theta(i) = e {
+                used_thetas.insert(*i);
+            }
+        });
+        per_sigma_deriv.push(Some(compile_ruv_mag_deriv_program(
+            &expr,
+            &sigma_name,
+            theta_names.len(),
+        )));
         let sig = sigma_name.clone();
         let f: RuvMagFn = Box::new(move |theta, obs_cov, time| {
             let mut vars: HashMap<String, f64> = HashMap::new();
@@ -8792,11 +8851,15 @@ fn build_ruv_magnitude(
         });
         per_sigma.push(Some(f));
     }
-    if any {
-        Ok(Some(RuvMagnitude { per_sigma }))
+    let rm = if any {
+        Some(RuvMagnitude {
+            per_sigma,
+            per_sigma_deriv,
+        })
     } else {
-        Ok(None)
-    }
+        None
+    };
+    Ok((rm, used_thetas))
 }
 
 // --- Individual parameter function builder ---
@@ -11852,6 +11915,97 @@ impl ScaleDerivProgram {
         eval_bytecode_g::<Dual1<N>>(
             &self.bc, theta_d, eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
         )
+    }
+}
+
+/// Differentiable form of a custom residual-error magnitude slot (#484/#576/#486):
+/// the magnitude expression compiled to bytecode, evaluable over `Dual1<M>` seeded
+/// on `θ` only. Unlike [`ScaleDerivProgram`] the magnitude never depends on `η` or
+/// an individual parameter (`validate_ruv_expr` rejects both), so there is a single
+/// var slot — the scaled sigma, pinned to the constant `1.0` — and no
+/// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
+/// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
+/// FD for a custom / time-varying σ magnitude.
+pub struct RuvMagDerivProgram {
+    bc: Bytecode,
+    n_theta: usize,
+    cov_names: Vec<String>,
+}
+
+/// Axis cap for the `Dual1<M>` dispatch table in [`RuvMagDerivProgram::theta_grad`]
+/// (mirrors the `MAX_SCALE_AXES` / `MAX_ODE_AXES` convention elsewhere). A model
+/// with more thetas than this falls back to FD for the magnitude's direct-θ
+/// gradient channel — `analytic_outer_gradient_available` bounds `model.n_theta`
+/// against this constant when a custom magnitude is active.
+pub(crate) const MAX_RUV_MAG_AXES: usize = 16;
+
+impl RuvMagDerivProgram {
+    /// `∂(magnitude)/∂θ` at `theta` (with the observation's covariates and raw
+    /// TIME), dispatching the const-generic `Dual1<M>` eval on `theta.len()`.
+    /// `None` when `theta.len()` exceeds [`MAX_RUV_MAG_AXES`] or does not match
+    /// the program's own `n_theta` (caller falls back to FD).
+    pub(crate) fn theta_grad(
+        &self,
+        theta: &[f64],
+        cov: &HashMap<String, f64>,
+        time: f64,
+    ) -> Option<Vec<f64>> {
+        use crate::sens::dual1::Dual1;
+        if theta.len() != self.n_theta {
+            return None;
+        }
+        if theta.is_empty() {
+            return Some(Vec::new());
+        }
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| cov.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let sigma_pin_f64 = 1.0_f64;
+        macro_rules! run {
+            ($n:literal) => {{
+                let theta_d: Vec<Dual1<$n>> = theta
+                    .iter()
+                    .enumerate()
+                    .map(|(m, &v)| Dual1::var(v, m))
+                    .collect();
+                let sigma_pin = [Dual1::<$n>::constant(sigma_pin_f64)];
+                let empty_nn: Vec<Vec<f64>> = Vec::new();
+                let mut stack: Vec<Dual1<$n>> = Vec::new();
+                let d = with_model_time(time, || {
+                    eval_bytecode_g::<Dual1<$n>>(
+                        &self.bc,
+                        &theta_d,
+                        &[],
+                        &cov_vec,
+                        &sigma_pin,
+                        &empty_nn,
+                        &mut stack,
+                    )
+                });
+                d.grad.to_vec()
+            }};
+        }
+        Some(match theta.len() {
+            1 => run!(1),
+            2 => run!(2),
+            3 => run!(3),
+            4 => run!(4),
+            5 => run!(5),
+            6 => run!(6),
+            7 => run!(7),
+            8 => run!(8),
+            9 => run!(9),
+            10 => run!(10),
+            11 => run!(11),
+            12 => run!(12),
+            13 => run!(13),
+            14 => run!(14),
+            15 => run!(15),
+            16 => run!(16),
+            _ => return None,
+        })
     }
 }
 
@@ -17315,6 +17469,41 @@ mod tests {
         assert!((m_early[1] - 1.0).abs() < 1e-12);
         assert!((m_late[0] - 1.5).abs() < 1e-12);
         assert!((m_late[1] - 1.0).abs() < 1e-12);
+    }
+
+    /// A theta referenced only from an `[error_model]` magnitude expression
+    /// (e.g. `RUV_LATE`, never used in `[individual_parameters]`) must not trip
+    /// the "declared but not referenced" warning — it *is* meaningfully
+    /// estimated, via the magnitude's direct-θ channel (#484/#576/#486).
+    #[test]
+    fn test_ruv_magnitude_theta_not_flagged_as_unused() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_LATE(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+"#;
+        let model = parse_model_string(content).unwrap();
+        assert!(model.has_custom_ruv_magnitude());
+        let warns: Vec<_> = model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("RUV_LATE"))
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "RUV_LATE is used by the magnitude expression, got: {:?}",
+            warns
+        );
     }
 
     #[test]

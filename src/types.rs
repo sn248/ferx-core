@@ -1455,6 +1455,13 @@ pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send
 #[derive(Default)]
 pub struct RuvMagnitude {
     pub per_sigma: Vec<Option<RuvMagFn>>,
+    /// Parallel to `per_sigma`: the compiled `Dual1` θ-derivative program for the
+    /// same non-bare slot (#576/#486), or `None` for a bare slot. Lets the
+    /// analytic outer θ/σ gradient differentiate the magnitude directly — a new
+    /// direct-θ term in `∂R/∂θ` — instead of falling back to FD. The runtime
+    /// closure in `per_sigma` still serves every value-only caller (inner loop,
+    /// IWRES, simulation).
+    pub per_sigma_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
@@ -1489,6 +1496,26 @@ impl RuvMagnitude {
             .map(|slot| match slot {
                 Some(f) => f(theta, obs_covariates, time),
                 None => 1.0,
+            })
+            .collect()
+    }
+
+    /// Per-sigma `∂(multiplier)/∂θ` vector for one observation (#576/#486). Slot
+    /// `k` evaluates its `Dual1` program's gradient; a bare slot (multiplier ≡ 1)
+    /// contributes an all-zero row. `None` when any active slot's program
+    /// declines (θ-axis count mismatch / beyond `MAX_RUV_MAG_AXES`) — the caller
+    /// then falls back to FD for the magnitude's direct-θ gradient channel.
+    pub fn eval_obs_theta_grad(
+        &self,
+        theta: &[f64],
+        obs_covariates: &HashMap<String, f64>,
+        time: f64,
+    ) -> Option<Vec<Vec<f64>>> {
+        self.per_sigma_deriv
+            .iter()
+            .map(|slot| match slot {
+                Some(p) => p.theta_grad(theta, obs_covariates, time),
+                None => Some(vec![0.0; theta.len()]),
             })
             .collect()
     }
@@ -1814,14 +1841,16 @@ impl ErrorSpec {
     }
 
     /// `d²(residual variance)/d(prediction f)²` with a per-observation custom
-    /// magnitude (#484) — the second-derivative analogue of [`dvar_df_scaled`].
+    /// magnitude (#484/#576) — the second-derivative analogue of [`dvar_df_scaled`].
     ///
     /// The proportional loading carries the multiplier `m_prop`, so the variance's
     /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`,
     /// i.e. [`d2var_df2`] scaled by `m_prop²` — exactly the `m²` factor
     /// [`dvar_df_scaled`] applies to `dvar_df`. Keeping the same scaling here lets
     /// the M3 censored curvature (which differentiates the same `v(f)`) stay
-    /// internally consistent under a custom RUV magnitude. A `mult` of all ones
+    /// internally consistent under a custom RUV magnitude, and the FOCEI outer
+    /// θ/σ gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`)
+    /// consume the same magnitude-scaled second derivative. A `mult` of all ones
     /// reproduces [`d2var_df2`].
     ///
     /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
@@ -2903,6 +2932,38 @@ impl CompiledModel {
                 .copied()
                 .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
             out.push(rm.eval_obs(theta, subject.obs_cov(j), time));
+        }
+        Some(out)
+    }
+
+    /// Per-observation `∂(residual-magnitude multiplier)/∂θ` for `subject` at
+    /// `theta` (#576/#486), as an `[obs][sigma-slot][theta]` tensor, or `None`
+    /// when no custom magnitude is active *or* any active slot's `Dual1` program
+    /// declines (θ-axis count beyond [`crate::parser::model_parser::MAX_RUV_MAG_AXES`]
+    /// — the analytic outer gradient's own gate,
+    /// [`crate::sens::provider::analytic_outer_gradient_available`], bounds
+    /// `model.n_theta` against the same constant, so this should only return
+    /// `None` here for a model that gate already declined). Feeds the outer θ/σ
+    /// gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`) — the
+    /// magnitude enters `R` through θ directly, not only through the prediction.
+    pub fn ruv_obs_mult_theta_grad(
+        &self,
+        subject: &Subject,
+        theta: &[f64],
+    ) -> Option<Vec<Vec<Vec<f64>>>> {
+        let rm = self.ruv_magnitude.as_ref()?;
+        if !rm.is_active() {
+            return None;
+        }
+        let n = subject.observations.len();
+        let mut out = Vec::with_capacity(n);
+        for j in 0..n {
+            let time = subject
+                .obs_raw_times
+                .get(j)
+                .copied()
+                .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
+            out.push(rm.eval_obs_theta_grad(theta, subject.obs_cov(j), time)?);
         }
         Some(out)
     }

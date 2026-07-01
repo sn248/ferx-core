@@ -354,7 +354,7 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     }
     // Steady-state dosing is not yet supported over the dual loop (needs dual
     // SS-equilibration); bolus and (finite-duration) infusion doses are handled.
-    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) {
+    if subject.has_periodic_ss_dose() {
         return false;
     }
     // Modeled-`RATE` doses (`RATE=-1`→`R{cmt}` rate, `RATE=-2`→`D{cmt}` duration)
@@ -466,7 +466,7 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // **or** a rate-defined infusion under `F ≠ 1` (#419: the bioavailable window length is
     // a moving boundary in `F`, carried by the rate-off saltation) — anything the static
     // superposition walk can't do. A subject with none of those uses the cheaper static walk.
-    let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
+    let has_ss = subject.has_periodic_ss_dose();
     let has_rate_defined_under_f =
         model.has_bioavailability() && subject.has_rate_defined_infusion();
     // #530: a modeled-`RATE`/duration dose (`RATE=-1`/`-2`, `R{cmt}`/`D{cmt}`) resolves its
@@ -1979,6 +1979,10 @@ fn ode_iov_subject_supported(
     if !ode_iov_supported(model) {
         return None;
     }
+    // Single scan for the periodic steady-state predicate reused by every SS gate
+    // below (the modeled-dose screen and the SS+lagtime / SS+time-RHS bails), rather
+    // than re-scanning `subject.doses` per branch on this hot per-subject path.
+    let has_ss = subject.has_periodic_ss_dose();
     // #530/#486: modeled-`RATE`/duration doses (`RATE=-1`/`-2`, `R{cmt}`/`D{cmt}`) are
     // resolved from their **per-occasion** PK slot as a live jet inside the event walk
     // (`inf_eff` reads `pk_at_dose[k][slot]`, seeded per occasion group by
@@ -1991,7 +1995,6 @@ fn ode_iov_subject_supported(
     // (`check_model_data` rejects such a model, but emit FD rather than a wrong gradient if
     // one slips past — the walk's `inf_eff` would silently fall to the unresolved fixed arm).
     if !subject.all_doses_fixed() {
-        let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
         let attr_map = model.active_dose_attr_map();
         let all_slots_present = subject.doses.iter().all(|d| {
             matches!(d.rate_mode, crate::types::RateMode::Fixed)
@@ -2016,13 +2019,13 @@ fn ode_iov_subject_supported(
     // rate-defined-under-F case is excluded above. SS combined with an estimated lagtime
     // routes to FD (the pre-arrival SS-tail seed is not yet carried by the dual walk —
     // mirrors `ode_tvcov_supported`, #472/#473 review).
-    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0) && model.has_lagtime() {
+    if has_ss && model.has_lagtime() {
         return None;
     }
     // SS combined with a non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) → FD: the SS
     // equilibration assumes a time-invariant pulse train, so the cycle recurrence breaks
     // (mirrors `ode_tvcov_supported`, #473 review #1).
-    if subject.doses.iter().any(|d| d.ss && d.ii > 0.0)
+    if has_ss
         && model
             .ode_spec
             .as_ref()

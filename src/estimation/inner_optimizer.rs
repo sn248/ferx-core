@@ -196,13 +196,16 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         return "model outside IOV analytic scope";
     }
     if model.ode_spec.is_some() {
+        // Single scan for the periodic steady-state predicate, mirroring
+        // `ode_iov_subject_supported`'s hoisted `has_ss` so the attribution order and
+        // the gate can't drift.
+        let has_ss = subject.has_periodic_ss_dose();
         // Modeled-`RATE`/duration doses are analytic under IOV since #486 (the per-occasion
         // modeled-window jet rides the rate-off saltation), EXCEPT when also steady-state
         // (the dual SS equilibration has no modeled-window jet yet) or when a `D{cmt}`/`R{cmt}`
         // slot is absent — mirror `ode_iov_subject_supported`'s screen so a modeled+SS subject
         // is attributed to SS, not to the (now-analytic) modeled dose itself.
         if !subject.all_doses_fixed() {
-            let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
             if has_ss {
                 return "steady-state + modeled RATE/DURATION dose";
             }
@@ -221,7 +224,6 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         if crate::sens::ode_provider::has_rate_defined_ss_infusion_under_f(model, subject) {
             return "steady-state rate-defined infusion under F";
         }
-        let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
         if has_ss && model.has_lagtime() {
             return "steady-state dose + estimated lagtime";
         }

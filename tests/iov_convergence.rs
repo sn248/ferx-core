@@ -679,6 +679,18 @@ fn iov_m3_ode_matches_closed_form_estimates() {
         opts.gradient_method = ferx_core::GradientMethod::Auto;
         opts.run_covariance_step = false;
         opts.verbose = false;
+        // Tighten the inner EBE tolerance (default 1e-5). This dataset has one
+        // heavily-censored subject whose M3 individual objective is extremely flat;
+        // at the default tolerance the inner optimizer stops short of that subject's
+        // EBE, and — because the two engines' predictions differ at the ~1e-10 level
+        // (closed form vs RK45) — the closed-form and ODE legs stop at *different*
+        // EBEs. Since #641 folds censored rows into log|H̃|, that EBE gap is amplified
+        // into a ~0.75 OFV / ~9% ω²_KA divergence between the two legs (a single-basin
+        // under-convergence, not two optima: at 1e-11 both legs converge to an
+        // identical minimum and every component agrees to ~5 s.f.). This is an
+        // engine-consistency test, so we tighten the inner loop to remove the
+        // under-convergence confound and compare the two engines at converged EBEs.
+        opts.inner_tol = 1e-11;
         fit(model, &pop, &model.default_params, &opts).expect("M3 + IOV fit runs")
     };
     let cf = run(&cf_model);
@@ -697,13 +709,13 @@ fn iov_m3_ode_matches_closed_form_estimates() {
         );
     }
 
-    // Same model, two prediction engines (closed form vs RK45) ⇒ the same optimum. Under
-    // the default L-BFGS both legs converge to identical estimates to ~6 sig figs
-    // (observed: TVCL/TVV/TVKA and ω_CL match to 6 decimals). Bands are kept at 1% on θ /
-    // 2% on variance components — far tighter than the ~2%/~20% an under-converging
-    // gradient optimizer produces on the flat CL valley, yet with enough slack to absorb
-    // platform/optimizer-version jitter. The OFV differs only by ~0.3 (fourth significant
-    // figure), the closed-form-vs-RK45 prediction difference through the censored marginal.
+    // Same model, two prediction engines (closed form vs RK45) ⇒ the same optimum. With
+    // the tightened inner EBE tolerance above, both legs converge to identical estimates
+    // to ~5 sig figs (observed: TVCL/TVV/TVKA, ω_CL, ω²_KA, Ω_iov, and σ all match to
+    // ~1e-4; OFV agrees to ~1e-5). Bands are kept at 1% on θ / 2% on variance components —
+    // far tighter than the ~2%/~9% an under-converged inner EBE produces on the flat
+    // censored subject at the default 1e-5 tolerance, yet with enough slack to absorb
+    // platform/optimizer-version jitter.
     assert!(
         (cf.ofv - ode.ofv).abs() < 0.5,
         "closed-form OFV {:.4} vs ODE OFV {:.4} must agree (same marginal, two engines)",

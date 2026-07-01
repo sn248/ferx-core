@@ -115,17 +115,23 @@ struct CensMargGrad {
 }
 
 impl CensMargGrad {
-    /// Censored contribution to `∂F/∂L_{row,col}` of the (stacked) Ω Cholesky
-    /// factor: `Σ_c a_varc · ∂R̃ⱼⱼ/∂L_{row,col} = Σ_c a_varc · 2·(Jⱼ L)_col · Jⱼ[row]`.
-    /// The caller supplies its own `L` (the plain factor for non-IOV, the
-    /// block-diagonal `L_full` for IOV) and maps `(row,col)` to its packed slot.
-    fn omega_entry(&self, row: usize, col: usize, l: &DMatrix<f64>) -> f64 {
+    /// Precompute `(Jⱼ L) = Lᵀ Jⱼ` (length `n`) for every censored row against the
+    /// caller's Cholesky factor `L` — the plain factor for non-IOV, the block-diagonal
+    /// `L_full` for IOV. Done once, then reused for every packed Ω entry, mirroring the
+    /// quant SB path's one-shot `jl = J·L` (so `(Jⱼ L)_col` is not recomputed per row).
+    fn prep_jl(&self, l: &DMatrix<f64>) -> Vec<DVector<f64>> {
+        self.rows.iter().map(|c| l.tr_mul(&c.jrow)).collect()
+    }
+
+    /// Censored contribution to `∂F/∂L_{row,col}` of the (stacked) Ω Cholesky factor:
+    /// `Σ_c a_varc · ∂R̃ⱼⱼ/∂L_{row,col} = Σ_c a_varc · 2·(Jⱼ L)_col · Jⱼ[row]`, reading
+    /// `(Jⱼ L)_col` from `jl` (from [`CensMargGrad::prep_jl`]). The caller maps
+    /// `(row,col)` to its packed slot.
+    fn omega_entry(&self, row: usize, col: usize, jl: &[DVector<f64>]) -> f64 {
         self.rows
             .iter()
-            .map(|c| {
-                let jl_col: f64 = (0..c.jrow.len()).map(|p| l[(p, col)] * c.jrow[p]).sum();
-                c.a_var * 2.0 * jl_col * c.jrow[row]
-            })
+            .zip(jl)
+            .map(|(c, jlc)| c.a_var * 2.0 * jlc[col] * c.jrow[row])
             .sum()
     }
 }
@@ -1536,9 +1542,9 @@ pub fn subject_packed_gradient_foce(
         model, subject, &sens, &sens0, sigma, omega, eta_hat, n_eta, n_theta, m3,
     )?;
 
-    // θ (fixed η̂): SB part over quant rows + censored `−logΦ` θ-gradient.
+    // θ (fixed η̂): SB part over quant rows + the marginal censored θ-gradient (`cg.theta`,
+    // built in `censored_marginal_foce_grad` from ∂f0/∂θ and ∂R̃ⱼⱼ/∂θ — #646).
     //   SB: u·Qₘ + tr(R̃⁻¹EₘΩJᵀ) − u·(EₘΩJᵀu) + ½Σ ∂R⁰/∂θ (R̃⁻¹ᵢᵢ − u²ᵢ).
-    //   censored: h·[ b̂ⱼₘ/w + (LLOQ−f̂)·∂R⁰/∂θ /(2w³) ], ∂R⁰/∂θ = d⁰·∂f(η=0)/∂θ.
     for m in 0..n_theta {
         let mut qm = DVector::<f64>::zeros(nq);
         let mut em = DMatrix::<f64>::zeros(nq, n_eta);
@@ -1572,6 +1578,7 @@ pub fn subject_packed_gradient_foce(
     // via `cg.omega_entry` (was zero when the censored term used the residual R⁰).
     let l = &params.omega.chol;
     let jl = &jmat * l;
+    let cjl = cg.prep_jl(l); // (Jⱼ L) per censored row, once
     let entries: Vec<(usize, usize)> = if params.omega.diagonal {
         (0..n_eta).map(|i| (i, i)).collect()
     } else {
@@ -1590,12 +1597,12 @@ pub fn subject_packed_gradient_foce(
         let rinv_jr = &rtilde_inv * jr;
         let fixed_l = jv.dot(&rinv_jr) - jr.dot(&u) * jv.dot(&u);
         let chain = if row == col { l[(row, row)] } else { 1.0 };
-        fixed[omega_start + ko] = (fixed_l + cg.omega_entry(row, col, l)) * chain;
+        fixed[omega_start + ko] = (fixed_l + cg.omega_entry(row, col, &cjl)) * chain;
     }
 
-    // σ (fixed η̂): SB part over quant + censored. ∂R⁰/∂σ by central FD of the
+    // σ (fixed η̂): SB part over quant + the marginal censored σ-gradient (`cg.sigma`;
+    // only R⁰ depends on σ, so ∂R̃ⱼⱼ/∂σ = ∂R⁰/∂σ — #646). ∂R⁰/∂σ by central FD of the
     // closed-form variance at f(η=0) — works for FOCE here and FOCEI in sigma_block.
-    //   censored: h·(LLOQ−f̂)·∂R⁰/∂σ /(2w³).
     let sigma_start = omega_start + entries.len();
     for k in 0..n_sigma {
         let hsig = sigma_fd_step(sigma[k]);
@@ -1616,7 +1623,8 @@ pub fn subject_packed_gradient_foce(
         fixed[sigma_start + k] = nat * sigma[k];
     }
 
-    // Coupling c = ∂F/∂η̂: SB part over quant rows + censored (∂(−logΦ)/∂η̂ = h·â/w).
+    // Coupling c = ∂F/∂η̂: SB part over quant rows + the marginal censored coupling
+    // (`cg.coupling`; the tail's η̂-response through both the marginal mean and R̃ⱼⱼ — #646).
     //   SB: u·P_k + tr(R̃⁻¹ Dk ΩJᵀ) − u·(Dk ΩJᵀ u),  P_k[i]=(Aⱼη̂)_k, Dk[i,l]=Aⱼ[k,l].
     let mut coupling = DVector::<f64>::zeros(n_eta);
     for k in 0..n_eta {
@@ -2001,8 +2009,8 @@ pub fn subject_packed_gradient_foce_iov(
         m3,
     )?;
 
-    // θ (fixed η̂): SB part over quant rows + censored `−logΦ` θ-gradient
-    //   h·[ b̂ⱼₘ/w + (LLOQ−f̂)·∂R⁰/∂θ /(2w³) ], ∂R⁰/∂θ = d⁰·∂f(η=0,κ=0)/∂θ.
+    // θ (fixed η̂): SB part over quant rows + the marginal censored θ-gradient
+    // (`cg.theta`, over the stacked [η, κ] system — #646).
     for m in 0..n_theta {
         let mut qm = DVector::<f64>::zeros(nq);
         let mut em = DMatrix::<f64>::zeros(nq, n_st);
@@ -2039,6 +2047,7 @@ pub fn subject_packed_gradient_foce_iov(
     let l_iov = &omega_iov.chol;
     let l_full = block_chol_full(l_bsv, l_iov, k, n_eta_bsv, n_iov);
     let jl = &jmat * &l_full;
+    let cjl = cg.prep_jl(&l_full); // (Jⱼ L_full) per censored row, once
     let entry_grad = |row: usize, col: usize| -> f64 {
         let jr = jmat.column(row);
         let jv = jl.column(col);
@@ -2049,12 +2058,13 @@ pub fn subject_packed_gradient_foce_iov(
     let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
     for (e, &(row, col)) in bsv_entries.iter().enumerate() {
         let chain = if row == col { l_bsv[(row, row)] } else { 1.0 };
-        fixed[omega_start + e] = (entry_grad(row, col) + cg.omega_entry(row, col, &l_full)) * chain;
+        fixed[omega_start + e] = (entry_grad(row, col) + cg.omega_entry(row, col, &cjl)) * chain;
     }
     let sigma_start = omega_start + bsv_entries.len();
 
-    // σ (fixed η̂): SB part over quant rows + censored. ∂R⁰/∂σ by central FD of the
-    // closed-form variance at f(η=0, κ=0). Censored: h·(LLOQ−f̂)·∂R⁰/∂σ /(2w³).
+    // σ (fixed η̂): SB part over quant rows + the marginal censored σ-gradient
+    // (`cg.sigma`; ∂R̃ⱼⱼ/∂σ = ∂R⁰/∂σ — #646). ∂R⁰/∂σ by central FD of the closed-form
+    // variance at f(η=0, κ=0).
     for kk in 0..n_sigma {
         let hsig = sigma_fd_step(sigma[kk]);
         let mut sp = sigma.clone();
@@ -2080,14 +2090,15 @@ pub fn subject_packed_gradient_foce_iov(
         for kk in 0..k {
             let row = n_eta_bsv + kk * n_iov + i;
             let col = n_eta_bsv + kk * n_iov + j;
-            raw += entry_grad(row, col) + cg.omega_entry(row, col, &l_full);
+            raw += entry_grad(row, col) + cg.omega_entry(row, col, &cjl);
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
         fixed[iov_start + e] = raw * chain;
     }
 
     // Coupling c = ∂F/∂η̂ over the stacked random effects: SB part over quant rows +
-    // censored ∂(−logΦ)/∂η̂_kk = h·(∂f̂/∂η̂_kk)/w.
+    // the marginal censored coupling (`cg.coupling`; the tail's [η, κ]-response through
+    // both the marginal mean and R̃ⱼⱼ — #646).
     let mut coupling = DVector::<f64>::zeros(n_st);
     for kk in 0..n_st {
         let mut pk = DVector::<f64>::zeros(nq);

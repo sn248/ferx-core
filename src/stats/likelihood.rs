@@ -1125,9 +1125,11 @@ pub fn foce_subject_nll_standard(
     // `f0 = f(η̂) − Hη̂` and the marginal variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰ⱼ` (#646).
     // This keeps FOCE a consistent Sheiner–Beal (linearized-marginal) objective —
     // matching Monolix's linearization likelihood and first-order/Tobit theory —
-    // in contrast to FOCEI (`foce_subject_nll_interaction`), a conditional Laplace
-    // method whose censored term stays at the conditional `f(η̂)`/`R⁰` and instead
-    // folds the censored curvature into `H̃` (see `cens_hess`, #486).
+    // in contrast to FOCEI (`foce_subject_nll_interaction`), a *conditional* first-order
+    // method whose censored term stays at the conditional `f(η̂)`/`R⁰` and instead folds
+    // the censored curvature into `H̃` (see `cens_hess`, #486) — the same conditional
+    // treatment NONMEM's LAPLACE M3 uses, at FOCEI Gauss-Newton order (dropping the
+    // `∂²f/∂η²` term full Laplace keeps).
     let m3 = matches!(bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let quant: Vec<usize> = if m3 {
         (0..n_obs)

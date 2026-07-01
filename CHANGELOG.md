@@ -39,8 +39,9 @@ section of the SDLC for the versioning policy).
   gradient is updated to match, including a new direct Ω-gradient channel for the censored
   variance, on both the non-IOV and IOV paths. **FOCE M3 OFV and estimates shift** (most
   when between-subject variance is large, where `HΩHᵀ` dominates `R⁰`). FOCEI M3 keeps the
-  conditional censored term (the one that matches NONMEM `METHOD=1 LAPLACE`, which is the
-  only way NONMEM runs M3).
+  conditional censored term — the treatment NONMEM's `METHOD=1 LAPLACE` M3 uses (NONMEM
+  runs M3 only under LAPLACE), which ferx's first-order FOCEI matches up to the
+  FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get

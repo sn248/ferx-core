@@ -5402,6 +5402,100 @@ mod tests {
         run_packed_check_foce(&model, &[5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.0]);
     }
 
+    // 1-cpt IV ODE with a parameter-dependent `init(central) = BASE/V` baseline + a finite
+    // infusion — a headline `init` composition (#486). Exercises the full FOCE packed gradient
+    // `[θ, Ω, σ]` end to end: the analytic init impulse (seeded on the event-driven walk and
+    // decayed under the infusion forcing) must survive the outer θ/Ω/σ assembly and match a
+    // Richardson-reconverged FD of ferx's FOCE OFV.
+    const IV_INIT_INFUSION: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVBASE(300.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_BASE ~ 0.04
+  sigma PROP ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BASE = TVBASE * exp(ETA_BASE)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = -CL/V * central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method     = foce
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    #[test]
+    fn population_packed_gradient_foce_init_infusion_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+        let model = parse_model_string(IV_INIT_INFUSION).expect("parse init+infusion");
+        let theta = vec![1.0, 20.0, 300.0];
+        // Two subjects, each dosed by a finite IV infusion (rate 25 → 4 h window) on top of the
+        // init baseline; obs straddle the infusion end.
+        let mk = |times: &[f64]| -> Subject {
+            let mut s = subject_with_obs(&model, &theta, times);
+            s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)];
+            assert!(s.doses[0].is_infusion());
+            let eta_ref = [0.12, -0.08, 0.15];
+            let preds = crate::pk::compute_predictions_with_tv(&model, &s, &theta, &eta_ref);
+            s.observations = preds.iter().map(|p| p * 0.85).collect();
+            s
+        };
+        let pop = Population {
+            subjects: vec![
+                mk(&[1.0, 2.0, 4.0, 6.0, 10.0]),
+                mk(&[0.5, 3.0, 5.0, 8.0, 24.0]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let mut template = model.default_params.clone();
+        template.theta = theta.clone();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, &params)))
+            .collect();
+        let analytic =
+            population_gradient_sens_foce(&model, &pop, &template, &x, &ehs).expect("supported");
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| marginal_nll_foce(&model, s, &p))
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 3e-3, epsilon = 1e-5);
+        }
+    }
+
     // --- Eq. 48 EBE warm-start predictor: is it correct & better than plain warm? ---
 
     /// The Eq. 48 predictor `η⁰ = η̂_prev + (dη̂/dx)·Δx` is a first-order Taylor

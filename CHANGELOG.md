@@ -64,6 +64,19 @@ section of the SDLC for the versioning policy).
   moving infusion-end flows through the steady-state trough exactly as it does through the
   current pulse. Validated against finite differences of the production predictor and against
   the independently NONMEM-anchored ODE steady-state modeled-dose twin.
+- **Initial conditions (`init(...)` / `[initial_conditions]`) are now fully analytic on the
+  FOCE/FOCEI sensitivity gradient** — every remaining combination that previously fell back to
+  finite differences is closed (#486). A parameter-dependent baseline (e.g. an indirect-response
+  or disease-progression PD baseline, `init(central) = BASE/V`) now gets exact analytic
+  gradients when combined with: a finite infusion, a built-in input-rate forcing
+  (igd/transit/weibull/`first_order`/`zero_order`), an estimated lagtime, steady-state dosing, a
+  modeled-duration/rate dose, and an EVID 3/4 reset — on the ODE event-driven walk; the
+  closed-form (1-/2-/3-cpt) `init` baseline on the time-varying-covariate walk; and `init`
+  **under IOV** on both engines (the amount stays BSV-only while the decay kernel follows each
+  occasion's clearance, matching `predict_iov`). Previously `init` was analytic only on the
+  closed-form dose-superposition path (#527) and the ODE plain-bolus TV-cov subset (#649);
+  everything else finite-differenced. Fits are unchanged — only the gradient path is now exact
+  (and faster) for these models.
 - **Zero-order absorption (`zero_order(dur)`, and the `zero_order` leg of a `mixed` model)
   combined with time-varying covariates or an estimated lagtime** now gets exact analytic
   FOCE/FOCEI sensitivities on the ODE event-driven walk instead of finite differences

@@ -582,29 +582,45 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // as on the static walk — so there is no longer any dropped forcing to guard against.
     // `init(...)` initial conditions are seeded on the event-driven walk at the subject's
     // first-record covariate snapshot (`tvcov_init_state`, matching production's `init_pk`),
-    // so a TV-cov + `init(...)` **bolus** subject is analytic on both loops (#486). It stays
-    // on FD when combined with a feature whose saltation / equilibration / forcing branch was
-    // written for a **zero baseline** and is not yet validated against a parameter-dependent
-    // `init` seed — the analytic scope matches what the FD-vs-production tests cover:
-    //   • an EVID 3/4 **reset** — production re-seeds `init` at the reset-event snapshot
-    //     (`last_pk`), whereas the walk carries one subject-level init jet;
-    //   • an estimated **lagtime** — the dose-arrival saltation branch assumes `x⁻ = 0`;
-    //   • a **finite infusion** — the `active_infusions` accumulation isn't checked against
-    //     a non-zero baseline;
-    //   • a built-in **input-rate forcing** (igd/transit/weibull/first_order, #643);
-    //   • **steady-state** — the dual SS equilibration seeds from zero, not `init`;
-    //   • a **modeled-duration/rate dose** (#530 moving-window saltation).
-    // Each is a genuine analytic-scope extension behind its own validation (#486 follow-up).
-    if ode.init_fn.is_some()
-        && (!subject.reset_times.is_empty()
-            || model.has_lagtime()
-            || !ode.input_rate.is_empty()
-            || subject.has_periodic_ss_dose()
-            || !subject.all_doses_fixed()
-            || subject.doses.iter().any(|d| d.is_infusion()))
-    {
-        return false;
-    }
+    // so a TV-cov + `init(...)` **bolus** subject is analytic on both loops (#649). As of #486
+    // `init(...)` is **fully analytic** on this non-IOV event-driven walk — it composes with
+    // every dosing feature the walk carries (finite infusion, estimated lagtime, built-in
+    // input-rate forcing, steady-state, modeled-duration/rate dose, and EVID 3/4 reset), each
+    // validated by an FD-vs-production test (below). The one-line summary of why each is safe:
+    // A **finite infusion** now composes with `init` (#486): the walk seeds `init_state` and
+    // then accumulates the `active_infusions` forcing on top of the running (init-derived)
+    // state — the forcing is a `du/dt` additive term with no zero-baseline assumption, so the
+    // analytic gradient already matches FD-of-production on a non-zero baseline (validated by
+    // `ode_provider_tvcov_init_infusion_matches_production`).
+    // An estimated **lagtime** also composes with `init` (#486): the dose-arrival saltation
+    // reads the *actual* pre-arrival state `x⁻ = u` (the decaying `init` baseline) and its
+    // velocity `g(x⁻)` — the "`x⁻ = 0` first-dose reduction" in the comment there is only a
+    // reduction, not an assumption, so a non-zero `init` baseline flows through the saltation
+    // unchanged (validated by `ode_provider_tvcov_init_lagtime_matches_production`).
+    // A **modeled-duration/rate dose** (`RATE=-1/-2`) also composes with `init` (#486): the
+    // moving infusion-end boundary is carried by the rate-off saltation reading the live
+    // `inf_eff` jet, on top of the init-seeded running state — no zero-baseline assumption
+    // (validated by `ode_provider_tvcov_init_modeled_duration_matches_production`; the
+    // slot-presence invariant below still guards an undeclared `D{cmt}`/`R{cmt}`).
+    // A built-in **input-rate forcing** also composes with `init` (#486). For continuous kinds
+    // (igd/transit/weibull/first_order) `add_prepared_input_rate_forcing` adds `R_in(tad)` to
+    // `du/dt` on top of the init-seeded running state; for `ZeroOrder` (now carried on this walk
+    // since #653) the per-segment constant `active_zero` channel delivers `F·amt·frac/dur` and
+    // the moving-end rate-off saltation reads the same running state. Both are orthogonal to the
+    // starting-state offset (validated by `ode_provider_tvcov_init_input_rate_matches_production`
+    // and `ode_provider_tvcov_init_zero_order_matches_production`).
+    // **Steady-state** also composes with `init` (#486): production's `equilibrate_ss_state`
+    // seeds the SS trough from zero and *overwrites* the whole state at the SS dose, discarding
+    // `init` there — so the dual `equilibrate_ss_state_g` (which also seeds from zero) matches
+    // it; `init` only affects the pre-SS-dose segments, which the walk carries via `init_state`
+    // (validated by `ode_provider_tvcov_init_ss_matches_production`).
+    // An EVID 3/4 **reset** also composes with `init` (#486): production re-applies
+    // `init(&last_pk.values)` at each reset, and the `K_RESET` branch of `integrate_tvcov_g`
+    // now mirrors that by re-seeding the state from the reset-event snapshot (via the shared
+    // `init_taylor_seed_at`, carrying `∂init/∂(θ,η)` at that snapshot) instead of zeroing —
+    // validated by `ode_provider_tvcov_init_reset_matches_production`.
+    // With A–F all composing, `init(...)` is fully analytic on the non-IOV event-driven walk;
+    // no per-feature FD clause remains here (IOV is gated separately in `ode_iov_supported`).
     // #530: modeled-`RATE`/duration doses are resolved from their PK slot as a live jet
     // inside the walk (`inf_eff` reads `pk_at_dose[k][slot]`), so the moving infusion-end
     // boundary is analytic via the rate-off saltation. Modeled-dose × steady-state IS now
@@ -788,9 +804,14 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     {
         return false;
     }
-    if ode.init_fn.is_some() {
-        return false;
-    }
+    // `init(...)` initial conditions are analytic on the ODE IOV walk too (#486): the IOV
+    // outer/inner (`run_subject_iov` / `_eta`) run through the SAME `integrate_tvcov_readout`
+    // the non-IOV walk uses, which seeds `init` via `tvcov_init_state` at the first-record
+    // snapshot and re-seeds it at each EVID 3/4 reset. Because that snapshot's PK duals carry
+    // the stacked `(θ, η_bsv, κ)` jets, the Taylor seed's deltas fold `∂init/∂κ` into the
+    // correct occasion axis with no IOV-specific seeding code — a κ-coupled baseline
+    // (`init(central) = C0·exp(η + κ)`) lands its derivative on the right axis. Validated by
+    // `ode_iov_init_provider_matches_fd_of_predict_iov`.
     // The η/θ/κ chain evaluates the individual-parameter program over the **combined**
     // `(θ, η_bsv, κ)` axes (`n_eff = n_eta + n_kappa`); require it present with matching
     // axes and a program-eval width within the dispatch table. (The per-subject stacked
@@ -1397,7 +1418,28 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
         Some(p) => p,
         None => return vec![T::from_f64(0.0); n_states],
     };
+    init_taylor_seed_at::<T>(init_fn, snap, pk_indices, n_states)
+}
 
+/// Seed the ODE `init(...)` state on the walk's own dual basis from a **given** PK-param
+/// snapshot `snap` (already seeded on `(θ, η[, κ])`), as a second-order Taylor of `init` in the
+/// PK params about `snap.val()`. Shared by [`tvcov_init_state`] (which selects the first-record
+/// snapshot, production's `init_pk`) and the event-driven walk's **EVID 3/4 reset** re-seed
+/// (which uses the reset-event snapshot — production's `last_pk`, #486): production re-applies
+/// `init(&last_pk.values)` at each reset, so the dual walk must rebuild the seed from the params
+/// in effect there, not carry the one subject-level jet.
+///
+/// The `∂init/∂p` derivatives come from the shared [`init_fd_derivs`] stencil. Each delta
+/// `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η[/κ] jet, so `T`'s own product rule
+/// propagates it to the walk basis exactly. A `Dual1` inner walk (`T::SECOND_ORDER == false`)
+/// **skips the second-order block and term entirely** — its ε² is zero, so the quadratic term
+/// contributes nothing — leaving the same first-order gradient the `Dual2` outer walk carries.
+fn init_taylor_seed_at<T: crate::sens::num::PkNum>(
+    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
+    snap: &[T],
+    pk_indices: &[usize],
+    n_states: usize,
+) -> Vec<T> {
     // Central FD of `init_fn` at that snapshot via the shared stencil. The inner `Dual1`
     // walk (`T::SECOND_ORDER == false`) discards the quadratic term, so skip the `d2` block
     // entirely there rather than build a Hessian it drops.
@@ -2087,6 +2129,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         pk_at_pk_only,
         &f_bio_at_dose,
         &init_state,
+        &model.pk_indices,
         first_dose_time,
         &dose_lag_slot,
         &dose_modeled_slot,
@@ -3697,6 +3740,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     pk_at_pk_only: &[Vec<T>],
     f_bio_at_dose: &[T],
     init_state: &[T],
+    // Differentiated PK slots, for re-seeding `init(...)` at an EVID 3/4 reset (#486). Only
+    // read when `ode.init_fn` is present; a no-`init` model zeros the state at a reset as before.
+    pk_indices: &[usize],
     first_dose_time: f64,
     dose_lag_slot: &[usize],
     dose_modeled_slot: &[Option<(crate::types::RateMode, usize)>],
@@ -3971,6 +4017,23 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     }
 
     let mut cur_t = tl[0].0;
+    // With an `init(...)` baseline the state is non-zero from the subject's true integration
+    // start (`subject_integration_start`, the earliest *record* time). If the first timeline
+    // event is later — e.g. a lagged first dose (whose event sits at `d.time + lag`) with a
+    // pre-arrival observation, or any pre-dose observation — the init baseline must first decay
+    // over the `[start, first_event]` gap, exactly as production's dense walk does (it always
+    // starts at `subject_integration_start`). Without this the pre-event obs reads the
+    // *undecayed* seed and every later segment inherits the wrong baseline. Gated on
+    // `init_fn`: with a zero baseline the gap integrates 0 → 0 (no dose is active before its
+    // own arrival), so the non-init walk is byte-identical. The first event's own segment
+    // `[start, t_event]` then integrates with that event's end-of-interval params, matching the
+    // convention every other segment uses.
+    if ode.init_fn.is_some() {
+        let start = crate::ode::predictions::subject_integration_start(subject);
+        if start.is_finite() && start < cur_t {
+            cur_t = start;
+        }
+    }
     let mut u = init_state.to_vec();
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
@@ -4844,14 +4907,26 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 }
             }
         } else {
-            // EVID 3/4 reset: zero every compartment's full jet (post-reset state is 0
-            // independent of the parameters, so its sensitivity is 0 too). `ode_tvcov_supported`
-            // routes `init(...)` + reset to FD, so whenever a reset fires here `init(...)` is
-            // absent and the reset baseline is zero (matches production's `initial_state` with
-            // no init). For EVID=4 the same-time dose sorts after the reset (`K_RESET < K_DOSE`),
-            // so it lands on the zeroed state.
-            for x in u.iter_mut() {
-                *x = T::from_f64(0.0);
+            // EVID 3/4 reset. Production re-applies the initial conditions here —
+            // `u = ode.initial_state(&last_pk.values)` — which restores each `init(...)`
+            // compartment to its value evaluated with the params in effect at the reset
+            // (`last_pk`) and zeros every compartment without an `init`. Mirror that on the dual
+            // walk (#486): with an `init(...)` present, re-seed the state from the reset-event
+            // snapshot via the shared Taylor seed — `params` is `last_params` for a `K_RESET`
+            // event (the `_` arm of the segment-params match), i.e. the most-recent record's PK,
+            // matching production's `last_pk` — so the post-reset jet carries the correct
+            // `∂init/∂(θ,η)` at *that* snapshot rather than the subject-level first-record seed.
+            // With no `init(...)` the seed's `base`/derivatives are all zero, so this reduces to
+            // the previous "zero every compartment" behaviour (byte-identical). For EVID=4 the
+            // same-time dose sorts after the reset (`K_RESET < K_DOSE`), so it lands on the
+            // re-seeded state.
+            match ode.init_fn.as_ref() {
+                Some(f) => u = init_taylor_seed_at::<T>(f.as_ref(), params, pk_indices, n_states),
+                None => {
+                    for x in u.iter_mut() {
+                        *x = T::from_f64(0.0);
+                    }
+                }
             }
             // Turn off any infusion that started before this reset (matches production's
             // `reset_floor`) — the active-set filter and the rate-off saltation below both
@@ -5716,6 +5791,93 @@ mod tests {
     /// production predictor, so the δlag² saltation coefficients (the rate-boundary `coef2`
     /// and the bolus `jg_cross` cross term) get no independent 2nd-order check otherwise
     /// (#472 review round 2 #3/#4).
+    /// Validate the analytic 2nd-order blocks (`d2f_deta2`, `d2f_deta_dtheta`) against
+    /// **double central finite differences of the production predictor** — the ground-truth
+    /// Hessian, not the self-FD of the analytic gradient. This is the check the #486
+    /// init-composition scope needs: a small Hessian element sitting between large neighbours
+    /// (e.g. `∂²f/∂η_V²` crossing zero mid-window for an `init = BASE/V` decay) makes the
+    /// he=1e-6 self-FD of `check_hessian_vs_fd_of_grad` catastrophically cancel, even though
+    /// the analytic Hessian is exact — double-FD of the predictor with an absolute floor is
+    /// robust there. The `epsilon` floor (`5e-3`) only relaxes elements whose magnitude is
+    /// below it (where a 4-point stencil is dominated by its own truncation/solver noise); a
+    /// genuinely wrong large element is still caught by `max_relative`.
+    fn check_hessian_vs_production_fd(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) {
+        let n_eta = model.n_eta;
+        let n_theta = model.n_theta;
+        let base = ode_subject_sensitivities(model, subject, theta, eta).expect("supported");
+        let pred = |e: &[f64], th: &[f64], j: usize| -> f64 {
+            compute_predictions_with_tv(model, subject, th, e)[j]
+        };
+        let h = 1e-4;
+        // ∂²f/∂η_k∂η_p via a 4-point cross stencil.
+        for p in 0..n_eta {
+            for (j, o) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let mut epp = eta.to_vec();
+                    epp[k] += h;
+                    epp[p] += h;
+                    let mut epm = eta.to_vec();
+                    epm[k] += h;
+                    epm[p] -= h;
+                    let mut emp = eta.to_vec();
+                    emp[k] -= h;
+                    emp[p] += h;
+                    let mut emm = eta.to_vec();
+                    emm[k] -= h;
+                    emm[p] -= h;
+                    let fd = (pred(&epp, theta, j) - pred(&epm, theta, j) - pred(&emp, theta, j)
+                        + pred(&emm, theta, j))
+                        / (4.0 * h * h);
+                    approx::assert_relative_eq!(
+                        o.d2f_deta2[k * n_eta + p],
+                        fd,
+                        max_relative = 5e-3,
+                        epsilon = 5e-3
+                    );
+                }
+            }
+        }
+        // ∂²f/∂η_k∂θ_m via a 4-point cross stencil.
+        for m in 0..n_theta {
+            let sm = h * (1.0 + theta[m].abs());
+            for (j, o) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let mut epp = eta.to_vec();
+                    epp[k] += h;
+                    let mut tp = theta.to_vec();
+                    tp[m] += sm;
+                    let mut epm = eta.to_vec();
+                    epm[k] += h;
+                    let mut tm = theta.to_vec();
+                    tm[m] -= sm;
+                    let fd = (pred(&epp, &tp, j)
+                        - pred(&epp, &tm, j)
+                        - pred(&emm_eta(eta, k, h), &tp, j)
+                        + pred(&emm_eta(eta, k, h), &tm, j))
+                        / (4.0 * h * sm);
+                    approx::assert_relative_eq!(
+                        o.d2f_deta_dtheta[k * n_theta + m],
+                        fd,
+                        max_relative = 5e-3,
+                        epsilon = 5e-3
+                    );
+                }
+            }
+        }
+    }
+
+    /// `eta` with `eta[k] -= h` (helper for the mixed η×θ stencil above).
+    fn emm_eta(eta: &[f64], k: usize, h: f64) -> Vec<f64> {
+        let mut e = eta.to_vec();
+        e[k] -= h;
+        e
+    }
+
     fn check_hessian_vs_fd_of_grad(
         model: &CompiledModel,
         subject: &Subject,
@@ -8432,15 +8594,14 @@ mod tests {
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
-    /// TV-cov + `init(...)` is admitted only for the validated **plain-bolus** scope (#486).
-    /// Combining `init(...)` with a feature whose saltation / equilibration / forcing branch
-    /// was written for a zero baseline — an EVID 3/4 reset, an estimated lagtime, a finite
-    /// infusion, a built-in input-rate forcing, steady-state, or a modeled-duration/rate dose
-    /// — routes to FD until each is separately validated. The two cases constructible from the
-    /// bolus fixture (reset, finite infusion) are pinned here; the rest share the same gate
-    /// clause in `ode_tvcov_supported`.
+    /// TV-cov + `init(...)` analytic scope (#486): `init(...)` is **fully analytic** on the
+    /// non-IOV event-driven walk — it composes with a finite infusion, an EVID 3/4 reset, and
+    /// (via their own model fixtures) lagtime / input-rate / SS / modeled-dose. This pins the
+    /// two compositions constructible from the plain bolus fixture (infusion, reset), which
+    /// previously routed to FD; the others are validated by their dedicated
+    /// `ode_provider_tvcov_init_*_matches_production` tests.
     #[test]
-    fn ode_tvcov_init_unvalidated_compositions_route_to_fd() {
+    fn ode_tvcov_init_compositions_are_analytic() {
         let model = parse_model_string(TVCOV_INIT_ODE).expect("parse");
         // Baseline: plain-bolus TV-cov + init is analytic.
         assert!(
@@ -8448,25 +8609,391 @@ mod tests {
             "init + bolus is analytic"
         );
 
-        // + EVID 3/4 reset → FD (production re-seeds init at the reset-event snapshot).
+        // + finite infusion → analytic (#486): the walk seeds init and adds the infusion
+        // forcing on top of the running state.
         let mut s = tvcov_subject();
-        s.reset_times = vec![4.0];
-        assert!(
-            !ode_tvcov_supported(&model, &s),
-            "init + EVID 3/4 reset must route to FD"
-        );
-
-        // + finite infusion → FD (active_infusions accumulation unvalidated vs a non-zero baseline).
-        let mut s = tvcov_subject();
-        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 5.0, false, 0.0)];
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0)];
         assert!(
             s.doses[0].is_infusion(),
             "fixture must be a finite infusion"
         );
         assert!(
-            !ode_tvcov_supported(&model, &s),
-            "init + finite infusion must route to FD"
+            ode_tvcov_supported(&model, &s),
+            "init + finite infusion is analytic (#486)"
         );
+
+        // + EVID 3/4 reset → analytic (#486): the K_RESET branch re-seeds init at the
+        // reset-event snapshot (matching production's `initial_state(&last_pk.values)`).
+        let mut s = tvcov_subject();
+        s.reset_times = vec![4.0];
+        assert!(
+            ode_tvcov_supported(&model, &s),
+            "init + EVID 3/4 reset is analytic (#486)"
+        );
+    }
+
+    // Tight-tolerance twin of `TVCOV_INIT_ODE` for the infusion branch: the `1e-11`/`1e-13`
+    // solver tolerance keeps the Dual2 Hessian's value-controlled step error far below the
+    // `2e-3` FD-of-gradient check. `F = 1` (bare slot), so the infusion is a fixed-boundary
+    // rate-defined window (`amt/rate`) — the branch-A question (does the forcing accumulate
+    // correctly on a non-zero init baseline?) without the rate-defined-under-`F` moving
+    // boundary, which is a separate (#419) mechanism.
+    const TVCOV_INIT_INF_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V    = TVV * exp(ETA_V)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = -CL/V * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
+    /// **TV-cov + `init(...)` + finite infusion** (#486, branch A). A 5 h IV infusion
+    /// (amt 100, rate 20, `F = 1`) into the init-seeded `central` compartment, under a WT
+    /// covariate that makes CL time-varying. The walk seeds `init(central) = BASE/V` and then
+    /// accumulates the `rate` forcing over the infusion window on top of that non-zero running
+    /// state — so the analytic `SubjectSens` (value, `∂f/∂(θ,η)`, both Hessian blocks) must
+    /// match FD of the production TV-cov predictor, and the light inner `Dual1` walk must match
+    /// the outer `Dual2` walk. Confirms the forcing branch carries no zero-baseline assumption.
+    #[test]
+    fn ode_provider_tvcov_init_infusion_matches_production() {
+        let model = parse_model_string(TVCOV_INIT_INF_ODE).expect("parse");
+        assert_eq!(model.n_theta, 4);
+        assert_eq!(model.n_eta, 2);
+        let mut subject = tvcov_subject(); // obs at 1,2,4,8; infusion runs [0,5]
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0)];
+        assert!(
+            subject.doses[0].is_infusion(),
+            "fixture must be an infusion"
+        );
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "TV-cov + init + infusion must be analytic (#486)"
+        );
+        let theta = vec![1.0, 20.0, 0.75, 500.0];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    // 1-cpt IV with an estimated lagtime carrying IIV and an `init(central) = BASE/V` baseline.
+    // The lagged bolus arrives at `t + lag`; before arrival the compartment decays from `init`,
+    // so the dose-arrival saltation's pre-arrival state `x⁻` is the *non-zero* init baseline.
+    // `CL` carries IIV (so the init decay — hence `x⁻` and its velocity `g(x⁻)`) depends on
+    // `ETA_CL`), and `LAGTIME` carries IIV (so the saltation's `∂/∂η_LAG` fires). Tight
+    // tolerance so the FD-of-predict Hessian check is clean.
+    const ONECPT_IV_LAG_INIT_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  LAGTIME = TVLAG * exp(ETA_LAG)
+  BASE    = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central) = -CL/V * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
+    /// **`init(...)` + estimated lagtime** (#486, branch C). A lagged bolus (arrives at
+    /// `t + lag ≈ 0.5`) on top of an `init(central) = BASE/V` decaying baseline. The obs at
+    /// t=0.25 sits in the pre-arrival window (pure init decay), the rest after arrival. The
+    /// dose-arrival saltation must use the actual pre-arrival state `x⁻ = u` (the init
+    /// baseline) and its velocity — validated at all orders against FD of the production
+    /// predictor, plus inner/outer parity. Confirms the saltation makes no zero-baseline
+    /// assumption.
+    #[test]
+    fn ode_provider_tvcov_init_lagtime_matches_production() {
+        let model = parse_model_string(ONECPT_IV_LAG_INIT_ODE).expect("parse");
+        assert!(model.has_lagtime());
+        let subject = bolus_subject(&[0.25, 1.0, 2.0, 4.0]);
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "init + lagtime must be analytic on the event-driven walk (#486)"
+        );
+        let theta = vec![1.0, 20.0, 0.5, 500.0];
+        let eta = vec![0.1, 0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// **`init(...)` + modeled-duration dose** (#486, branch E). A `RATE=-2` / `D1`-modeled
+    /// infusion (window `[0, D1]`, moving boundary in `D1 = TVD1·exp(ETA_D1)`) delivering into
+    /// an `init(central) = BASE/V` compartment. The moving infusion-end saltation reads the
+    /// live `inf_eff` `D1` jet on top of the init-seeded running state; obs straddle the window
+    /// end (`D1 = 5`: t=1,3 inside; t=6,10 after). Validated at all orders against FD of the
+    /// production predictor (which resolves `D1` per evaluation), plus inner/outer parity.
+    #[test]
+    fn ode_provider_tvcov_init_modeled_duration_matches_production() {
+        const MODELED_DUR_INIT_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  theta TVBASE(200.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  D1   = TVD1 * exp(ETA_D1)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central) = -CL/V * central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let model = parse_model_string(MODELED_DUR_INIT_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 10.0]);
+        subject.doses = vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            false,
+            0.0,
+            crate::types::RateMode::ModeledDuration,
+        )];
+        assert!(
+            ode_tvcov_supported(&model, &subject) && !ode_subject_supported(&model, &subject),
+            "init + modeled-duration dose must route to the event-driven walk (#486)"
+        );
+        let theta = vec![5.0, 50.0, 5.0, 200.0];
+        let eta = vec![0.12, -0.08];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// **`init(...)` + built-in `first_order` input-rate forcing + TV-cov** (#486, branch B).
+    /// A first-order absorption forcing `R_in = KA·(dose remaining)` feeds `central`, which also
+    /// carries an `init(central) = BASE/V` baseline; a WT covariate on CL makes the subject
+    /// time-varying (forcing the event-driven walk). `add_prepared_input_rate_forcing` adds
+    /// `R_in(tad)` to `du/dt` on top of the init-seeded state — validated at all orders against
+    /// FD of the production predictor, plus inner/outer parity.
+    #[test]
+    fn ode_provider_tvcov_init_input_rate_matches_production() {
+        const FIRST_ORDER_INIT_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.0, 0.05, 10.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_KA ~ 0.05
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA * exp(ETA_KA)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = first_order(ka=KA) - CL/V * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let model = parse_model_string(FIRST_ORDER_INIT_TVCOV_ODE).expect("parse");
+        assert!(!model.ode_spec.as_ref().unwrap().input_rate.is_empty());
+        let subject = tvcov_subject(); // WT covariate → TV-cov; obs at 1,2,4,8
+        assert!(subject.has_tv_covariates());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "init + input-rate forcing + TV-cov must be analytic (#486)"
+        );
+        let theta = vec![1.0, 20.0, 1.0, 0.75, 500.0];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// **`init(...)` + `zero_order` absorption + TV-cov** (#486, branch B). `zero_order` was
+    /// ported to the event-driven walk by #653; with `init` its per-segment constant `active_zero`
+    /// delivery (`F·amt·frac/DUR` over `[dose, dose+DUR]`, moving end in `DUR`) rides on top of the
+    /// init-seeded state, and the moving-end rate-off saltation reads that running state. A WT
+    /// covariate makes the subject TV-cov. Obs straddle the window end (`DUR=4`). Validated at all
+    /// orders against FD of production, plus inner/outer parity.
+    #[test]
+    fn ode_provider_tvcov_init_zero_order_matches_production() {
+        const ZERO_ORDER_INIT_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  theta TVBASE(2000.0, 10.0, 50000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V    = TVV
+  DUR  = TVDUR * exp(ETA_DUR)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let model = parse_model_string(ZERO_ORDER_INIT_TVCOV_ODE).expect("parse");
+        let mut subject = tvcov_subject(); // WT covariate → TV-cov
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        assert!(subject.has_tv_covariates());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "init + zero_order + TV-cov must be analytic (#486/#653)"
+        );
+        let theta = vec![5.0, 50.0, 4.0, 0.75, 2000.0];
+        let eta = vec![0.12, -0.08];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// **`init(...)` + steady-state dose** (#486, branch D). Production's `equilibrate_ss_state`
+    /// seeds the SS trough from zero and *overwrites the whole state* at the SS dose — so it
+    /// discards `init` there, exactly as the dual `equilibrate_ss_state_g` does. `init` therefore
+    /// only affects the **pre-SS-dose** segments: here the SS bolus is at t=5 (`II=12`), with obs
+    /// at t=1,2 in the pre-dose window reading the decaying `init(central) = BASE/V` baseline
+    /// (their `∂/∂(θ,η)` carry the init seed's derivatives) and obs at t=8,14 reading the SS
+    /// decay (init-independent). The walk seeds `init_state`, decays it from the true integration
+    /// start (t=0) to t=5, then overwrites at the SS dose — matching production at all orders.
+    #[test]
+    fn ode_provider_tvcov_init_ss_matches_production() {
+        const ONECPT_IV_SS_INIT_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV * exp(ETA_V)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = -CL/V * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let model = parse_model_string(ONECPT_IV_SS_INIT_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 2.0, 8.0, 14.0]);
+        // SS bolus at t=5, II=12: obs at 1,2 are pre-dose (init decay); 8,14 read the SS decay.
+        subject.doses = vec![DoseEvent::new(5.0, 100.0, 1, 0.0, true, 12.0)];
+        assert!(
+            subject.has_periodic_ss_dose(),
+            "fixture must be a periodic SS dose"
+        );
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "init + steady-state must be analytic on the event-driven walk (#486)"
+        );
+        let theta = vec![1.0, 20.0, 500.0];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// **`init(...)` + EVID 3/4 reset** (#486, branch F). Production re-applies
+    /// `init(&last_pk.values)` at each reset (the `K_RESET` branch re-seeds the state from the
+    /// reset-event snapshot rather than zeroing). Here an `init(central) = BASE/V` model under a
+    /// WT covariate (TV-cov, so the reset-time snapshot differs from the first-record one) takes
+    /// a bolus at t=0, a reset at t=4 (which restores the init baseline), and a second bolus at
+    /// t=5. Obs at t=2 (pre-reset decay), t=4.5 (post-reset init baseline, pre-2nd-dose), and
+    /// t=8,12 (2nd-dose decay on the re-seeded baseline). The re-seeded jet must carry
+    /// `∂init/∂(θ,η)` at the reset snapshot — validated at all orders against FD of production,
+    /// plus inner/outer parity.
+    #[test]
+    fn ode_provider_tvcov_init_reset_matches_production() {
+        let model = parse_model_string(TVCOV_INIT_ODE).expect("parse");
+        // tvcov_subject has a WT covariate (TV-cov) and a bolus at t=0. Add a reset + 2nd dose,
+        // and place obs around the reset. obs_covariates must match obs_times length.
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let mut subject = tvcov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.dose_covariates = vec![wt(60.0), wt(85.0)];
+        subject.obs_times = vec![2.0, 4.5, 8.0, 12.0];
+        subject.obs_covariates = vec![wt(65.0), wt(75.0), wt(80.0), wt(90.0)];
+        subject.observations = vec![1.0; 4];
+        subject.obs_cmts = vec![1; 4];
+        subject.cens = vec![0; 4];
+        subject.occasions = vec![1; 4];
+        subject.reset_times = vec![4.0];
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "init + reset must be analytic on the event-driven walk (#486)"
+        );
+        let theta = vec![1.0, 20.0, 0.75, 500.0];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     /// **Estimated lagtime × time-varying covariates.** A 1-cpt oral ODE with a WT

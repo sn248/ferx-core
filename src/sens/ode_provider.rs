@@ -335,12 +335,31 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // production's `DoseAttrMap::f_bio`, so the analytic gradient carries `∂/∂F{cmt}`
     // exactly. Both indexed slots are ordinary individual parameters seeded in
     // `params_dual` like any other — so lagtime and indexed-`F` compose.
-    // BUT lagtime + a built-in absorption **input rate** (`igd`/`weibull`/`transit`) is
-    // out of scope: an estimated lagtime forces the event-driven walk (`integrate_tvcov_g`),
-    // which carries no `R_in` forcing — so the input-rate absorption would silently drop
-    // from the gradient. The static walk handles the input rate but not lagtime, so the
-    // combination has no analytic walk → FD (#430 finding 1 / #472).
-    if model.has_lagtime() && !ode.input_rate.is_empty() {
+    // Lagtime + a built-in absorption **input rate** now composes on the event-driven
+    // walk (`integrate_tvcov_g`, #486): an estimated lagtime forces that walk, which
+    // now carries `R_in` — the continuous `∂R_in/∂lag` flows through the shared
+    // `add_prepared_input_rate_forcing` helper (its `tad` carries the lag jet), and
+    // the *onset* term (the forcing switching on at the dose's lagged arrival, a
+    // discontinuity in `du/dt` at that moving boundary) is injected as an exact
+    // rate-on saltation, mirroring the existing lagged-infusion rate-on injection.
+    // `InverseGaussian`'s onset vanishes for every valid `(mat, cv2)` (an essential
+    // singularity dominates); `Transit`'s vanishes for `n > 0` and is a finite
+    // `ktr·dose` jump at the degenerate `n = 0`; `FirstOrder`'s onset is always the
+    // finite `ka·dose`. `Weibull`'s onset **diverges** for shape `β < 1` (an
+    // integrable spike, not a finite jump) — no closed-form saltation exists there,
+    // so a model combining lagtime with `Weibull` stays on the FD fallback.
+    // `ZeroOrder`'s own moving-boundary cutoff is a separate mechanism (#530) not yet
+    // ported to the event-driven walk, so lagtime + `zero_order` also stays FD.
+    if model.has_lagtime()
+        && ode.input_rate.iter().any(|f| {
+            !matches!(
+                f.kind,
+                crate::pk::absorption::InputRateKind::Transit
+                    | crate::pk::absorption::InputRateKind::InverseGaussian
+                    | crate::pk::absorption::InputRateKind::FirstOrder
+            )
+        })
+    {
         return false;
     }
     // The η/θ chain evaluates the individual-parameter program over `Dual2`
@@ -401,18 +420,12 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return false;
     }
-    // Built-in absorption forcing (igd, #430) + EVID 3/4 resets: the f64 path turns
-    // off pre-reset dose tails via a `reset_floor`, which the dual forcing loop in
-    // `integrate_g` doesn't yet replicate (it sums `R_in` over every dose with
-    // `tad > 0`). Keep reset+absorption subjects on the FD fallback. This is the
-    // SHARED scope gate for both the outer θ-sensitivities and the inner η-gradient,
-    // so the inner EBE loop can't silently run an analytic no-`reset_floor` gradient
-    // while the outer correctly falls back to FD (#430 review #1).
-    if let Some(ode) = model.ode_spec.as_ref() {
-        if !ode.input_rate.is_empty() && !subject.reset_times.is_empty() {
-            return false;
-        }
-    }
+    // Built-in absorption forcing (igd/transit/weibull/etc., #430) + EVID 3/4 resets:
+    // the dual forcing loop in `integrate_g` now threads the same tracked
+    // `reset_floor` the f64 path uses, turning off a dose's pre-reset tail exactly
+    // like production's `active_infusions` (#486) — so this combination is analytic
+    // on both the outer θ-sensitivities and the inner η-gradient (the shared scope
+    // gate keeps the two in lockstep, #430 review #1).
     // Estimated lagtime always routes to the **event-driven** walk (`ode_tvcov_supported`
     // / `run_subject_tvcov`), where the per-dose event-time saltation handles it exactly
     // (uniform or per-compartment lags). The static superposition walk here assumes a
@@ -447,23 +460,6 @@ fn infusion_spans_segment(
 /// does not yet mirror. The IOV dual walk carries EVID=2 breakpoints separately since
 /// #590. Checked by *both* the outer and inner entry points so the analytic scope stays
 /// matched (#439).
-/// True when the subject has a **rate-defined steady-state infusion under bioavailability
-/// `F ≠ 1`** — the one SS-infusion case still routed to FD (its equilibration cycles would
-/// each need the `F`-scaled active window, a moving boundary not yet carried). Shared by
-/// `ode_tvcov_supported` (outer) and `ode_iov_subject_supported` (inner) so the two gates
-/// stay byte-identical and can't silently desync (#473 review #4).
-pub(crate) fn has_rate_defined_ss_infusion_under_f(
-    model: &CompiledModel,
-    subject: &Subject,
-) -> bool {
-    model.has_bioavailability()
-        && subject.doses.iter().any(|d| {
-            d.ss && d.ii > 0.0
-                && crate::ode::predictions::is_real_infusion(d)
-                && matches!(d.infusion_def, crate::types::InfusionDef::RateDefined)
-        })
-}
-
 /// Resolve a dose's modeled `RATE` to its PK slot (#530). A `RATE=-2` (`D{cmt}`) dose reads
 /// its duration slot, a `RATE=-1` (`R{cmt}`) dose its rate slot; a `Fixed` dose — or a modeled
 /// dose whose `D{cmt}`/`R{cmt}` slot is undeclared — returns `None`. Single-sourced so the
@@ -540,10 +536,25 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
-    // Built-in absorption input-rate forcing (igd, #430): the TV-cov event-driven
-    // walk (`integrate_tvcov_g`) does not carry the `R_in` forcing, so a TV-cov igd
-    // model must route to the static / FD path instead of silently dropping it.
-    if !ode.input_rate.is_empty() {
+    // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
+    // the TV-cov event-driven walk (`integrate_tvcov_g`) now carries `R_in` via the
+    // shared `add_prepared_input_rate_forcing` helper, exactly as the static walk
+    // does. A bolus dose's (lagged) arrival is a *fixed* (non-dual) boundary when
+    // there is no estimated lagtime, so the pure TV-cov case needs no saltation; the
+    // combined lagtime + input-rate saltation is gated separately by
+    // `ode_analytical_supported` (which this function calls above), so a model
+    // reaching here with both already carries only the boundary-safe kinds.
+    // `ZeroOrder`'s own moving-boundary cutoff (#530) is a *per-segment constant*
+    // delivery this walk doesn't carry (only `integrate_g`'s `zero_windows` does) —
+    // admitting it here would silently drop the forcing entirely
+    // (`add_prepared_input_rate_forcing` skips `ZeroOrder` by design, expecting the
+    // caller to deliver it separately), so a model using it stays on the FD
+    // fallback until that machinery is ported (tracked as a stretch goal, #486).
+    if ode
+        .input_rate
+        .iter()
+        .any(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
+    {
         return false;
     }
     // The bolus walk seeds compartments at zero; `init(...)` needs the seeded
@@ -553,39 +564,40 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     }
     // #530: modeled-`RATE`/duration doses are resolved from their PK slot as a live jet
     // inside the walk (`inf_eff` reads `pk_at_dose[k][slot]`), so the moving infusion-end
-    // boundary is analytic via the rate-off saltation. Decline to FD when (a) the dose is
-    // also **steady-state** (the dual SS equilibration reads a fixed per-cycle `t_inf` with
-    // no modeled-window jet yet), or (b) any modeled dose's `D{cmt}`/`R{cmt}` slot is absent
-    // — `check_model_data` rejects such a model, but if one slips past, emit FD rather than a
-    // wrong gradient (the walk's `inf_eff` would silently fall to the unresolved fixed arm).
+    // boundary is analytic via the rate-off saltation. Modeled-dose × steady-state IS now
+    // analytic too (#486): `equilibrate_ss_state_g` threads the same `inf_eff` jet into its
+    // per-cycle active/quiet split. Decline to FD only when a modeled dose's `D{cmt}`/`R{cmt}`
+    // slot is absent — `check_model_data` rejects such a model, but if one slips past, emit
+    // FD rather than a wrong gradient (the walk's `inf_eff` would silently fall to the
+    // unresolved fixed arm).
     if !subject.all_doses_fixed() {
         let attr_map = model.active_dose_attr_map();
         let all_slots_present = subject.doses.iter().all(|d| {
             matches!(d.rate_mode, crate::types::RateMode::Fixed)
                 || modeled_slot_for(attr_map, d).is_some()
         });
-        if has_ss || !all_slots_present {
+        if !all_slots_present {
             return false;
         }
     }
     // #419: a rate-defined infusion under `F ≠ 1` reshapes the *window* to `F·dur` (a
-    // moving boundary), now handled by the rate-off saltation — EXCEPT for a **steady-
-    // state** rate-defined infusion, whose equilibration cycles would each need the
-    // `F`-scaled active window (not yet carried), so route that subset to FD.
-    if has_rate_defined_ss_infusion_under_f(model, subject) {
-        return false;
-    }
+    // moving boundary) — handled by the rate-off saltation everywhere now, including a
+    // **steady-state** rate-defined infusion (#486: `equilibrate_ss_state_g`'s per-cycle
+    // active/quiet split reads the same `F`-scaled `inf_eff` window as the main walk).
     // Steady-state (`SS=1`, `II>0`) — bolus *and* infusion — is handled via the dual
     // equilibration (the SS infusion runs an active-rate window + quiet window per cycle).
-    // SS combined with an estimated **lagtime** routes to FD: the dose arrives at
-    // `t_dose + lag`, so observations in the pre-arrival window `[t_dose, t_dose + lag]`
-    // must read the *previous* interval's steady-state tail (production seeds it via
-    // `ss_state_at_phase` at the dose record time). The dual walk has no such pre-arrival
-    // seed yet, so a pre-arrival obs would silently read the empty running state — decline
-    // until that seeding lands (#472/#473 review; tracked in #481-adjacent follow-up).
-    if has_ss && model.has_lagtime() {
-        return false;
-    }
+    // SS combined with an estimated **lagtime** IS now analytic too (#486): a lagged SS dose
+    // arrives at `t_dose + lag`, so observations in the pre-arrival window
+    // `[t_dose, t_dose + lag)` must read the *previous* interval's steady-state tail — the
+    // walk seeds it via a `K_SS_SEED` timeline break at the dose record time, calling
+    // `ss_state_at_phase_g` (the dual mirror of production's `ss_state_at_phase`) at phase
+    // `II − lag`. The dose's *own* arrival still goes through the **unmodified** general
+    // lagtime saltation (`x⁻ = ` the freshly re-equilibrated trough, which carries no
+    // explicit `∂/∂lag` jet of its own): even though the trough's *value* is lag-invariant
+    // (an autonomous RHS, required below, makes the periodic recurrence anchored to the
+    // pulse, not to wall-clock arrival time), a later *fixed-absolute-time* observation's
+    // elapsed time since arrival still shifts with `lag`, and the saltation's `D·δlag` term
+    // captures exactly that — mirroring the existing `x⁻ = 0` first-dose reduction.
     // SS combined with a **non-autonomous RHS** (one that reads `TIME`/`TAFD`/`TAD`) routes
     // to FD: the SS dual equilibration expands a time-*invariant* pulse train (cycle-relative
     // time, anchor 0), so a time/TAD-dependent RHS breaks the steady-state cycle recurrence —
@@ -675,8 +687,10 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     if !ode.diffusion_var.is_empty() {
         return false;
     }
-    // The IOV walk reuses `integrate_tvcov_g`, which carries no input-rate (`R_in`)
-    // forcing, so any built-in absorption model routes to FD.
+    // `integrate_tvcov_g` now carries input-rate (`R_in`) forcing (#486), but that
+    // support has only been validated on the non-IOV event-driven walk; extending
+    // IOV to built-in absorption models is an unaudited scope expansion, not a
+    // technical limitation of the walk itself, so it still routes to FD here.
     if !ode.input_rate.is_empty() {
         return false;
     }
@@ -772,8 +786,6 @@ pub fn ode_subject_sensitivities(
     // needed here. `pk` and `pd` are each evaluated once and threaded into the drivers,
     // so neither recomputes them.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    // (reset+absorption FD fallback is enforced by the shared `ode_subject_supported`
-    // gate above, so both the outer and inner paths decline it together — #430 review #1.)
     // Individual-parameter η/θ derivatives (cheap: one dual eval, no integration).
     // Besides feeding the chain, the `∂p/∂η` rows tell us which individual parameters
     // carry IIV, which decides the dual's Hessian width.
@@ -1856,6 +1868,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
 
     let states = integrate_tvcov_g::<T>(
         program,
+        ode,
         ode.n_states,
         subject,
         pk_at_dose,
@@ -2051,9 +2064,9 @@ fn ode_iov_subject_supported(
     // `seed_pk_dual2_iov` so a `κ`-coupled modeled window — `D1 = TVD1·exp(η + κ)` —
     // lands its sensitivity in the correct stacked axis), so the moving infusion-end
     // boundary is analytic via the rate-off saltation, exactly as on the non-IOV TV-cov
-    // walk (`ode_tvcov_supported`). Decline to FD when (a) the modeled dose is also
-    // **steady-state** (the dual SS equilibration reads a fixed per-cycle `t_inf` with no
-    // modeled-window jet yet), or (b) any modeled dose's `D{cmt}`/`R{cmt}` slot is absent
+    // walk (`ode_tvcov_supported`). Modeled-dose × steady-state IS now analytic too (#486):
+    // `equilibrate_ss_state_g` threads the same `inf_eff` jet into its per-cycle active/quiet
+    // split. Decline to FD only when a modeled dose's `D{cmt}`/`R{cmt}` slot is absent
     // (`check_model_data` rejects such a model, but emit FD rather than a wrong gradient if
     // one slips past — the walk's `inf_eff` would silently fall to the unresolved fixed arm).
     if !subject.all_doses_fixed() {
@@ -2062,7 +2075,7 @@ fn ode_iov_subject_supported(
             matches!(d.rate_mode, crate::types::RateMode::Fixed)
                 || modeled_slot_for(attr_map, d).is_some()
         });
-        if has_ss || !all_slots_present {
+        if !all_slots_present {
             return None;
         }
     }
@@ -2072,18 +2085,14 @@ fn ode_iov_subject_supported(
     // this route; the event walk gets TV-cov PK params, while scaling follows the live
     // subject-static semantics (#590).
     // #419: rate-defined infusion under `F ≠ 1` is handled via the rate-off saltation
-    // (moving window boundary), except for a steady-state rate-defined infusion (the
-    // equilibration window would need to scale with `F`) → FD (shared gate, #473 review #4).
-    if has_rate_defined_ss_infusion_under_f(model, subject) {
-        return None;
-    }
-    // Steady-state (bolus and infusion) is handled via the dual equilibration; the #419
-    // rate-defined-under-F case is excluded above. SS combined with an estimated lagtime
-    // routes to FD (the pre-arrival SS-tail seed is not yet carried by the dual walk —
-    // mirrors `ode_tvcov_supported`, #472/#473 review).
-    if has_ss && model.has_lagtime() {
-        return None;
-    }
+    // (moving window boundary) — including a steady-state rate-defined infusion (#486:
+    // `equilibrate_ss_state_g`'s per-cycle active/quiet split reads the same `F`-scaled
+    // `inf_eff` window as the main walk).
+    // Steady-state (bolus and infusion) is handled via the dual equilibration. SS combined
+    // with an estimated lagtime IS now analytic too (mirrors `ode_tvcov_supported`, #486):
+    // the shared `integrate_tvcov_g` walk carries the `K_SS_SEED` pre-arrival seed, and the
+    // dose's own arrival still goes through the unmodified general lagtime saltation,
+    // regardless of outer/IOV dispatch.
     // SS combined with a non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) → FD: the SS
     // equilibration assumes a time-invariant pulse train, so the cycle recurrence breaks
     // (mirrors `ode_tvcov_supported`, #473 review #1).
@@ -2942,6 +2951,16 @@ fn jdotg_value<T: crate::sens::num::PkNum>(
     out.iter().map(|o| o.grad[0]).collect()
 }
 
+/// The jet-only part of a moving-boundary time `x` (an estimated lagtime or
+/// modeled infusion duration): `x − x.val()` has value `0` (the boundary's f64
+/// position is unchanged) but the same derivatives as `x`, so it is the `δ` fed
+/// into a saltation correction (e.g. `δlag`, `δt_inf`). Shared by every call site
+/// so the convention can't drift between them.
+#[inline]
+fn jet_only<T: crate::sens::num::PkNum>(x: T) -> T {
+    x - T::from_f64(x.val())
+}
+
 /// Estimated-lagtime event-time saltation at an **infusion rate boundary** (the rate
 /// turning on at `t_dose + lag` or off at `t_dose + lag + dur`), where the window shifts
 /// with `lag`. Unlike a bolus, the state is continuous and only `ẋ` jumps by the forcing
@@ -3009,17 +3028,26 @@ fn inject_rate_saltation<T: crate::sens::num::PkNum>(
 /// fixed-point differentiation. The caller then applies the SS dose's own pulse normally.
 ///
 /// Handles SS **bolus** doses (pulse + decay per cycle) and SS **infusions** (an active-rate
-/// window `[0, t_inf]` then a quiet `[0, II−t_inf]` decay per cycle). Only a *rate-defined*
-/// SS infusion under `F ≠ 1` is still routed to FD upstream (its window would scale with
-/// `F` — a moving boundary the cycle loop does not carry). `eval_rhs_anchored` uses
+/// window `[0, t_inf]` then a quiet `[0, II−t_inf]` decay per cycle), where `t_inf`/the active
+/// forcing are the caller's mode-aware `(inf_rate, inf_window)` jet (`inf_eff`, #530/#419) —
+/// so a modeled-duration/rate dose (`RATE=-1/-2`) and a rate-defined infusion under `F ≠ 1`
+/// (whose window is `F·duration`, a moving boundary) are both analytic via the same per-cycle
+/// rate-off saltation as the main walk's `K_INF_END` (#486). `eval_rhs_anchored` uses
 /// cycle-relative time (anchor 0), matching production for a TAD-independent RHS (#439 SS).
+#[allow(clippy::too_many_arguments)]
 fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     dose: &crate::types::DoseEvent,
     f_bio: T,
     params: &[T],
+    // `Some((rate, window))` for an infusion (the caller's `inf_eff[idx]` jet, #530/#419);
+    // `None` for a bolus. Replacing the old `(is_inf, inf_rate, inf_window)` triple removes the
+    // meaningless `T::from_f64(0.0)` sentinels the bolus case had to pass (#642 review #5).
+    inf: Option<(T, T)>,
     opts: &crate::ode::solver::OdeSolverOptions,
+    d1_vars: &mut Vec<Dual1<1>>,
+    d1_stack: &mut Vec<Dual1<1>>,
 ) -> Vec<T> {
     let mut u = vec![T::from_f64(0.0); n_states];
     if dose.ii <= 0.0 || dose.cmt == 0 {
@@ -3044,21 +3072,23 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
             &mut stack_cell.borrow_mut(),
         );
     };
-    let is_inf = crate::ode::predictions::is_real_infusion(dose);
-    if is_inf {
+    if let Some((inf_rate, inf_window)) = inf {
         // SS infusion: each cycle is an active-rate window `[0, t_inf]` (the wrapped RHS
-        // injects `F·rate` into the dosing compartment) followed by a quiet decay window
-        // `[0, II − t_inf]`. `t_inf = dose.duration` is fixed here (rate-defined infusion
-        // under `F ≠ 1`, where the window itself scales with `F`, is gated to FD upstream
-        // per #419; for `F = 1` / duration-defined, the window is parameter-independent).
-        let t_inf = dose.duration;
-        if t_inf > dose.ii {
+        // injects the mode-aware bioavailable forcing into the dosing compartment) followed
+        // by a quiet decay window `[0, II − t_inf]`. `(inf_rate, inf_window)` is the caller's
+        // `inf_eff[idx]` (#530/#419): a modeled dose (`RATE=-1/-2`) rebuilds both from its PK
+        // slot, and a rate-defined infusion under `F ≠ 1` carries `F`'s jet in the *window*
+        // (`inf_window = F·duration`, rate held) rather than in the magnitude — so the
+        // active/quiet split below is generic over every case, not just the F=1 / duration-
+        // defined subset the old fixed-`dose.duration` split covered.
+        let t_inf_val = inf_window.val();
+        if t_inf_val > dose.ii {
             return u; // overlapping pulses — no simple equilibration (mirrors production)
         }
-        let rate_forcing = f_bio * T::from_f64(dose.rate);
-        let quiet = dose.ii - t_inf;
-        let saveat_inf = [t_inf];
-        let saveat_q = [quiet];
+        let rate_forcing = inf_rate;
+        let quiet_val = dose.ii - t_inf_val;
+        let saveat_inf = [t_inf_val];
+        let saveat_q = [quiet_val];
         // Shared early stop (#519): break once the trough converges, on the same mixed
         // atol/rtol criterion the f64 predictor uses (driver shared with `equilibrate_ss_g`,
         // #532 #9/#10).
@@ -3072,12 +3102,33 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
                     du[cmt_idx] = du[cmt_idx] + rate_forcing;
                 }
             };
-            let sol = solve_ode_g(&rhs_active, &u, (0.0, t_inf), params, &saveat_inf, opts);
+            let sol = solve_ode_g(&rhs_active, &u, (0.0, t_inf_val), params, &saveat_inf, opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
-            if quiet > 0.0 {
-                let sol = solve_ode_g(&bare_rhs, &u, (0.0, quiet), params, &saveat_q, opts);
+            // Per-cycle rate-off window saltation (#530/#419): the active/quiet boundary is
+            // evaluated at the fixed nominal `t_inf_val`, but the true window `inf_window` may
+            // carry a jet (modeled `D`/`R`, or `F·duration`) — inject the same event-time
+            // correction the main walk's `K_INF_END` uses (`d_off = inf_window − t_inf_val`,
+            // mechanically identical to `dtinf` there), so each cycle's boundary sensitivity
+            // is exact, not just the boundary's *value*.
+            let dtinf = inf_window - T::from_f64(t_inf_val);
+            inject_rate_saltation::<T>(
+                &mut u,
+                cmt_idx,
+                rate_forcing,
+                dtinf,
+                1.0,
+                program,
+                params,
+                t_inf_val,
+                0.0,
+                0.0,
+                d1_vars,
+                d1_stack,
+            );
+            if quiet_val > 0.0 {
+                let sol = solve_ode_g(&bare_rhs, &u, (0.0, quiet_val), params, &saveat_q, opts);
                 if let Some(last) = sol.last() {
                     u.copy_from_slice(&last.u);
                 }
@@ -3108,6 +3159,179 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
         }
     }
     crate::ode::predictions::record_ss_equilibration_cycles(cycles_run);
+    u
+}
+
+/// Taylor-extend a state `u` — already integrated to the fixed nominal bound `t_val` under
+/// `rhs` — by a further **dual-valued, zero-value** duration `dt`: the value `u` would have
+/// from continuing to flow under the SAME `rhs` for `dt` more time, to 2nd order in `dt`
+/// (`u += g(u)·dt + ½·(J·g)(u)·dt²`, `g` = `rhs`'s velocity at `(u, t_val)`). Unlike
+/// [`inject_rate_saltation`] (a forcing *jump* at an RHS switch), there is no switch here —
+/// this is the sensitivity of a continuous flow's endpoint to its own duration, needed when
+/// the duration itself (not a forcing) carries a derivative jet: the SS+lagtime pre-arrival
+/// phase seed (#486, [`ss_state_at_phase_g`]), where `phase = II − lag` and its active/quiet
+/// split are dual-valued durations advanced from an otherwise lag-invariant trough. `rhs`'s
+/// possible constant forcing (e.g. the SS active window) has zero state-Jacobian, so the
+/// *bare* program's `J·g` (via [`jdotg_value`]) is exact here too — no separate forced-
+/// Jacobian needed, mirroring how `inject_rate_saltation` itself only ever uses the bare
+/// program.
+#[allow(clippy::too_many_arguments)]
+fn extend_flow_by_dual_duration_g<T: crate::sens::num::PkNum>(
+    u: &mut [T],
+    dt: T,
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    rhs: impl Fn(&[T], &[T], f64, &mut [T]),
+    params: &[T],
+    t_val: f64,
+    first_dose_time: f64,
+    anchor: f64,
+    d1_vars: &mut Vec<Dual1<1>>,
+    d1_stack: &mut Vec<Dual1<1>>,
+) {
+    let n = u.len();
+    let mut g = vec![T::from_f64(0.0); n];
+    rhs(u, params, t_val, &mut g);
+    let params_d1: Vec<Dual1<1>> = params.iter().map(|p| Dual1::constant(p.val())).collect();
+    let jg = jdotg_value::<T>(
+        program,
+        n,
+        u,
+        &g,
+        &params_d1,
+        t_val,
+        first_dose_time,
+        anchor,
+        d1_vars,
+        d1_stack,
+    );
+    let dt2 = dt * dt;
+    for c in 0..n {
+        u[c] = u[c] + g[c] * dt + T::from_f64(0.5 * jg[c]) * dt2;
+    }
+}
+
+/// Dual counterpart of production's `ss_state_at_phase`: advances a precomputed SS `trough`
+/// (the pre-pulse state, phase `0⁻ ≡ II`, from [`equilibrate_ss_state_g`]) forward to
+/// `phase ∈ [0, II)`, measured from the pulse at phase 0. Used for the SS+lagtime pre-arrival
+/// seed (#486): observations between an SS dose's record time and its lagged arrival read the
+/// *previous* interval's tail at `phase = II − lag`, which carries `lag`'s jet
+/// (`∂phase/∂lag = −1`). Each duration derived from `phase` is integrated to its fixed nominal
+/// (`.val()`) bound and Taylor-extended by [`extend_flow_by_dual_duration_g`] for the remaining
+/// dual part — the same technique `equilibrate_ss_state_g`'s per-cycle rate-off saltation uses,
+/// but for a continuous (non-switching) flow rather than a forcing jump; crossing the
+/// active/quiet boundary itself (when `phase > t_inf`) still uses [`inject_rate_saltation`],
+/// exactly as the main cycle loop does. Mirrors production's "phase ≥ dose.duration" scope
+/// note: assumes the lagtime doesn't leave the prior infusion still active at `phase` (the
+/// realistic regime; overlapping infusions are already rejected upstream by
+/// `equilibrate_ss_state_g`).
+///
+/// The `trough` is taken as a parameter (not recomputed) so the caller can equilibrate once and
+/// reuse it at both this pre-arrival seed and the dose's own later `K_DOSE` event, halving the
+/// up-to-50-cycle dual SS loop for a lagged SS dose (#642 review #4). `inf` is `Some((rate,
+/// window))` for an infusion, `None` for a bolus (#642 review #5).
+#[allow(clippy::too_many_arguments)]
+fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
+    program: &crate::parser::model_parser::OdeRhsProgram,
+    n_states: usize,
+    dose: &crate::types::DoseEvent,
+    f_bio: T,
+    params: &[T],
+    inf: Option<(T, T)>,
+    phase: T,
+    trough: Vec<T>,
+    opts: &crate::ode::solver::OdeSolverOptions,
+    d1_vars: &mut Vec<Dual1<1>>,
+    d1_stack: &mut Vec<Dual1<1>>,
+) -> Vec<T> {
+    let mut u = trough;
+    let phase_val = phase.val();
+    if phase_val <= 0.0 {
+        return u;
+    }
+    // CMT is 1-based; a malformed `CMT=0` must no-op (return the trough unchanged), matching
+    // `equilibrate_ss_state_g`'s own `dose.cmt == 0` zero-guard. `saturating_sub(1)` would
+    // instead alias it to the valid index 0 and silently dose compartment 0 (#642 review #1).
+    if dose.cmt == 0 {
+        return u;
+    }
+    let cmt_idx = dose.cmt - 1;
+    if cmt_idx >= n_states {
+        return u;
+    }
+    let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
+    let bare_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+        eval_rhs_anchored::<T>(
+            program,
+            us,
+            ps,
+            t,
+            0.0,
+            0.0,
+            du,
+            &mut vars_cell.borrow_mut(),
+            &mut stack_cell.borrow_mut(),
+        );
+    };
+    if let Some((inf_rate, inf_window)) = inf {
+        let t_inf_val = inf_window.val();
+        let active_val = phase_val.min(t_inf_val);
+        let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+            bare_rhs(us, ps, t, du);
+            if cmt_idx < du.len() {
+                du[cmt_idx] = du[cmt_idx] + inf_rate;
+            }
+        };
+        let sol = solve_ode_g(
+            &rhs_active,
+            &u,
+            (0.0, active_val),
+            params,
+            &[active_val],
+            opts,
+        );
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+        if phase_val <= t_inf_val {
+            // Still inside the active window at `phase`: extend along the SAME (active)
+            // flow by the remaining dual part of `phase` itself.
+            let dt = phase - T::from_f64(phase_val);
+            extend_flow_by_dual_duration_g::<T>(
+                &mut u, dt, program, rhs_active, params, active_val, 0.0, 0.0, d1_vars, d1_stack,
+            );
+        } else {
+            // Crossing the active/quiet boundary: the window itself may carry a jet
+            // (modeled `D`/`R`, or `F·duration`) — inject the same rate-off saltation
+            // `equilibrate_ss_state_g`'s cycle loop uses (`d_off = inf_window − t_inf_val`).
+            let dtinf = inf_window - T::from_f64(t_inf_val);
+            inject_rate_saltation::<T>(
+                &mut u, cmt_idx, inf_rate, dtinf, 1.0, program, params, t_inf_val, 0.0, 0.0,
+                d1_vars, d1_stack,
+            );
+            let quiet_val = phase_val - t_inf_val;
+            let sol = solve_ode_g(&bare_rhs, &u, (0.0, quiet_val), params, &[quiet_val], opts);
+            if let Some(last) = sol.last() {
+                u.copy_from_slice(&last.u);
+            }
+            // Quiet-leg duration `phase − inf_window` also carries `phase`'s (and the
+            // window's) jet beyond the nominal `quiet_val` — extend along the quiet flow.
+            let dt_quiet = (phase - inf_window) - T::from_f64(quiet_val);
+            extend_flow_by_dual_duration_g::<T>(
+                &mut u, dt_quiet, program, bare_rhs, params, quiet_val, 0.0, 0.0, d1_vars, d1_stack,
+            );
+        }
+    } else {
+        u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
+        let sol = solve_ode_g(&bare_rhs, &u, (0.0, phase_val), params, &[phase_val], opts);
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+        let dt = phase - T::from_f64(phase_val);
+        extend_flow_by_dual_duration_g::<T>(
+            &mut u, dt, program, bare_rhs, params, phase_val, 0.0, 0.0, d1_vars, d1_stack,
+        );
+    }
     u
 }
 
@@ -3144,6 +3368,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
 #[allow(clippy::too_many_arguments)]
 fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
+    ode: &OdeSpec,
     n_states: usize,
     subject: &Subject,
     pk_at_dose: &[Vec<T>],
@@ -3167,13 +3392,23 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // are exact). `dose_lag_slot` is empty when the model has no lagtime (byte-identical to
     // the pre-lag walk).
     let has_lagtime = !dose_lag_slot.is_empty();
-    let lag_val = |k: usize| -> f64 {
+    // Carries `∂lag/∂(θ,η)` (incl. the lagtime axis itself) — fed into
+    // `add_prepared_input_rate_forcing` as `dose_lagtimes` so a built-in input-rate
+    // forcing's `tad = t − (dose.time + lag)` carries the exact continuous
+    // `∂R_in/∂lag` for `t` after the dose's (lagged) arrival (#486); the *onset*
+    // discontinuity at the arrival itself is injected separately as a rate-on
+    // saltation (mirroring the lagged-infusion rate-on injection below). A flat
+    // constant (`T::from_f64(0.0)`) when there is no lagtime, so `tad` reduces to the
+    // pre-#486 fixed-boundary computation.
+    let lag_dual = |k: usize| -> T {
         if has_lagtime {
-            pk_at_dose[k][dose_lag_slot[k]].val()
+            pk_at_dose[k][dose_lag_slot[k]]
         } else {
-            0.0
+            T::from_f64(0.0)
         }
     };
+    // Value-only counterpart of `lag_dual`, for callers that only need `lag.val()`.
+    let lag_val = |k: usize| -> f64 { lag_dual(k).val() };
 
     // #530: per-dose modeled rate/duration slot (empty when every dose is fixed). A modeled
     // dose is unresolved in `subject.doses` (`rate`/`duration == 0`), so its effective
@@ -3263,27 +3498,64 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     };
     let inf_window_len = |k: usize| -> f64 { inf_eff[k].1.val() };
 
-    // Merged timeline: (time, kind, idx), kind ∈ {Reset=0, Dose=1, PkOnly=2, Obs=3,
-    // InfEnd=4} — the sort key matching production's `kind_order` (Reset before a
-    // co-timed Dose so an EVID=4 reset+dose zeros the state before its own dose lands;
-    // Dose before PkOnly before Obs; infusion-end last so an obs at the end reads the
-    // infusion still contributing). Doses (and infusion windows) sit at their lagged
-    // arrival `d.time + lag_val(k)`; resets and pk-only records are at their record time
-    // (fixed, not lag-shifted).
+    // Built-in absorption input-rate forcing (#486): `dose_lagtimes_dual[k]` feeds
+    // `add_prepared_input_rate_forcing`'s `tad` computation with the dual lag (see
+    // `lag_dual` above); empty when the model has none (the common case — every
+    // per-segment closure below then skips the forcing loop entirely).
+    let has_input_rate = !ode.input_rate.is_empty();
+    let dose_lagtimes_dual: Vec<T> = if has_input_rate {
+        (0..subject.doses.len()).map(lag_dual).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Whether dose `k` is a periodic steady-state dose (`SS=1`, `II>0`) — single source of
+    // truth for the walk, mirroring `Subject::has_periodic_ss_dose`'s per-dose predicate.
+    let is_ss_dose = |d: &crate::types::DoseEvent| -> bool { d.ss && d.ii > 0.0 };
+
+    // The SS-equilibration infusion jet for dose `idx`: `Some(inf_eff[idx])` for an infusion,
+    // `None` for a bolus. One shared source for both SS call sites (`K_DOSE` and `K_SS_SEED`),
+    // so their infusion-jet handling can't desync (#642 review #5). `inf_eff[idx]` is only read
+    // when `is_inf(d)` (which implies `has_any_infusion`, so `inf_eff` is populated).
+    let ss_inf = |d: &crate::types::DoseEvent, idx: usize| -> Option<(T, T)> {
+        if is_inf(d) {
+            Some(inf_eff[idx])
+        } else {
+            None
+        }
+    };
+
+    // Merged timeline: (time, kind, idx), kind ∈ {Reset=0, SsSeed=1, Dose=2, PkOnly=3, Obs=4,
+    // InfEnd=5} — the sort key matching production's `kind_order` (Reset before a co-timed
+    // Dose so an EVID=4 reset+dose zeros the state before its own dose lands; a per-dose
+    // SS pre-arrival seed — see below — before its own later Dose event; Dose before PkOnly
+    // before Obs; infusion-end last so an obs at the end reads the infusion still
+    // contributing). Doses (and infusion windows) sit at their lagged arrival
+    // `d.time + lag_val(k)`; resets and pk-only records are at their record time (fixed, not
+    // lag-shifted).
     const K_RESET: u8 = 0;
-    const K_DOSE: u8 = 1;
-    const K_PKONLY: u8 = 2;
-    const K_OBS: u8 = 3;
-    const K_INF_END: u8 = 4;
+    const K_SS_SEED: u8 = 1;
+    const K_DOSE: u8 = 2;
+    const K_PKONLY: u8 = 3;
+    const K_OBS: u8 = 4;
+    const K_INF_END: u8 = 5;
     // Capacity includes one `K_INF_END` slot per infusion (each dose adds its window-end
-    // event below), matching production's timeline reservation. `n_infusion_ends` was
-    // computed once above (and reused for `has_any_infusion`).
+    // event below) and one `K_SS_SEED` slot per lagged SS dose, matching production's
+    // timeline reservation. `n_infusion_ends` was computed once above (and reused for
+    // `has_any_infusion`).
+    let n_ss_seeds = subject
+        .doses
+        .iter()
+        .enumerate()
+        .filter(|(k, d)| is_ss_dose(d) && lag_val(*k) > 0.0)
+        .count();
     let mut tl: Vec<(f64, u8, usize)> = Vec::with_capacity(
         subject.doses.len()
             + n_obs
             + subject.pk_only_times.len()
             + subject.reset_times.len()
-            + n_infusion_ends,
+            + n_infusion_ends
+            + n_ss_seeds,
     );
     for &rt in &subject.reset_times {
         tl.push((rt, K_RESET, 0));
@@ -3294,6 +3566,17 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // Window end uses the bioavailable length (`F·dur` for a rate-defined infusion,
             // the modeled `D`/`F·amt/R` for a modeled dose, #530).
             tl.push((d.time + lag_val(k) + inf_window_len(k), K_INF_END, k));
+        }
+        // SS + estimated lagtime (#486): the dose arrives at `d.time + lag`, so observations
+        // in the pre-arrival window `[d.time, d.time + lag)` must read the *previous*
+        // interval's steady-state tail, not the (empty) running state. Break at the raw
+        // record time `d.time` and seed it there via `ss_state_at_phase_g` (phase
+        // `II − lag`, the point the prior pulse's tail has decayed to by the record time) —
+        // mirrors production's dense-path break (`ode/predictions.rs` `ss_state_at_phase`
+        // call sites). Only when this dose's own resolved lag is positive; a model with
+        // lagtime elsewhere but zero lag on this SS dose needs no seed.
+        if is_ss_dose(d) && lag_val(k) > 0.0 {
+            tl.push((d.time, K_SS_SEED, k));
         }
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
@@ -3319,6 +3602,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // when `has_lagtime` is false).
     let mut d1_vars: Vec<Dual1<1>> = Vec::new();
     let mut d1_stack: Vec<Dual1<1>> = Vec::new();
+    // Per-dose SS-equilibration trough cache (#642 review #4): a lagged SS dose needs its
+    // trough at both the `K_SS_SEED` pre-arrival seed and its later `K_DOSE` event. The seed
+    // (processed first, earlier `t_event`) equilibrates once and stashes the trough here; the
+    // `K_DOSE` event reuses it instead of re-running the up-to-50-cycle dual SS loop. Entries
+    // stay `None` for non-lagged SS doses (which never hit `K_SS_SEED`).
+    let mut ss_trough_cache: Vec<Option<Vec<T>>> = vec![None; subject.doses.len()];
 
     // TAD anchor: the most recent dose at or before the current segment start. The
     // timeline is sorted and doses sort before a co-timed obs, so this only advances
@@ -3351,10 +3640,36 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         // Segment `[cur_t, t_event]` uses the params evaluated at `t_event` (NONMEM
         // end-of-interval convention); a reset reuses the previous record's params.
         let params: &[T] = match kind {
-            K_DOSE => &pk_at_dose[idx],
+            // `K_SS_SEED` shares `pk_at_dose[idx]` with its dose's own (later) `K_DOSE`
+            // event — both read the same underlying record's PK snapshot (#486).
+            K_DOSE | K_SS_SEED => &pk_at_dose[idx],
             K_PKONLY => &pk_at_pk_only[idx],
             K_OBS => &pk_at_obs[idx],
             _ => last_params, // K_RESET / K_INF_END (not records)
+        };
+        // Built-in absorption input-rate forcing (#486): hoisted once per event from
+        // this event's own PK snapshot `params` — unlike the static walk's single
+        // subject-constant snapshot, TV-cov can change params at every event, so the
+        // dose-invariant constants (`ln Γ`, `KTR`, …) must be rebuilt per snapshot,
+        // mirroring production's per-segment `prepare_input_rates`
+        // (`ode_predictions_event_driven`). Computed here (rather than only inside
+        // the `t_event > cur_t` segment below) so a `K_DOSE` event whose own segment
+        // is degenerate (zero-length, e.g. the very first event) still has it
+        // available for the onset saltation below. `ode_analytical_supported`'s
+        // `supported_over_dual()` allowlist guarantees every kind reaching here
+        // prepares successfully.
+        let prepared_forcings: Vec<PreparedInputRate<T>> = if has_input_rate {
+            ode.input_rate
+                .iter()
+                .map(|f| {
+                    f.prepare_dual::<T>(params).expect(
+                        "ode_analytical_supported's supported_over_dual() allowlist \
+                         guarantees prepare_dual succeeds for every admitted kind",
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         if t_event > cur_t {
             // Infusions whose (lagged) window fully spans this segment add a constant
@@ -3408,6 +3723,23 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         du[cmt] = du[cmt] + fr;
                     }
                 }
+                // R_in(tad), via the shared generic helper — `dose_lagtimes_dual`
+                // carries the exact continuous `∂R_in/∂lag` through `tad` when the
+                // model has an estimated lagtime; the onset saltation at the dose's
+                // own arrival is injected separately at the `K_DOSE` event below.
+                if !prepared_forcings.is_empty() {
+                    crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
+                        ode,
+                        &prepared_forcings,
+                        ps,
+                        &subject.doses,
+                        &dose_lagtimes_dual,
+                        f_bio_at_dose,
+                        reset_floor,
+                        t,
+                        du,
+                    );
+                }
             };
             // Single save point per segment — a stack array avoids the per-segment
             // heap allocation of `vec![t_event]` (#449 review #14).
@@ -3427,29 +3759,125 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // SS infusion (active-rate + quiet window per cycle); only a rate-defined SS
             // infusion under `F ≠ 1`, SS + lagtime, and SS + a non-autonomous RHS route to
             // FD upstream (#473 review #7).
-            if d.ss && d.ii > 0.0 {
-                u = equilibrate_ss_state_g::<T>(
-                    program,
-                    n_states,
-                    d,
-                    f_bio_at_dose[idx],
-                    &pk_at_dose[idx],
-                    opts,
-                );
+            if is_ss_dose(d) {
+                // Reuse the trough already equilibrated at this dose's `K_SS_SEED` pre-arrival
+                // seed (lagged SS dose); otherwise equilibrate now (non-lagged SS dose). Both
+                // produce the identical trough for the same `pk_at_dose[idx]` — the cache just
+                // avoids the second up-to-50-cycle dual SS loop (#642 review #4).
+                u = match ss_trough_cache[idx].take() {
+                    Some(trough) => trough,
+                    None => equilibrate_ss_state_g::<T>(
+                        program,
+                        n_states,
+                        d,
+                        f_bio_at_dose[idx],
+                        &pk_at_dose[idx],
+                        ss_inf(d, idx),
+                        opts,
+                        &mut d1_vars,
+                        &mut d1_stack,
+                    ),
+                };
             }
             // CMT is 1-based; a malformed `CMT=0` must not silently dose compartment
             // 0 (the datareader rejects it upstream) (#449 review #8).
             if d.cmt >= 1 {
                 let cmt_idx = d.cmt - 1;
                 if cmt_idx < n_states {
-                    if is_inf(d) {
+                    if has_input_rate && input_rate_consumes_cmt(ode, d.cmt) {
+                        // The dose feeds a built-in absorption forcing (`R_in`), not a
+                        // bolus (#430) — its mass flows in continuously via
+                        // `add_prepared_input_rate_forcing` in the RHS above, not as an
+                        // instantaneous jump here (mirrors the static walk's
+                        // `input_rate_consumes_cmt` bolus skip). With an estimated
+                        // lagtime, the forcing's *onset* is a discontinuity in `du/dt`
+                        // at the dose's lagged arrival (`R_in` switches from inactive to
+                        // `R_in(0⁺)` there, since the forcing's domain guard treats
+                        // `tad ≤ 0` as flat-zero) — inject the exact rate-on saltation,
+                        // the sign-mirror of the lagged-infusion injection below but with
+                        // `Δr = Σ frac·R_in(0⁺)` (summed over every forcing feeding this
+                        // compartment) in place of a constant infusion rate. Without
+                        // lagtime the dose's arrival is a fixed (non-dual) boundary, so
+                        // no saltation is needed — the continuous forcing above already
+                        // carries every other parameter's exact sensitivity.
+                        if has_lagtime {
+                            let lag = pk_at_dose[idx][dose_lag_slot[idx]];
+                            let dlag = jet_only(lag);
+                            let dose_mass = f_bio_at_dose[idx] * T::from_f64(d.amt);
+                            let mut onset = T::from_f64(0.0);
+                            for (f, prep) in ode.input_rate.iter().zip(&prepared_forcings) {
+                                if f.cmt == cmt_idx {
+                                    onset = onset
+                                        + f.frac(&pk_at_dose[idx]) * prep.rate_at_zero(dose_mass);
+                                }
+                            }
+                            inject_rate_saltation::<T>(
+                                &mut u,
+                                cmt_idx,
+                                onset,
+                                dlag,
+                                -1.0,
+                                program,
+                                &pk_at_dose[idx],
+                                t_event,
+                                first_dose_time,
+                                t_event,
+                                &mut d1_vars,
+                                &mut d1_stack,
+                            );
+                        }
+                    } else if is_inf(d) {
                         // Infusion: no bolus — the rate `F·rate` enters via the segment
                         // forcing above over `[t_dose+lag, t_dose+lag+dur]`. With lagtime,
                         // the window's *start* shifts, so inject the rate-on event-time
-                        // saltation (`s = −1`).
+                        // saltation (`s = −1`). This ALSO applies to an SS dose (#486), but
+                        // needs one extra step first (below): unlike a regular lagged dose,
+                        // whose pre-arrival state acquires an `∂/∂lag = -g(x⁻)` jet "for
+                        // free" by chaining through a fixed-duration prior segment,
+                        // `equilibrate_ss_state_g`'s trough has *zero* `∂/∂lag` (the periodic
+                        // recurrence is anchored to the pulse, not to wall-clock arrival
+                        // time) — so that embedded jet must be given to it explicitly before
+                        // the (otherwise unmodified) rate-on saltation is exact.
                         if has_lagtime {
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
-                            let dlag = lag - T::from_f64(lag.val());
+                            let dlag = jet_only(lag);
+                            if is_ss_dose(d) {
+                                // The rate-on saltation below assumes `u`'s own `∂/∂lag`
+                                // already equals `-g(u)` (the "embedded jet" a genuinely
+                                // flowing pre-arrival residual acquires for free, by chaining
+                                // through a fixed-duration prior segment — see the module's
+                                // #486 dose-time-saltation derivation). `u` is the SS trough
+                                // here, whose `∂/∂lag` is exactly zero instead — so give it
+                                // that embedded jet explicitly, by flowing it `-δlag` under
+                                // the bare (unforced) RHS, before the unmodified rate-on
+                                // injection below (which is then exact, same as a regular
+                                // lagged infusion).
+                                let bare_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
+                                    eval_rhs_anchored::<T>(
+                                        program,
+                                        us,
+                                        ps,
+                                        t,
+                                        first_dose_time,
+                                        t_event,
+                                        du,
+                                        &mut vars_cell.borrow_mut(),
+                                        &mut stack_cell.borrow_mut(),
+                                    );
+                                };
+                                extend_flow_by_dual_duration_g::<T>(
+                                    &mut u,
+                                    -dlag,
+                                    program,
+                                    bare_rhs,
+                                    &pk_at_dose[idx],
+                                    t_event,
+                                    first_dose_time,
+                                    t_event,
+                                    &mut d1_vars,
+                                    &mut d1_stack,
+                                );
+                            }
                             // Rate-on at `t+lag`: the start shifts with `lag` only (not with
                             // the bioavailable window length); `dr` = effective forcing. Its
                             // `J·g` eval is anchored at `t_event` (TAD=0, this dose just
@@ -3486,7 +3914,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // reduces to `−g(x⁺)·δlag + ½ẋ̇⁺·δlag²` — the single-dose time-shift.)
                         let params = &pk_at_dose[idx];
                         let lag = params[dose_lag_slot[idx]];
-                        let dlag = lag - T::from_f64(lag.val());
+                        let dlag = jet_only(lag);
                         // TAD anchor for the *pre*-dose velocity `g(x⁻)`: the most recent
                         // earlier dose. On the first dose `last_dose_eff` is `NEG_INFINITY`,
                         // which `eval_rhs_anchored` turns into `TAD = NaN` — fine for a
@@ -3498,23 +3926,33 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         } else {
                             t_event
                         };
-                        // `x⁻` = the pre-bolus running state. (SS + lagtime routes to FD, so
-                        // no equilibration has overwritten `u` here.) Cloned lazily in this
-                        // bolus branch — a lagtime *infusion* dose never needs it (#473
-                        // review #6).
+                        // `x⁻` = the pre-bolus running state. For a plain dose this is the
+                        // continuing residual trajectory, and `g(x⁻)` is its own velocity —
+                        // the term that (via `J·g(x⁻)`, propagated by the ordinary sensitivity
+                        // equation over the *fixed* duration to any later event) reproduces the
+                        // "the incoming segment's own duration also depends on lag" effect. For
+                        // an **SS** dose, `u` holds the periodic trough, which by construction
+                        // does *not* flow toward the event as lag shifts (the recurrence is
+                        // anchored to the pulse, not to wall-clock time) — so there is no
+                        // incoming segment to account for, exactly like a genuine first dose
+                        // with no prior residual: `g(x⁻)` is treated as zero (skip the eval),
+                        // leaving only the `−g(x⁺)·δlag` term (the "later fixed-time
+                        // observations see a shifted elapsed time since arrival" effect, #486).
                         let u_minus = u.clone();
                         let mut g_minus = vec![T::from_f64(0.0); n_states];
-                        eval_rhs_anchored::<T>(
-                            program,
-                            &u_minus,
-                            params,
-                            t_event,
-                            first_dose_time,
-                            pre_anchor,
-                            &mut g_minus,
-                            &mut vars_cell.borrow_mut(),
-                            &mut stack_cell.borrow_mut(),
-                        );
+                        if !is_ss_dose(d) {
+                            eval_rhs_anchored::<T>(
+                                program,
+                                &u_minus,
+                                params,
+                                t_event,
+                                first_dose_time,
+                                pre_anchor,
+                                &mut g_minus,
+                                &mut vars_cell.borrow_mut(),
+                                &mut stack_cell.borrow_mut(),
+                            );
+                        }
                         u[cmt_idx] = u[cmt_idx] + f_bio_at_dose[idx] * T::from_f64(d.amt);
                         let mut g_plus = vec![T::from_f64(0.0); n_states];
                         eval_rhs_anchored::<T>(
@@ -3592,6 +4030,47 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // run at this record, and the next segment must use its params (with κ fixed
             // at zero under IOV, matching production `predict_iov`).
             last_params = &pk_at_pk_only[idx];
+        } else if kind == K_SS_SEED {
+            // SS + estimated lagtime pre-arrival seed (#486): between this dose's raw
+            // record time (this event) and its lagged arrival (the later `K_DOSE` event
+            // for the same `idx`), the running state is the *previous* interval's
+            // steady-state tail — `ss_state_at_phase_g` advances the trough forward by
+            // `phase = II − lag` (the dual carries `lag`'s jet exactly as
+            // `equilibrate_ss_state_g`'s per-cycle rate-off saltation does, #530). The
+            // segment from here to the lagged arrival then flows this seed forward
+            // through the walk's ordinary integration.
+            let d = &subject.doses[idx];
+            let lag = pk_at_dose[idx][dose_lag_slot[idx]];
+            let phase = T::from_f64(d.ii) - lag;
+            let inf = ss_inf(d, idx);
+            // Equilibrate the SS trough once here and cache it, so this lagged SS dose's later
+            // `K_DOSE` event reuses it instead of re-running the dual SS loop (#642 review #4).
+            let trough = equilibrate_ss_state_g::<T>(
+                program,
+                n_states,
+                d,
+                f_bio_at_dose[idx],
+                &pk_at_dose[idx],
+                inf,
+                opts,
+                &mut d1_vars,
+                &mut d1_stack,
+            );
+            ss_trough_cache[idx] = Some(trough.clone());
+            u = ss_state_at_phase_g::<T>(
+                program,
+                n_states,
+                d,
+                f_bio_at_dose[idx],
+                &pk_at_dose[idx],
+                inf,
+                phase,
+                trough,
+                opts,
+                &mut d1_vars,
+                &mut d1_stack,
+            );
+            last_params = &pk_at_dose[idx];
         } else if kind == K_INF_END {
             // Infusion window end: the rate turns off (the next segment's `active_inf`
             // excludes it). Not a record — no state change, no `last_params` update. The
@@ -3613,12 +4092,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 && d.cmt - 1 < n_states
             {
                 let dlag = if has_lagtime {
-                    let lag = pk_at_dose[idx][dose_lag_slot[idx]];
-                    lag - T::from_f64(lag.val())
+                    jet_only(pk_at_dose[idx][dose_lag_slot[idx]])
                 } else {
                     T::from_f64(0.0)
                 };
-                let dtinf = inf_eff[idx].1 - T::from_f64(inf_eff[idx].1.val());
+                let dtinf = jet_only(inf_eff[idx].1);
                 let d_off = dlag + dtinf;
                 inject_rate_saltation::<T>(
                     &mut u,
@@ -3998,8 +4476,10 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             // Built-in absorption input-rate forcing R_in(tad), via the shared
             // generic helper — the same superposition loop production runs on `f64`,
             // now monomorphised on the dual type `T`. Lagtime is excluded from this
-            // provider (`&[]` → tad = t − dose.time), and reset+absorption is gated to
-            // FD (`NEG_INFINITY` floor → no pre-reset skip) (#430 review #4 / #451).
+            // provider (`&[]` → tad = t − dose.time); reset+absorption now threads the
+            // tracked `reset_floor` (#486) so a dose delivered before the most recent
+            // EVID 3/4 reset is correctly turned off here too, matching production's
+            // `active_infusions` rule for infusions (#430 review #4 / #451 / #486).
             if !prepared_forcings.is_empty() {
                 crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
                     ode,
@@ -4008,7 +4488,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                     &subject.doses,
                     &[],
                     dose_f_bio,
-                    f64::NEG_INFINITY,
+                    reset_floor,
                     t,
                     du,
                 );
@@ -6265,38 +6745,62 @@ mod tests {
         check_vs_production(&model, &subject, &[1.0, 20.0, 0.75], &[0.1]);
     }
 
-    /// **SS × estimated lagtime routes to FD.** The SS dose arrives at `t_dose + lag`, so
-    /// observations in the pre-arrival window `[t_dose, t_dose+lag]` must read the previous
-    /// interval's steady-state tail (production seeds it via `ss_state_at_phase`). The dual
-    /// walk has no pre-arrival SS-tail seed, so it declines SS+lagtime to FD rather than
-    /// silently read the empty running state for such an obs (#473 review #1).
+    /// **SS × estimated lagtime is now analytic (#486, PR3 sub-case (a)).** The SS dose
+    /// arrives at `t_dose + lag`, so observations in the pre-arrival window
+    /// `[t_dose, t_dose+lag)` must read the previous interval's steady-state tail — the
+    /// walk seeds it via a `K_SS_SEED` timeline break (`ss_state_at_phase_g`, phase
+    /// `II − lag`), mirroring production's `ss_state_at_phase` at the dose record time. Obs
+    /// at `0.2` (< lag ≈ 0.5) exercises the pre-arrival seed directly; the rest exercise the
+    /// dose's own (unmodified) general lagtime saltation and later cycles.
     #[test]
-    fn ode_provider_ss_lagtime_routes_to_fd() {
+    fn ode_provider_ss_lagtime_matches_production() {
         let model = parse_model_string(ONECPT_ORAL_LAG_ODE).expect("parse oral lag ODE");
-        let mut subject = bolus_subject(&[2.0, 4.0, 6.0, 10.0]);
+        let mut subject = bolus_subject(&[0.2, 1.0, 4.0, 8.0, 13.0]);
         subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
         assert!(subject.doses[0].ss && model.has_lagtime());
         assert!(
-            !ode_tvcov_supported(&model, &subject),
-            "SS + lagtime must decline to FD (pre-arrival SS-tail seed not yet carried)"
+            ode_tvcov_supported(&model, &subject),
+            "SS + lagtime → event-driven walk (#486)"
         );
+        // θ = [TVCL, TVV, TVKA, TVLAG].
+        let theta = [1.0, 10.0, 1.0, 0.5];
+        let eta = [0.12, -0.08];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        // 2nd order: the pre-arrival seed's `extend_flow_by_dual_duration_g` Taylor term and
+        // the dose's own (now g_minus=0) lagtime saltation coefficient are both new — neither
+        // is exercised by the existing non-SS lagtime Hessian test.
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
     }
 
-    /// **SS × lagtime × infusion also routes to FD** (same pre-arrival-seed gap, #473 #1).
+    /// **SS × lagtime × infusion is also analytic now** (same pre-arrival seed, #486). Here
+    /// `phase = II − lag ≈ 11.5` exceeds the infusion's own duration (2.5 h), so the seed
+    /// exercises `ss_state_at_phase_g`'s harder branch: crossing the active/quiet boundary
+    /// (the `inject_rate_saltation` reuse) before extending the quiet leg by the remaining
+    /// dual duration. Obs at `0.3` (< lag) lands in the pre-arrival window.
     #[test]
-    fn ode_provider_ss_lagtime_infusion_routes_to_fd() {
+    fn ode_provider_ss_lagtime_infusion_matches_production() {
         let model = parse_model_string(ONECPT_IV_LAG_INF_ODE).expect("parse lag+inf ODE");
-        let mut subject = bolus_subject(&[3.0, 5.0, 8.0, 11.0]);
+        let mut subject = bolus_subject(&[0.3, 3.0, 5.0, 8.0, 11.0]);
         subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 40.0, true, 12.0)];
         assert!(subject.doses[0].ss && subject.doses[0].is_infusion() && model.has_lagtime());
-        assert!(!ode_tvcov_supported(&model, &subject));
+        assert!(ode_tvcov_supported(&model, &subject));
+        // θ = [TVCL, TVV, TVLAG]; η = [ETA_CL, ETA_LAG].
+        let theta = [1.0, 10.0, 0.5];
+        let eta = [0.1, 0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        // 2nd order: the rate-on pre-advance (`extend_flow_by_dual_duration_g`, feeding the
+        // *unmodified* `inject_rate_saltation`) is new machinery, specific to this combo.
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
     }
 
-    /// **Rate-defined SS infusion under `F ≠ 1` routes to FD** (drives the gate's early
-    /// return, #473 review #13). Its equilibration cycles would each need the `F`-scaled
-    /// active window — a moving boundary the cycle loop does not carry.
+    /// **Rate-defined SS infusion under `F ≠ 1` is now analytic (#486, PR3 sub-case (b)).**
+    /// `equilibrate_ss_state_g` reads the caller's `inf_eff` jet (window `F·duration`, rate
+    /// held) instead of the raw fixed `dose.duration`, and injects the same per-cycle
+    /// rate-off saltation the main walk's `K_INF_END` uses.
     #[test]
-    fn ode_provider_ss_rate_defined_infusion_under_f_routes_to_fd() {
+    fn ode_provider_ss_rate_defined_infusion_under_f_matches_production() {
         let model = parse_model_string(ONECPT_IV_F_ODE).expect("parse F ODE");
         assert!(model.has_bioavailability());
         let mut subject = bolus_subject(&[1.0, 3.0, 6.0]);
@@ -6308,9 +6812,119 @@ mod tests {
                 && subject.has_rate_defined_infusion()
         );
         assert!(
-            !ode_tvcov_supported(&model, &subject),
-            "rate-defined SS infusion under F must decline to FD"
+            ode_tvcov_supported(&model, &subject),
+            "rate-defined SS infusion under F → event-driven walk (#486)"
         );
+        // η = [ETA_CL, ETA_F]; θ = [TVCL, TVV, TVF].
+        let theta = [1.0, 10.0, 0.7];
+        let eta = [0.1, 0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+    }
+
+    /// **Early-stop stays gradient-faithful with the new per-cycle rate-off saltation**
+    /// (#486, mirroring `ode_provider_ss_early_stop_matches_full_budget`): the (b) sub-case's
+    /// per-cycle `inject_rate_saltation` call accumulates over however many cycles the SS
+    /// loop runs, so an early-stopped run must still match a forced-full-budget run to well
+    /// within FD-validation precision — not just for the value, but for the `F`-window
+    /// saltation's gradient/Hessian contribution specifically.
+    #[test]
+    fn ode_provider_ss_rate_under_f_early_stop_matches_full_budget() {
+        let model = parse_model_string(ONECPT_IV_F_ODE).expect("parse F ODE");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 9.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 40.0, true, 12.0)];
+        assert!(ode_tvcov_supported(&model, &subject), "SS + F → analytic");
+        let theta = [1.0, 10.0, 0.7];
+        let eta = [0.1, 0.05];
+
+        let early = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+        let early_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+        let full = crate::ode::predictions::with_full_ss_equilibration(|| {
+            ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported")
+        });
+        let full_cycles = crate::ode::predictions::last_ss_equilibration_cycles();
+
+        assert_eq!(
+            full_cycles,
+            crate::ode::predictions::SS_EQUILIBRATION_CYCLES,
+            "forced-full must run the whole budget"
+        );
+        assert!(
+            early_cycles < full_cycles,
+            "early stop should run fewer cycles ({early_cycles}) than the full budget ({full_cycles})"
+        );
+        for (e, f) in early.obs.iter().zip(&full.obs) {
+            approx::assert_relative_eq!(e.f, f.f, max_relative = 1e-9, epsilon = 1e-12);
+            for (a, b) in e.df_deta.iter().zip(&f.df_deta) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            for (a, b) in e.df_dtheta.iter().zip(&f.df_dtheta) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            // The per-cycle rate-off saltation accumulates into the 2nd-order term across every
+            // cycle, so the Hessian blocks — not just the gradient — must survive early stop
+            // (this is what the docstring claims; #642 review #2).
+            for (a, b) in e.d2f_deta2.iter().zip(&f.d2f_deta2) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            for (a, b) in e.d2f_deta_dtheta.iter().zip(&f.d2f_deta_dtheta) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+        }
+    }
+
+    /// **Modeled-duration dose × SS is now analytic (#486, PR3 sub-case (d) — cheapest,
+    /// implemented first).** `equilibrate_ss_state_g` threads the `inf_eff` jet (rebuilt
+    /// from the `D1` PK slot, exactly as the non-SS modeled-duration walk does) into its
+    /// per-cycle active/quiet split and rate-off saltation. Observations straddle the SS
+    /// dose's own (post-equilibration) window end at `D1=5`.
+    #[test]
+    fn ode_provider_ss_modeled_duration_matches_production() {
+        const MODELED_DUR_SS_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL/V * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(MODELED_DUR_SS_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 10.0]);
+        subject.doses = vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            true,
+            12.0,
+            crate::types::RateMode::ModeledDuration,
+        )];
+        assert!(subject.doses[0].ss && !subject.doses[0].is_fixed());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "modeled-duration × SS → event-driven walk (#486)"
+        );
+        let theta = [5.0, 50.0, 5.0];
+        let eta = [0.12, -0.08];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
     }
 
     #[test]
@@ -7381,6 +7995,10 @@ mod tests {
   y = central / V
 [error_model]
   DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
 "#;
 
     // Same disposition shape but with a `transit()` forcing — lifted to Dual2 in
@@ -7745,13 +8363,15 @@ mod tests {
         );
     }
 
-    /// A `weibull()` model **with an EVID 3/4 reset** must fall back to FD on both
-    /// the outer θ-sensitivities and the inner η-gradient: the dual forcing loop
-    /// doesn't replicate the f64 `reset_floor` that turns off pre-reset dose tails.
-    /// The reset gate keys on `!input_rate.is_empty()` (kind-agnostic), so Weibull
-    /// inherits it — pinned here (the Weibull analogue of the igd reset test).
+    /// A `weibull()` model **with an EVID 3/4 reset** is now analytic on both the
+    /// outer θ-sensitivities and the inner η-gradient (#486): the dual forcing loop
+    /// threads the tracked `reset_floor` into the shared `add_prepared_input_rate_forcing`
+    /// helper, exactly like the f64 predictor's `active_infusions` rule, so a dose's
+    /// pre-reset tail is correctly turned off. Reset is kind-agnostic (keyed on
+    /// `!input_rate.is_empty()`), so Weibull inherits the fix — pinned here (the
+    /// Weibull analogue of the igd reset test).
     #[test]
-    fn ode_provider_weibull_with_reset_falls_back_to_fd() {
+    fn ode_provider_weibull_with_reset_matches_production() {
         let model = parse_model_string(WEIBULL_ODE).expect("parse");
         let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 11.0, 13.0, 16.0]);
         subject.doses = vec![
@@ -7759,27 +8379,21 @@ mod tests {
             DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
         ];
         subject.reset_times = vec![10.0];
-        let theta = [5.0, 50.0, 2.0, 1.5];
-        let eta = [0.1, 0.05];
+        let theta = vec![5.0, 50.0, 2.0, 1.5];
+        let eta = vec![0.1, 0.05];
         assert!(
-            ode_subject_sensitivities(&model, &subject, &theta, &eta).is_none(),
-            "weibull() + reset must fall back to FD on the outer θ-sensitivity path"
+            ode_subject_supported(&model, &subject),
+            "weibull() + reset is now shared scope for both outer and inner (#486)"
         );
-        assert!(
-            !ode_subject_supported(&model, &subject),
-            "weibull() + reset must be out of shared scope (covers the inner η-gradient)"
-        );
-        assert!(
-            ode_subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
-            "weibull() + reset must fall back to FD on the inner η-gradient path too"
-        );
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
-    /// Built-in absorption + an EVID 3/4 reset is kept on the FD fallback in
-    /// slice 1: the dual loop doesn't yet apply the `reset_floor` that turns off
-    /// pre-reset dose tails, so `ode_subject_sensitivities` declines the subject.
+    /// Built-in absorption + an EVID 3/4 reset is now analytic (#486): the dual
+    /// forcing loop threads the tracked `reset_floor`, turning off a dose's
+    /// pre-reset tail exactly like the f64 predictor's `active_infusions` rule.
     #[test]
-    fn ode_provider_igd_with_reset_falls_back_to_fd() {
+    fn ode_provider_igd_with_reset_matches_production() {
         let model = parse_model_string(IGD_ODE).expect("parse");
         let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 11.0, 13.0, 16.0]);
         subject.doses = vec![
@@ -7787,23 +8401,17 @@ mod tests {
             DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
         ];
         subject.reset_times = vec![10.0];
-        let theta = [5.0, 50.0, 2.0, 0.3];
-        let eta = [0.1, -0.05];
+        let theta = vec![5.0, 50.0, 2.0, 0.3];
+        let eta = vec![0.1, -0.05];
+        // The inner η-gradient shares the scope gate, so it must be analytic too —
+        // else the EBE loop would run FD while the outer runs analytic (#430 review #1
+        // — same shared-scope invariant, now on the "supported" side of the gate).
         assert!(
-            ode_subject_sensitivities(&model, &subject, &theta, &eta).is_none(),
-            "IG + reset must fall back to FD on the outer θ-sensitivity path (#430)"
+            ode_subject_supported(&model, &subject),
+            "IG + reset is now shared scope for both outer and inner (#486)"
         );
-        // The inner η-gradient shares the scope gate, so it must decline too — else
-        // the EBE loop would run an analytic no-`reset_floor` gradient while the outer
-        // falls back to FD (#430 review #1). Guarded by `ode_subject_supported`.
-        assert!(
-            !ode_subject_supported(&model, &subject),
-            "IG + reset must be out of shared scope (covers the inner η-gradient)"
-        );
-        assert!(
-            ode_subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
-            "IG + reset must fall back to FD on the inner η-gradient path too (#430 review #1)"
-        );
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     /// Bioavailability F on an igd() model flows *only* through the input-rate
@@ -7902,36 +8510,396 @@ mod tests {
         }
     }
 
-    /// Regression for #430 review finding 1: an igd() model that also declares a
-    /// compartment-indexed `ALAG{n}` lag must stay on the FD fallback. The lag is
-    /// wired through the `DoseAttrMap`, so it lands in neither `pk_indices` nor the
-    /// bare `PK_IDX_LAGTIME` slot — the gate must consult `has_lagtime()`, or it
-    /// would serve the model and the dual loop would compute a no-lag gradient
-    /// that diverges from the f64 predictor (which shifts the forcing by the lag).
+    /// Regression for #430 review finding 1, now closed by #486: an igd() model that
+    /// also declares a compartment-indexed `ALAG{n}` lag is analytic. The lag is
+    /// wired through the `DoseAttrMap` (not `pk_indices`/`PK_IDX_LAGTIME`), and
+    /// routes the subject to the event-driven walk (`ode_tvcov_supported`), which now
+    /// carries `R_in`: the continuous `∂R_in/∂lag` flows through the dual `tad`, and
+    /// the forcing's onset at the dose's lagged arrival is injected as an exact
+    /// rate-on saltation. Inverse-Gaussian's onset vanishes identically (the
+    /// essential singularity at `tad → 0⁺` dominates for every valid `(mat, cv2)`),
+    /// so this combination has no boundary-safety caveat (contrast Weibull, still FD
+    /// for `β < 1`, see `ode_provider_weibull_with_alag_stays_on_fd_fallback`).
     #[test]
-    fn ode_provider_igd_with_alag_stays_on_fd_fallback() {
+    fn ode_provider_igd_with_alag_matches_production() {
         let model = parse_model_string(IGD_ALAG_ODE).expect("parse");
         assert!(
             model.has_lagtime(),
             "ALAG1 must enable has_lagtime() (precondition for the gate)"
         );
-        // igd() + lagtime stays on FD: lagtime routes to the event-driven walk, which
-        // carries no `R_in` forcing, while the static walk (which handles igd) declines
-        // lagtime — so neither serves it (#430 finding 1; #439). Both per-subject gates
-        // decline, so `ode_subject_sensitivities` returns `None` → FD.
         let subj = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0]);
         assert!(
             !ode_subject_supported(&model, &subj),
-            "igd()+lagtime: static walk declines (lagtime)"
+            "igd()+lagtime: the static walk still declines lagtime (routes to event-driven, #439)"
         );
         assert!(
-            !ode_tvcov_supported(&model, &subj),
-            "igd()+lagtime: event-driven walk declines (input-rate forcing)"
+            ode_tvcov_supported(&model, &subj),
+            "igd()+lagtime: the event-driven walk now carries R_in (#486)"
         );
+        let theta = vec![5.0, 50.0, 2.0, 0.3, 0.3];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        // The onset saltation's 2nd-order coefficient (`coef2` in `inject_rate_saltation`,
+        // fed `dr = rate_at_zero(...)` here) is otherwise only value/1st-order checked
+        // above; FOCEI's inner Newton step and Laplace `log|H̃|` consume the 2nd-order
+        // blocks, so validate them against FD of the analytic 1st-order gradient too.
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    // A one-compartment `first_order()` absorption model (feeds `central` directly,
+    // no separate depot) — the textbook Bateman shape with an estimated lagtime.
+    // Unlike inverse-Gaussian, `FirstOrder`'s onset `R_in(0⁺) = dose·ka` is *always*
+    // finite and nonzero, so this is the sharpest check of the new rate-on
+    // saltation's `Δr ≠ 0` arm (`ode_provider_igd_with_alag_matches_production`
+    // exercises only the `Δr = 0` case, since IG's onset always vanishes).
+    const FIRST_ORDER_ALAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0,  0.1, 100.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVKA(1.0,  0.05, 20.0)
+  theta TVLAG(0.3, 0.01,  5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_KA ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA * exp(ETA_KA)
+  ALAG1 = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// `first_order()` + an estimated compartment-indexed lag (#486): the onset
+    /// saltation's `Δr = dose·ka` is always finite and nonzero, so this is the
+    /// sharpest check of the new rate-on injection (contrast the IG test, whose
+    /// onset always vanishes). Value/`∂f/∂η`/`∂f/∂θ` (incl. `∂f/∂TVLAG` and
+    /// `∂f/∂TVKA`) must match the production predictor + central FD, and the inner
+    /// `Dual1` walk must reproduce the outer `Dual2` walk's η-gradient exactly.
+    ///
+    /// Observation times deliberately avoid landing exactly on `dose.time + TVLAG`
+    /// (`= 0.3` here): a nonzero-onset forcing's prediction has a genuine kink there
+    /// in `lag` (0 for `lag ≥ obs.time`, smoothly increasing for `lag < obs.time`),
+    /// so central FD at that exact point averages the two one-sided derivatives
+    /// (one of which is 0) instead of probing the analytic gradient's right-continuous
+    /// convention (`R_in` active from `tad ≥ 0⁺`) — a test artifact, not a provider bug.
+    #[test]
+    fn ode_provider_first_order_with_alag_matches_production() {
+        let model = parse_model_string(FIRST_ORDER_ALAG_ODE).expect("parse");
+        assert!(model.has_lagtime());
+        let subj = bolus_subject(&[0.1, 0.2, 0.4, 0.6, 1.0, 2.0, 4.0, 8.0]);
+        assert!(!ode_subject_supported(&model, &subj));
         assert!(
-            ode_subject_sensitivities(&model, &subj, &[5.0, 50.0, 2.0, 0.3, 0.3], &[0.1, -0.05])
-                .is_none(),
-            "igd()+ALAG1 must route to FD"
+            ode_tvcov_supported(&model, &subj),
+            "first_order()+lagtime: the event-driven walk now carries R_in (#486)"
+        );
+        let theta = vec![5.0, 50.0, 1.0, 0.3];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        // The sharpest 2nd-order check of the new onset saltation: `Δr = dose·ka` is
+        // nonzero here (unlike IG/transit's vanishing onset), so `coef2`'s `rate_at_zero`
+        // contribution is live. FOCEI's inner Newton step / Laplace `log|H̃|` consume
+        // `d2f_deta2`/`d2f_deta_dtheta`, so validate them against FD of the analytic
+        // 1st-order gradient (only value/1st-order is checked above).
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    // TRANSIT_ODE (depot → central, forcing on depot) with an estimated
+    // compartment-indexed lag on the *depot* (the forcing's own compartment). With
+    // `N > 0` (TVN = 3.0) the onset vanishes (any `n > 0` dominates to zero, mirroring
+    // IG), so this exercises the `Transit` `n > 0` arm of `rate_at_zero` end-to-end.
+    const TRANSIT_ALAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.1, 20.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_N  ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  MTT   = TVMTT
+  N     = TVN * exp(ETA_N)
+  KA    = TVKA
+  ALAG1 = TVLAG
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = transit(n=N, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// `transit()` + an estimated lag on the forcing's own compartment (#486): `N`
+    /// carries IIV, so the second-order `trigamma` forcing terms also flow through
+    /// the event-driven walk here (not just the static one). `N > 0` throughout, so
+    /// the onset saltation is the `rate_at_zero` zero-jump arm.
+    #[test]
+    fn ode_provider_transit_with_alag_matches_production() {
+        let model = parse_model_string(TRANSIT_ALAG_ODE).expect("parse");
+        assert!(model.has_lagtime());
+        let subj = bolus_subject(&[0.1, 0.3, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        assert!(!ode_subject_supported(&model, &subj));
+        assert!(
+            ode_tvcov_supported(&model, &subj),
+            "transit()+lagtime: the event-driven walk now carries R_in (#486)"
+        );
+        let theta = vec![5.0, 50.0, 1.0, 3.0, 1.0, 0.3];
+        let eta = vec![0.1, 0.05];
+        check_vs_production(&model, &subj, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        // 2nd-order check of the `rate_at_zero` zero-jump arm's saltation coefficient —
+        // only value/1st-order is checked above, but FOCEI's inner Newton step / Laplace
+        // `log|H̃|` consume the 2nd-order blocks.
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
+    }
+
+    /// `transit()` + an EVID 3/4 reset (#486, cell (b)): the static walk still
+    /// declines (no lagtime here, but the subject carries a reset), and the fix is
+    /// kind-agnostic, so transit inherits it exactly like igd/weibull.
+    #[test]
+    fn ode_provider_transit_with_reset_matches_production() {
+        let model = parse_model_string(TRANSIT_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 11.0, 13.0, 16.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![10.0];
+        let theta = vec![5.0, 50.0, 1.0, 3.0, 1.0];
+        let eta = vec![0.1, 0.05];
+        assert!(
+            ode_subject_supported(&model, &subject),
+            "transit() + reset is shared scope for both outer and inner (#486)"
+        );
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// `zero_order()` + an EVID 3/4 reset (#486 review follow-up): the kind-agnostic
+    /// gate relaxation in `ode_subject_supported` (dropped for every `InputRateKind`,
+    /// not just the "smooth density" forcings this PR's forcing loop touches) also
+    /// admits a pure `zero_order()` model. Its own moving-boundary cutoff is a
+    /// separate, pre-existing per-segment mechanism (`zero_windows`/`reset_floor`,
+    /// #530) untouched by this PR, so this closes an undocumented capability rather
+    /// than adding new machinery. The reset fires *inside* the first dose's open
+    /// window (`[0, DUR=4]` cut short at `t=2`) — the exact straddling case that
+    /// would leak pre-reset mass if `reset_floor` weren't already threaded through
+    /// `zero_windows`.
+    #[test]
+    fn ode_provider_zero_order_with_reset_matches_production() {
+        const ZERO_ORDER_ODE_RESET: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(ZERO_ORDER_ODE_RESET).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 4.0, 8.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![2.0];
+        let theta = vec![5.0, 50.0, 4.0];
+        let eta = vec![0.1, 0.05];
+        assert!(
+            ode_subject_supported(&model, &subject),
+            "zero_order() + reset is shared scope for both outer and inner (#486, kind-agnostic gate)"
+        );
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// `mixed` (zero-order + first-order) absorption + an EVID 3/4 reset (#486
+    /// review follow-up): the same kind-agnostic gate relaxation, now exercised for
+    /// the `mixed` combination — the `zero_order` term's window is what's exposed to
+    /// the reset-cutting hazard; the `first_order` term rides the general
+    /// smooth-density reset fix this PR adds.
+    #[test]
+    fn ode_provider_mixed_with_reset_matches_production() {
+        const MIXED_ODE_RESET: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(3.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FZO  = TVFZO
+  FZO1 = 1 - TVFZO
+  KA   = TVKA
+  DUR  = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(MIXED_ODE_RESET).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 2.5, 4.0, 8.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(1.5, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![1.5];
+        let theta = vec![5.0, 50.0, 0.4, 1.0, 3.0];
+        let eta = vec![0.12, -0.08];
+        assert!(
+            ode_subject_supported(&model, &subject),
+            "mixed absorption + reset is shared scope for both outer and inner (#486, kind-agnostic gate)"
+        );
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    // WEIBULL_ODE with an allometric weight covariate on CL — exercises cell (c):
+    // TV-cov + input-rate on the event-driven walk (no lagtime involved at all, so
+    // the dose's arrival is a fixed, non-dual boundary; the continuous forcing's
+    // `∂f/∂(TVTD,TVBETA,ETA_BETA)` must still match production under changing
+    // per-event PK params).
+    const WEIBULL_ODE_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVTD(2.0,  0.05,  24.0)
+  theta TVBETA(1.5, 0.1,  10.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL   ~ 0.09
+  omega ETA_BETA ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V    = TVV
+  TD   = TVTD
+  BETA = TVBETA * exp(ETA_BETA)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// `weibull()` + a time-varying covariate (#486, cell (c)): the event-driven walk
+    /// now carries `R_in`, hoisting the forcing's dose-invariant constants fresh per
+    /// segment as `CL` (hence the per-event PK snapshot) changes with `WT`.
+    #[test]
+    fn ode_provider_weibull_tvcov_matches_production() {
+        let model = parse_model_string(WEIBULL_ODE_TVCOV).expect("parse");
+        let mut subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 16.0]);
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        subject.dose_covariates = vec![wt(60.0)];
+        subject.obs_covariates = vec![wt(60.0), wt(65.0), wt(70.0), wt(75.0), wt(80.0), wt(85.0)];
+        assert!(subject.has_tv_covariates());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "weibull()+TV-cov must be analytic on the event-driven walk (#486)"
+        );
+        let theta = vec![5.0, 50.0, 2.0, 1.5, 0.75];
+        let eta = vec![0.1, 0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// Gate-scope regression: `zero_order()` + a TV covariate must stay on the FD
+    /// fallback (#486 Open Questions — the stretch). Its own moving-boundary cutoff
+    /// is a *per-segment constant* delivery (`integrate_g`'s `zero_windows`) that the
+    /// event-driven walk doesn't carry; admitting it here would silently drop the
+    /// forcing (`add_prepared_input_rate_forcing` skips `ZeroOrder` by design).
+    #[test]
+    fn ode_provider_zero_order_tvcov_stays_on_fd_fallback() {
+        const ZERO_ORDER_ODE_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(ZERO_ORDER_ODE_TVCOV).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 10.0]);
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        subject.dose_covariates = vec![wt(60.0)];
+        subject.obs_covariates = vec![wt(60.0), wt(65.0), wt(70.0), wt(75.0)];
+        assert!(subject.has_tv_covariates());
+        assert!(
+            !ode_tvcov_supported(&model, &subject),
+            "zero_order()+TV-cov must stay on FD until the moving-boundary cutoff is ported \
+             to the event-driven walk (#486 stretch)"
         );
     }
 }

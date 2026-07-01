@@ -48,8 +48,18 @@ section of the SDLC for the versioning policy).
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK
   jet, and the moving infusion-end boundary carries `∂/∂{θ,η,κ}` — including when the
-  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`). Steady-state modeled doses
-  stay on the finite-difference fallback for now.
+  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`).
+- Three more **steady-state (`SS=1`) ODE dosing** combinations now get exact analytic
+  FOCE/FOCEI sensitivities instead of finite differences (#486): a modeled-duration/rate
+  dose (`RATE=-1`/`-2`), a rate-defined infusion under bioavailability `F ≠ 1`, and an
+  estimated lagtime. The SS dual equilibration now threads the
+  same mode-aware rate/window jet the non-SS event-driven walk uses into its per-cycle
+  active/quiet split, and a lagged SS dose's pre-arrival window `[t_dose, t_dose+lag)` is
+  seeded from the previous interval's steady-state tail (mirroring the production
+  predictor's own pre-arrival seed). Only SS combined with a non-autonomous RHS (one that
+  reads `TIME`/`TAFD`/`TAD`) stays on the FD fallback — a time-invariant pulse train has no
+  well-defined steady state under a time-dependent RHS. See
+  [Steady-state dosing](model-file/steady-state.qmd).
 - A structural parameter that reads the event-time built-in `TIME`/`time` (a
   NONMEM-style `$PK IF (TIME.GE.45) CL=…` time-dependent switch) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
@@ -59,8 +69,9 @@ section of the SDLC for the versioning policy).
   with and without inter-occasion variability, including together with an
   η-dependent `obs_scale` expression (the event-driven walk now applies the scale
   quotient — which also makes time-varying-covariate + expression-scale models
-  analytic). Only the direct `pk(...=TIME)` mapping still falls back to finite
-  differences.
+  analytic). The direct `pk(...=TIME)` structural mapping is covered too: the parser
+  desugars the mapped slot into a hidden individual parameter (`__ferx_pktime_*`), so
+  it rides the same per-event analytic walk as an `[individual_parameters]` switch.
 - A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
   **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
@@ -78,6 +89,23 @@ section of the SDLC for the versioning policy).
   subject covariate snapshot), and the EVID=2 breakpoint rides the event-driven
   walk that already carried it — closing the matching cells the IOV path gained in
   #590/#591. LTBS-combined `obs_scale` stays on the FD fallback.
+- **Built-in absorption input-rate forcing** (`igd`/`transit`/`weibull`/`first_order`/
+  `zero_order`, incl. `mixed`) combined with an **EVID 3/4 reset** now gets exact
+  analytic FOCE/FOCEI sensitivities instead of finite differences (#486): the fix
+  threads the already-tracked `reset_floor` into the shared forcing helper (turning
+  off a dose's pre-reset tail, matching the infusion rule) kind-agnostically, so
+  `zero_order`'s own separate per-segment window mechanism (#530) inherits it too.
+  `igd`/`transit`/`weibull`/`first_order` (but not `zero_order`/`mixed`) also now get
+  exact analytic sensitivities combined with **time-varying covariates**, via the
+  same helper wired into the event-driven walk, hoisting the forcing's
+  dose-invariant constants fresh per segment as the PK snapshot changes. Combined
+  with an **estimated lagtime**, `igd`/`transit`/`first_order` are also now
+  analytic: the continuous `∂R_in/∂lag` flows through the walk's dual
+  time-after-dose, and the forcing's onset at the dose's lagged arrival is
+  injected as an exact rate-on saltation. `weibull` stays on the FD fallback when
+  combined with lagtime (its onset can diverge for shape `β < 1`), as does
+  `zero_order`'s own moving-boundary cutoff combined with TV-cov or lagtime (a
+  separate per-segment mechanism not yet ported to the event-driven walk).
 - **Analytic transit-compartment absorption** (#386). A new `pk one_cpt_transit(cl, v, n, mtt)`
   structural model evaluates Savic (2007) transit absorption into a one-compartment disposition as
   an exponential-tilting closed form (the incomplete-gamma `convolve_1cpt`), with exact `Dual2`

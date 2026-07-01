@@ -82,8 +82,12 @@ section of the SDLC for the versioning policy).
   (e.g. a late-phase RUV inflation `PROP_ERR * (1 + RUV_LATE * TIME/48)`).
   Validated against a live NONMEM FOCEI fit (OFV and every estimate, including
   `RUV_LATE`, match to ~4-5 significant figures — see `examples/warfarin_ruv_magnitude.ferx`).
-  `block_sigma` correlated residual error, `iiv_on_ruv`, an M3-BLOQ censored row,
-  more than 16 thetas, and plain `method = foce` (non-interaction) still fall back
+  Plain `method = foce` (non-interaction) now gets the analytic gradient too, on both
+  the non-IOV and IOV paths: the Sheiner–Beal marginal threads the magnitude into its
+  typical-value residual variance `R⁰` (value and direct-θ derivative), so `auto`
+  resolves a FOCE magnitude model to a gradient-based optimizer instead of BOBYQA. The
+  supported theta count is also raised from 16 to 32. `block_sigma` correlated residual
+  error, `iiv_on_ruv`, an M3-BLOQ censored row, and more than 32 thetas still fall back
   to the (magnitude-aware) finite-difference gradient.
 - **`init(...)` initial conditions with time-varying covariates** now get exact analytic
   FOCE/FOCEI sensitivities on the ODE path instead of finite differences (#486). The

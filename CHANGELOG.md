@@ -400,6 +400,12 @@ section of the SDLC for the versioning policy).
   reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
 
 ### Fixed
+- **Optimizer trace is now flushed to disk after every row** so live consumers
+  (e.g. the ferx-r trace UI) see iterations as they happen. The `TraceWriter`
+  wrapped the file in a `BufWriter` and only flushed at `finish()`; high-volume
+  methods (SAEM) filled the buffer and streamed incidentally, but gradient
+  methods (FOCE/FOCEI/GN) emit few rows (smaller than the buffer) so the trace
+  file did not appear until the fit completed.
 - **Gradient optimizers no longer fail on a first-step overshoot into the EBE guard**
   (#486). When the outer optimizer's inner EBE loop rejected a trial step (too many
   unconverged subjects, or a non-finite OFV), the objective was clamped to a flat `1e20`

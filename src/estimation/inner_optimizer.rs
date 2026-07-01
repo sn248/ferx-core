@@ -229,6 +229,19 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         {
             return "steady-state dose + time-dependent ODE RHS";
         }
+        // #486: a steady-state dose combined with a built-in absorption input-rate forcing
+        // (`zero_order`/`first_order`) declines to FD — the dual SS equilibration does not
+        // spread a periodic zero-order window / first-order tail over the cycle. Mirror
+        // `ode_iov_subject_supported`'s bail, in the same order, so this attribution can't
+        // drift.
+        if has_ss
+            && model
+                .ode_spec
+                .as_ref()
+                .is_some_and(|o| !o.input_rate.is_empty())
+        {
+            return "steady-state dose + built-in absorption forcing";
+        }
         let occ_groups = iov_occasion_groups(subject);
         if occ_groups.is_empty() {
             return "no observation occasions";
@@ -3808,6 +3821,45 @@ mod iov_tests {
         assert_eq!(
             iov_fd_reason(&model, &subject),
             "modeled RATE/DURATION dose with missing D/R slot"
+        );
+    }
+
+    #[test]
+    fn iov_fd_reason_attributes_ss_input_rate() {
+        // #486: a steady-state dose + a built-in absorption forcing (`zero_order`) declines
+        // to FD under IOV; `iov_fd_reason` must name that combination (not the generic
+        // "outside IOV analytic scope"), mirroring `ode_iov_subject_supported`'s bail.
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVDUR(5.0,0.1,24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_DUR ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  DUR = TVDUR * exp(ETA_DUR)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse zero_order ODE IOV");
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "SS + zero_order must route to FD under IOV"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "steady-state dose + built-in absorption forcing"
         );
     }
 

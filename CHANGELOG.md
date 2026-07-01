@@ -44,6 +44,14 @@ section of the SDLC for the versioning policy).
   FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
+- **Zero-order absorption (`zero_order(dur)`, and the `zero_order` leg of a `mixed` model)
+  combined with time-varying covariates or an estimated lagtime** now gets exact analytic
+  FOCE/FOCEI sensitivities on the ODE event-driven walk instead of finite differences
+  (#486). The constant `F·amt·frac/dur` window is delivered per integration segment, with
+  its moving end `d.time + lag + dur` (and, under lagtime, its moving start) carried by
+  rate-off / rate-on saltations; the rate-off uses the general `g⁻ − g⁺` form so a
+  covariate that varies across the window end stays exact. Only `zero_order` under IOV
+  remains on finite differences.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) on the analytical
   (closed-form 1-/2-/3-cpt) models** now get exact analytic FOCE/FOCEI sensitivities
   instead of finite differences (#486), closing the largest closed-form-vs-ODE gap (the
@@ -469,6 +477,16 @@ section of the SDLC for the versioning policy).
   data clock everywhere — the model `TIME`/`T` builtin, `[derived]` columns,
   sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
   report the value in the data file; no per-subject time shift is applied.
+
+### Fixed
+- **Finite / modeled-duration infusions combined with a time-varying covariate that
+  changes across the infusion's end** now get an exact analytic second-order gradient
+  (#486). The rate-off boundary sits between records, so the RHS Jacobian jumps there;
+  the closed-form rate-off saltation assumed a single parameter set and dropped the
+  `(J⁺ − J⁻)·x` curvature term, biasing the FOCEI Hessian / covariance-step SEs by a few
+  percent (first-order gradient and OFV were unaffected). The infusion end now uses the
+  same general `g⁻ − g⁺` saltation as the zero-order window end. Cases without a covariate
+  varying across the infusion end are unchanged.
 
 ### Changed
 - For `block_sigma` correlated residual models, the SAEM reported OFV (the

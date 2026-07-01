@@ -3668,12 +3668,16 @@ mod tests {
     /// event-driven walk applies the subject-static scale quotient post-walk (validated
     /// in `expression_scale_on_event_walk_matches_fd_closed_form`,
     /// `ode_expression_scale_on_event_walk_matches_production`, and
-    /// `ode_iov_time_expression_scale_matches_fd_of_predict_iov`). The only fallback
-    /// specific to `TIME` is the direct `pk(...=TIME)` mapping (not desugared into the
-    /// program's `pk_slots`); the pre-existing scale fallbacks (LTBS + `ExpressionScale`;
-    /// closed-form IOV + any scaling) are unchanged and independent of `TIME`. The
-    /// non-`TIME` twin of each model must stay supported, proving the guards are specific
-    /// (#486 / #610).
+    /// `ode_iov_time_expression_scale_matches_fd_of_predict_iov`). The direct
+    /// `pk(...=TIME)` mapping is now desugared into a synthetic `__ferx_pktime_*`
+    /// individual parameter and served analytically too (see the `ANALYTICAL_TIME_DIRECT`
+    /// block below and `time_builtin_direct_pk_mapping_matches_fd_of_production`); the only
+    /// remaining `TIME`-specific fallbacks are edge combinations the event-driven walk
+    /// itself cannot serve (an ODE `init(...)` baseline or a built-in input-rate forcing
+    /// under `TIME`, asserted below). The pre-existing scale fallbacks (LTBS +
+    /// `ExpressionScale`; closed-form IOV + any scaling) are unchanged and independent of
+    /// `TIME`. The non-`TIME` twin of each model must stay supported, proving the guards
+    /// are specific (#486 / #610).
     #[test]
     fn time_builtin_indiv_params_force_fd_fallback() {
         // Analytical 1-cpt IV: a `$PK IF(TIME...)`-style switch on CL.
@@ -3910,22 +3914,27 @@ mod tests {
             "TIME + init(...) ODE outer route must report FD, not analytic"
         );
 
-        // Direct `pk(...=TIME)` mapping (not an `[individual_parameters]`
-        // statement): the `pk_time_mapping` slot sets `uses_time_builtin` too, but
-        // it is NOT desugared into the individual-parameter program's `pk_slots`, so
-        // `prog_covers_required_pk_slots` does not see the mapped slot and the
-        // per-event analytic walk declines — the subject stays on FD. Analytic
-        // support for the direct-mapping form is a follow-up to #486 (it needs the
-        // mapped slot threaded into the program as a hidden, TIME-only parameter).
+        // Direct `pk(...=TIME)` mapping (not an `[individual_parameters]` statement): the
+        // parser now desugars the `=TIME` binding into a synthetic
+        // `__ferx_pktime_<slot> = TIME` individual parameter (mirroring the #631 Form-C
+        // readout desugaring), so the mapped slot enters the program's `pk_slots` and
+        // rides the same per-event analytic walk as an `[individual_parameters]` TIME
+        // switch — no longer FD (#486 direct-mapping follow-up). Use a 2-cpt `q=TIME`
+        // mapping so the mapped slot is not a denominator (a `v=TIME` model divides by
+        // `V = 0` at the `t = 0` dose — a user degeneracy, not a gate concern).
         const ANALYTICAL_TIME_DIRECT: &str = r#"
 [parameters]
   theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.04
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  V2 = TVV2
 [structural_model]
-  pk one_cpt_iv(cl=CL, v=TIME)
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#;
@@ -3935,19 +3944,12 @@ mod tests {
             "direct pk(...=TIME) mapping sets the uses_time_builtin flag"
         );
         assert!(
-            !tvcov_analytical_supported(&direct),
-            "direct pk(...=TIME) mapping is not yet served by the analytic walk (FD follow-up)"
-        );
-        // #637 review #1: since the mapping falls back to FD on every subject, the
-        // model-level report predicates must ALSO say FD — otherwise the fit banner /
-        // `{model}-fit.yaml` would claim "analytic" for a 100%-FD fit.
-        assert!(
-            !analytical_supported(&direct),
-            "direct pk(...=TIME) must report non-analytic at the model level"
+            analytical_supported(&direct) && tvcov_analytical_supported(&direct),
+            "direct pk(...=TIME) mapping is now served by the per-event analytic walk (desugared)"
         );
         assert!(
-            !analytic_outer_gradient_available(&direct),
-            "direct pk(...=TIME) outer gradient route must report FD, not analytic"
+            analytic_outer_gradient_available(&direct),
+            "direct pk(...=TIME) outer gradient route is now analytic"
         );
     }
 
@@ -4116,6 +4118,120 @@ mod tests {
             approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
             for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
                 approx::assert_relative_eq!(a, b, max_relative = 1e-10, epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// #486: a **direct `pk(...=TIME)` structural mapping** (here `q=TIME` on a 2-cpt IV,
+    /// so the mapped slot is not a denominator — `v=TIME` would divide by `V = 0` at the
+    /// `t = 0` dose). The parser desugars it into a synthetic `__ferx_pktime_q = TIME`
+    /// individual parameter, so `Q` = event time per event (`∂Q/∂θ = ∂Q/∂η = 0`) while
+    /// `CL`/`V1`'s derivatives stay exact. value + ∂η + ∂²η + ∂θ + ∂²η∂θ must match central
+    /// FD of production (which threads the same per-event TIME through the desugared param).
+    #[test]
+    fn time_builtin_direct_pk_mapping_matches_fd_of_production() {
+        const DIRECT_Q_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(DIRECT_Q_TIME).expect("parse direct q=TIME");
+        assert!(crate::parser::model_parser::compiled_model_uses_time_builtin(&m));
+        assert!(
+            tvcov_analytical_supported(&m),
+            "direct pk(q=TIME) desugars to an indiv-param → analytic"
+        );
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 10.0, 24.0, 48.0],
+            Vec::new(),
+        );
+        assert!(!s.has_tv_covariates());
+        check_full_provider_vs_fd(&m, &s, &[10.0, 50.0, 100.0], &[0.10, -0.05]);
+    }
+
+    /// #486: the direct `pk(q=TIME)` desugaring must be *exactly* the explicit
+    /// `[individual_parameters] QT = TIME; pk(q=QT)` form — a pure rename into a synthetic
+    /// parameter. This ties the direct mapping to the `[individual_parameters]` TIME path
+    /// that #637 validated live against NONMEM (`METHOD=1 INTER`, ~5 sig figs), so the
+    /// direct form inherits that numerical validation by transitivity. All sensitivity
+    /// outputs (value + ∂η + ∂θ + 2nd-order) must agree to 1e-12.
+    #[test]
+    fn time_builtin_direct_pk_mapping_equivalent_to_explicit_indiv_param() {
+        const DIRECT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const EXPLICIT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+  QT = TIME
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=QT, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m_direct = parse_model_string(DIRECT).expect("parse direct");
+        let m_explicit = parse_model_string(EXPLICIT).expect("parse explicit");
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 10.0, 24.0, 48.0],
+            Vec::new(),
+        );
+        let theta = [10.0, 50.0, 100.0];
+        let eta = [0.10, -0.05];
+        let sd = subject_sensitivities(&m_direct, &s, &theta, &eta).expect("direct sens");
+        let se = subject_sensitivities(&m_explicit, &s, &theta, &eta).expect("explicit sens");
+        assert_eq!(sd.obs.len(), se.obs.len());
+        for (a, b) in sd.obs.iter().zip(se.obs.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-13);
+            for (x, y) in a.df_deta.iter().zip(b.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            for (x, y) in a.df_dtheta.iter().zip(b.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            for (x, y) in a.d2f_deta2.iter().zip(b.d2f_deta2.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            // The mixed η-θ second derivative feeds the FOCEI Laplace `log|H̃|`
+            // θ-gradient this work targets, so it must match too.
+            for (x, y) in a.d2f_deta_dtheta.iter().zip(b.d2f_deta_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
             }
         }
     }

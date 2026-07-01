@@ -47,8 +47,9 @@ section of the SDLC for the versioning policy).
   with and without inter-occasion variability, including together with an
   η-dependent `obs_scale` expression (the event-driven walk now applies the scale
   quotient — which also makes time-varying-covariate + expression-scale models
-  analytic). Only the direct `pk(...=TIME)` mapping still falls back to finite
-  differences.
+  analytic). The direct `pk(...=TIME)` structural mapping is covered too: the parser
+  desugars the mapped slot into a hidden individual parameter (`__ferx_pktime_*`), so
+  it rides the same per-event analytic walk as an `[individual_parameters]` switch.
 - A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
   **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences

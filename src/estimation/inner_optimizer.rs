@@ -1459,10 +1459,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // model that the walk declines (e.g. TIME + `[initial_conditions]`) would report
     // an analytic inner here while `subject_eta_grad` returns `None`, splitting the
     // inner route from the outer.
-    if subject.has_tv_covariates()
-        || crate::sens::provider::subject_has_oral_infusion(model, subject)
-        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-    {
+    if crate::sens::provider::subject_routes_to_event_walk(model, subject) {
         return crate::sens::provider::tvcov_analytical_supported(model);
     }
     true

@@ -251,6 +251,21 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if ode.rhs_program.is_none() {
         return false;
     }
+    // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
+    // (`ode_subject_supported` declines it so it can't take the static superposition
+    // path). So being model-level "analytic" additionally requires that walk's model-level
+    // constraints — `init(...)` and built-in absorption input-rate forcing are handled only
+    // on the static walk (`integrate_tvcov_g` seeds compartments at zero and carries no
+    // `R_in`), so a TIME + `init(...)` or TIME + input-rate model has NO analytic walk and
+    // every subject falls back to FD. Decline here so `sens_supported` /
+    // `analytic_outer_gradient_available` (which call this with no per-subject check) report
+    // FD rather than claiming "analytic" for a 100%-FD population — the ODE twin of the
+    // closed-form `analytical_supported` fix (#637 round-2 review #1).
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        && (ode.init_fn.is_some() || !ode.input_rate.is_empty())
+    {
+        return false;
+    }
     // Readout: the state directly (`ObsCmt`), a simple Form C output program
     // (`y = <expr>` over states/indiv params, e.g. `central / V1`), or a per-CMT
     // Form C (`y[CMT=N] = <expr>`) where every endpoint carries a simple program
@@ -2258,6 +2273,17 @@ fn build_iov_scale_jets<T: crate::sens::num::PkNum>(
     jets
 }
 
+/// Whether the IOV ODE walk must seed each event individually (its own occasion ×
+/// covariate snapshot × time) rather than sharing one source per occasion group: TV
+/// covariates, EVID=2 covariate breakpoints, or a `TIME`-built-in structural parameter.
+/// Shared by `run_subject_iov` (outer `Dual2`) and `run_subject_iov_eta` (inner `Dual1`)
+/// so their per-event seeding decisions can't desync (#637 round-2 review #4).
+fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
+    subject.has_tv_covariates()
+        || !subject.pk_only_covariates.is_empty()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+}
+
 /// IOV outer (`Dual2<M>`, `M = n_theta + n_eta + K·n_kappa`) sensitivities for an ODE
 /// model — the IOV counterpart of [`run_subject_tvcov`]. Seeds each event's stacked
 /// PK duals at its (occasion, covariate-snapshot) — one source per occasion group when
@@ -2356,8 +2382,7 @@ fn run_subject_iov<const M: usize>(
     // source the event walk uses, so build it once here and share it with `seed_iov_events`
     // — no double seeding (#575 review). `None` for TV-cov OR `TIME` subjects (each event
     // seeds at its own snapshot/time in `seed_iov_events`).
-    let per_event =
-        subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty() || uses_time;
+    let per_event = iov_walk_per_event(model, subject);
     let static_group_dual: Option<Vec<Vec<Dual2<M>>>> = if per_event {
         None
     } else {
@@ -2656,8 +2681,7 @@ fn run_subject_iov_eta<const N: usize>(
     // Static-cov per-group seeding built once and shared by the event walk — the inner
     // counterpart of the outer `static_group_dual` (#575 review). `None` for TV-cov OR
     // `TIME` subjects.
-    let per_event =
-        subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty() || uses_time;
+    let per_event = iov_walk_per_event(model, subject);
     let static_group_dual: Option<Vec<Vec<Dual1<N>>>> = if per_event {
         None
     } else {

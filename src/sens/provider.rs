@@ -1400,10 +1400,7 @@ pub fn subject_sensitivities_tvcov(
     // need the state-propagating walk rather than dose superposition. A structural
     // parameter reading the `TIME` built-in is piecewise/time-varying for the same
     // reason, so it routes here too even with no TV covariates (#486 / #610).
-    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
-    if !tvcov_analytical_supported(model)
-        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) || uses_time)
-    {
+    if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
     // Steady-state doses equilibrate per-event in the walk (`equilibrate_ss_g`,
@@ -1647,10 +1644,7 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
-    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
-    if !tvcov_analytical_supported(model)
-        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) || uses_time)
-    {
+    if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
@@ -1942,10 +1936,7 @@ fn subject_eta_grad_impl(
     // matching `Dual1` walk (out-of-scope cases return `None` → FD per point).
     // A `TIME`-built-in structural parameter routes through the per-event walk
     // too (piecewise/time-varying), mirroring the outer provider (#486 / #610).
-    if subject.has_tv_covariates()
-        || subject_has_oral_infusion(model, subject)
-        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-    {
+    if subject_routes_to_event_walk(model, subject) {
         return subject_eta_grad_tvcov_with_schedule(model, subject, theta, eta, cached_schedule);
     }
     // Same model/subject scope as the full provider …
@@ -2456,7 +2447,7 @@ pub(crate) fn apply_event_walk_expression_scale_outer(
         scale_prog,
         &pk,
         &pd,
-        &prog.pk_slots(),
+        prog.pk_slots_ref(),
         theta,
         eta,
         &subject.covariates,
@@ -2494,7 +2485,7 @@ pub(crate) fn apply_event_walk_expression_scale_inner(
         scale_prog,
         &pk,
         &dp_deta,
-        &prog.pk_slots(),
+        prog.pk_slots_ref(),
         theta,
         eta,
         &subject.covariates,
@@ -2889,6 +2880,20 @@ pub(crate) fn subject_has_oral_infusion(model: &CompiledModel, subject: &Subject
     ) && subject.doses.iter().any(|d| d.is_infusion())
 }
 
+/// True when a subject must be served by the event-driven per-event walk rather than
+/// dose superposition: it carries **time-varying covariates**, an **oral infusion**
+/// (#350/#400 forced responses), or the model reads the **`TIME` built-in** in a
+/// structural parameter — all of which make the PK parameters per-event dynamic. Single
+/// source of truth so the outer gradient (`subject_sensitivities_impl`), the inner EBE
+/// gradient (`subject_eta_grad_impl` and `inner_optimizer::analytic_inner_grad_supported`),
+/// and the two TV-walk triggers cannot drift to different routing decisions (#637 round-2
+/// review #3).
+pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subject) -> bool {
+    subject.has_tv_covariates()
+        || subject_has_oral_infusion(model, subject)
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+}
+
 fn subject_sensitivities_impl(
     model: &CompiledModel,
     subject: &Subject,
@@ -2943,10 +2948,7 @@ fn subject_sensitivities_impl(
     // must route through the per-event walk even with no TV covariates, since the
     // dose-superposition path below would freeze it at one `t=0` snapshot (#486 /
     // #610).
-    if subject.has_tv_covariates()
-        || subject_has_oral_infusion(model, subject)
-        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-    {
+    if subject_routes_to_event_walk(model, subject) {
         return subject_sensitivities_tvcov(model, subject, theta, eta);
     }
     // EVID=3/4 resets are handled by restricting dose superposition to the
@@ -3867,6 +3869,45 @@ mod tests {
         assert!(
             crate::sens::ode_provider::ode_iov_supported(&ode_iov_t),
             "ODE IOV now serves TIME via the per-event stacked walk (#486)"
+        );
+
+        // #637 round-2 review #1: a TIME + `init(...)` ODE model must report FD at the
+        // model level. TIME forces the event-driven walk (`ode_subject_supported`
+        // declines it), but that walk cannot seed a non-zero `init(...)` state, so every
+        // subject falls back to FD — `ode_analytical_supported` / `analytic_outer_gradient_available`
+        // must therefore report FD, not "analytic".
+        const ODE_TIME_INIT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let ode_time_init = parse_model_string(ODE_TIME_INIT).expect("parses ODE TIME init");
+        assert!(uses_time(&ode_time_init) && ode_time_init.ode_spec.is_some());
+        assert!(
+            !ode_supported(&ode_time_init),
+            "TIME + init(...) ODE must decline at the model level (no analytic walk)"
+        );
+        assert!(
+            !analytic_outer_gradient_available(&ode_time_init),
+            "TIME + init(...) ODE outer route must report FD, not analytic"
         );
 
         // Direct `pk(...=TIME)` mapping (not an `[individual_parameters]`

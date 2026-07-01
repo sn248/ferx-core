@@ -1391,9 +1391,27 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
     pk_indices: &[usize],
     n_states: usize,
 ) -> Vec<T> {
-    // First-record snapshot (smallest record time), matching production's `init_pk`
-    // selection. Doses/obs/pk-only are scanned in that order, so at an exact tie the
-    // earliest-considered snapshot wins — identical to production's `consider` (`t < bt`).
+    // First-record snapshot (smallest record time), matching production's `init_pk` selection.
+    let snap = match first_record_pk::<T>(subject, pk_at_dose, pk_at_obs, pk_at_pk_only) {
+        Some(p) => p,
+        None => return vec![T::from_f64(0.0); n_states],
+    };
+    init_taylor_seed_at::<T>(init_fn, snap, pk_indices, n_states)
+}
+
+/// The PK-param snapshot at the subject's **first record** (smallest record time), matching
+/// production's `init_pk` selection (`ode/predictions.rs`) and its `last_pk` seed for a reset
+/// that is itself the first event. Doses / obs / pk-only are scanned in that order under a
+/// strict `t < best_t`, so at an exact tie the earliest-considered snapshot wins — dose over
+/// obs over pk-only, identical to production's `consider`. `None` when the subject has no
+/// records. Shared by [`tvcov_init_state`] (the initial `init` seed) and the event-driven
+/// walk's `last_params` seed (the reset re-seed's snapshot, #486 review) so the two can't drift.
+fn first_record_pk<'a, T: crate::sens::num::PkNum>(
+    subject: &Subject,
+    pk_at_dose: &'a [Vec<T>],
+    pk_at_obs: &'a [Vec<T>],
+    pk_at_pk_only: &'a [Vec<T>],
+) -> Option<&'a [T]> {
     let mut best_t = f64::INFINITY;
     let mut best: Option<&[T]> = None;
     for (k, d) in subject.doses.iter().enumerate() {
@@ -1414,11 +1432,7 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
             best = Some(&pk_at_pk_only[m]);
         }
     }
-    let snap = match best {
-        Some(p) => p,
-        None => return vec![T::from_f64(0.0); n_states],
-    };
-    init_taylor_seed_at::<T>(init_fn, snap, pk_indices, n_states)
+    best
 }
 
 /// Seed the ODE `init(...)` state on the walk's own dual basis from a **given** PK-param
@@ -4163,15 +4177,17 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     let mut reset_floor = f64::NEG_INFINITY;
 
     // Most-recent record's params, used to integrate a segment ending at a **reset** or
-    // infusion-end (neither carries a PK record — mirrors production's `last_pk`). The first
-    // event's segment is empty (`cur_t == tl[0].0`), so this initial value is rarely read
-    // before a real record sets it; any available record snapshot is a defensive fallback.
-    let mut last_params: &[T] = pk_at_obs
-        .first()
-        .or_else(|| pk_at_dose.first())
-        .or_else(|| pk_at_pk_only.first())
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
+    // infusion-end (neither carries a PK record — mirrors production's `last_pk`). Seeded with
+    // the **first-record** snapshot (production's `init_pk`, dose-preferred on ties), not an
+    // arbitrary array-first slice: a reset that is itself the first event (an EVID=4 reset+dose
+    // at `t = 0`) re-seeds `init` from `last_params` here (`init_taylor_seed_at` in the
+    // `K_RESET` branch), and production re-applies `init(&last_pk.values)` with
+    // `last_pk = init_pk.unwrap_or_default()` there — so the snapshot must match production's
+    // `init_pk`, or the reset re-seed (hence its gradient) diverges for that edge case
+    // (#486 review — Copilot). For every later reset `last_params` is overwritten by the most
+    // recent record, exactly as production updates `last_pk` (#486).
+    let mut last_params: &[T] =
+        first_record_pk::<T>(subject, pk_at_dose, pk_at_obs, pk_at_pk_only).unwrap_or(&[]);
 
     for p in 0..tl.len() {
         let (t_event, kind, idx) = tl[p];
@@ -8990,6 +9006,65 @@ mod tests {
             "init + reset must be analytic on the event-driven walk (#486)"
         );
         let theta = vec![1.0, 20.0, 0.75, 500.0];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    // 1-cpt IV with an `init(central) = BASE/V` baseline whose `V` (hence `init`) depends on a
+    // WT covariate — so the *snapshot* the reset re-seed reads is observable in the gradient.
+    const ONECPT_IV_INIT_WTV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV * (WT / 70) * exp(ETA_V)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = -CL/V * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
+    /// **`init(...)` + EVID=4 reset+dose at `t = 0` (the reset is the first timeline event)**
+    /// (#486 review — Copilot). Production re-applies `init(&last_pk.values)` at the reset with
+    /// `last_pk = init_pk` (the first-record snapshot, dose-preferred on ties). The walk seeds
+    /// `last_params` from the *same* `first_record_pk` selection, so the reset re-seed reads the
+    /// dose@0 snapshot — not an arbitrary array-first obs slice. Here `init = BASE/V` and `V`
+    /// depends on WT, and the dose@0 covariate (WT=60) differs from the observations' (WT=90),
+    /// so a wrong snapshot at the re-seed would shift the baseline and its `∂/∂(θ,η)`. Validated
+    /// against FD of the production predictor, plus inner/outer parity. (Before the fix
+    /// `last_params` was `pk_at_obs.first()` = the WT=90 obs snapshot → mismatch.)
+    #[test]
+    fn ode_provider_init_reset_dose_at_zero_matches_production() {
+        let model = parse_model_string(ONECPT_IV_INIT_WTV_ODE).expect("parse");
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let mut subject = bolus_subject(&[1.0, 2.0, 4.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        subject.dose_covariates = vec![wt(60.0)]; // dose@0 snapshot: WT=60
+        subject.obs_covariates = vec![wt(90.0), wt(90.0), wt(90.0)]; // obs: WT=90
+        subject.covariates = wt(60.0);
+        subject.reset_times = vec![0.0]; // EVID=4 reset+dose at t=0 → reset is the first event
+        assert!(subject.has_tv_covariates());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "init + reset must be analytic (#486)"
+        );
+        let theta = vec![1.0, 20.0, 500.0];
         let eta = vec![0.1, -0.05];
         check_vs_production(&model, &subject, &theta, &eta);
         check_hessian_vs_production_fd(&model, &subject, &theta, &eta);

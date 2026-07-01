@@ -35,6 +35,14 @@ section of the SDLC for the versioning policy).
   the prediction value is unchanged and the synthetic parameters never appear in
   EBE / sdtab output. (A readout referencing a neural-network output stays on the
   FD fallback.)
+- Two more **non-IOV ODE** model combinations now get exact analytic FOCE/FOCEI
+  sensitivities instead of finite differences (#486): a time-varying-covariate ODE
+  model with **(a)** an `EVID=2` covariate-only breakpoint, or **(b)** an
+  η-dependent `obs_scale = expr(θ,η)` divisor. The `obs_scale` divisor is applied
+  as a single subject-static post-walk quotient (production evaluates it at the
+  subject covariate snapshot), and the EVID=2 breakpoint rides the event-driven
+  walk that already carried it — closing the matching cells the IOV path gained in
+  #590/#591. LTBS-combined `obs_scale` stays on the FD fallback.
 - **Analytic transit-compartment absorption** (#386). A new `pk one_cpt_transit(cl, v, n, mtt)`
   structural model evaluates Savic (2007) transit absorption into a one-compartment disposition as
   an exponential-tilting closed form (the incomplete-gamma `convolve_1cpt`), with exact `Dual2`

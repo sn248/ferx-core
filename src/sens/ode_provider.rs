@@ -484,18 +484,15 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     {
         return false;
     }
-    // On this **non-IOV** TV-cov path an `ExpressionScale` divisor is served only on the
-    // **static** walk (the subject-static quotient via `apply_expression_scale_outer`,
-    // #486); the event-driven walk here carries no post-walk scale quotient, so decline
-    // rather than run the walk *without* applying the scale. (The scale itself is
-    // subject-static even for TV-cov subjects — production `apply_scaling` reads
-    // `subject.covariates` — so the IOV walk *does* serve this combination via its
-    // per-occasion-group post-walk quotient since #590; the non-IOV walk just lacks that
-    // machinery. `ode_subject_supported` also excludes these subjects from the static
-    // walk, so the net effect is FD for the non-IOV combination.)
-    if matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
-        return false;
-    }
+    // An η-dependent `ExpressionScale` `obs_scale` divisor IS served on this non-IOV TV-cov
+    // walk now (#486): the scale is **subject-static even for TV-cov subjects** (production
+    // `apply_scaling` reads `subject.covariates`), so `run_subject_tvcov` /
+    // `run_subject_tvcov_eta` apply it as a single subject-static post-walk quotient — the
+    // IOV per-occasion-group machinery (#590) collapses to one jet because there is no κ.
+    // Admissibility (`!log_transform`, axis counts, axis cap) is already enforced upstream
+    // by `ode_analytical_supported`'s scaling allowlist (only `None`/`ScalarScale`/an
+    // axis-admissible `ExpressionScale` reach here), so no extra guard is needed; LTBS
+    // stays FD via that allowlist's `!log_transform` admissibility.
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
     // `integrate_tvcov_g` shifts each dose to `t_dose + lag` and injects the event-time
     // (saltation) sensitivity, propagated exactly through the per-event params (#439).
@@ -567,11 +564,11 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     }
     // EVID 3/4 resets and finite-duration infusions ARE handled (resets zero the state;
     // infusions add `F·rate` forcing over their lagged window, with rate-boundary lagtime
-    // saltation). EVID=2 pk-only breakpoints are not yet carried on the non-IOV TV-cov
-    // ODE path (the IOV path below supports them since #590).
-    if !subject.pk_only_times.is_empty() {
-        return false;
-    }
+    // saltation). EVID=2 pk-only breakpoints are ALSO carried now (#486): the timeline in
+    // `integrate_tvcov_g` pushes each `K_PKONLY` event and integrates its segment with the
+    // PK params seeded at that record's covariate snapshot (`pk_at_pk_only`), exactly as
+    // the obs/dose breakpoints — with no κ there is no `iov_combined_pk_only` analogue to
+    // build (mirrors the IOV path's #590 support).
     true
 }
 
@@ -1959,7 +1956,34 @@ fn run_subject_tvcov<const M: usize>(
             d2f_deta_dtheta,
         });
     }
-    Some(SubjectSens { obs: out })
+    let mut sens = SubjectSens { obs: out };
+    // η-dependent `ExpressionScale` divisor (#486): the scale is **subject-static even under
+    // TV covariates** (production `apply_scaling` reads `subject.covariates`), so apply it as
+    // a single subject-static post-walk quotient — the SAME `apply_expression_scale_outer`
+    // the static walk uses (`ode_subject_sensitivities:820-848`). The TV-cov walk carries no
+    // whole-subject `pd`/`pk`, so compute them once here at the subject covariate snapshot.
+    // (The IOV per-occasion-group quotient collapses to this single jet — there is no κ.)
+    if let ScalingSpec::ExpressionScale {
+        deriv: Some(sprog), ..
+    } = &model.scaling
+    {
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+        let pd = param_derivatives(model, subject, theta, eta)?;
+        let slots = prog.pk_slots_ref();
+        crate::sens::provider::apply_expression_scale_outer(
+            &mut sens,
+            sprog,
+            &pk,
+            &pd,
+            slots,
+            theta,
+            eta,
+            &subject.covariates,
+            n_theta,
+            n_eta,
+        );
+    }
+    Some(sens)
 }
 
 /// Per-subject IOV scope + dimensions, shared by the outer (`Dual2`) and inner
@@ -2733,6 +2757,30 @@ fn run_subject_tvcov_eta<const N: usize>(
             f: fd.value,
             df_deta,
         });
+    }
+    // η-dependent `ExpressionScale` divisor (#486): apply the subject-static η-only quotient
+    // on the light gradient, via the SAME `apply_expression_scale_inner_dispatch` the static
+    // inner walk uses (`ode_subject_eta_grad:918-944`). Subject-static even under TV-cov, so
+    // compute `pk` + `∂p/∂η` once at `subject.covariates`. Inner and outer MUST move in
+    // lockstep (shared gate) — else the inner EBE gradient silently diverges from the outer.
+    if let ScalingSpec::ExpressionScale {
+        deriv: Some(sprog), ..
+    } = &model.scaling
+    {
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+        let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
+        let slots = prog.pk_slots_ref();
+        crate::sens::provider::apply_expression_scale_inner_dispatch(
+            &mut out,
+            sprog,
+            &pk,
+            &dp_deta,
+            slots,
+            theta,
+            eta,
+            &subject.covariates,
+            n_eta,
+        );
     }
     Some(out)
 }
@@ -4739,42 +4787,177 @@ mod tests {
         check_hessian_vs_fd_of_grad(&model, &subject, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08]);
     }
 
-    /// `ExpressionScale` on the ODE path is served only on the **static** walk: combined
-    /// with **LTBS** or **time-varying covariates** it must route to FD (`None`), so the
-    /// post-walk subject-static quotient never runs where it would be wrong (#486).
+    /// `ExpressionScale` + **LTBS** must route to FD (`None`): the walk applies the LTBS
+    /// log in PK-param space *before* the η/θ chain, so the production scale-then-log order
+    /// can't be reproduced by a post-walk quotient — `expression_scale_axes_admissible`
+    /// gates it on `!log_transform`, so the analytic scope declines it (#486).
     #[test]
-    fn ode_provider_expression_scale_combos_fall_back_to_fd() {
-        // + LTBS → out of analytic scope (the walk applies LTBS pre-chain).
+    fn ode_provider_expression_scale_ltbs_falls_back_to_fd() {
         let mut ltbs = parse_model_string(TWOCPT_ODE_EXPRSCALE).expect("parse");
         ltbs.log_transform = true;
         assert!(
             !ode_analytical_supported(&ltbs),
             "ExpressionScale + LTBS must fall back to FD"
         );
-        // + time-varying covariate → the scale would be per-event; decline both walks.
-        let tvcov = parse_model_string(
-            &TWOCPT_ODE_EXPRSCALE
-                .replace(
-                    "V1 = TVV1 * exp(ETA_V1)",
-                    "V1 = TVV1 * (WT/70) * exp(ETA_V1)",
-                )
-                .replace(
-                    "[error_model]",
-                    "[covariates]\n  WT continuous\n[error_model]",
-                ),
-        )
-        .expect("parse tvcov");
-        let mut subj = bolus_subject(&[1.0, 4.0, 12.0]);
-        subj.obs_covariates = vec![
-            std::iter::once(("WT".to_string(), 60.0)).collect(),
-            std::iter::once(("WT".to_string(), 70.0)).collect(),
-            std::iter::once(("WT".to_string(), 80.0)).collect(),
-        ];
+    }
+
+    /// A 2-cpt IV ODE with **time-varying covariates** (`WT` on `V1`) **and** an η-dependent
+    /// `ExpressionScale` divisor `obs_scale = 1000 / V1`. The scale is **subject-static even
+    /// under TV covariates** (production `apply_scaling` reads `subject.covariates`), so the
+    /// non-IOV TV-cov walk applies it as a single subject-static post-walk quotient (#486 —
+    /// the IOV per-occasion-group machinery of #590 collapses to one jet, no κ). The walk
+    /// itself runs the per-event TV-cov PK params; only the divisor is subject-static.
+    const TWOCPT_ODE_EXPRSCALE_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0,   0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)
+  V1 = TVV1 * (WT/70) * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  obs_scale = 1000 / V1
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// Build a TV-cov subject (WT on dose + per-obs) for the 2-cpt ExpressionScale model,
+    /// with `subject.covariates` carrying the subject-static WT the scale divisor reads.
+    fn exprscale_tvcov_subject() -> Subject {
+        let mut subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        subject.covariates = wt(70.0);
+        subject.dose_covariates = vec![wt(62.0)];
+        subject.obs_covariates = vec![wt(62.0), wt(66.0), wt(70.0), wt(74.0), wt(80.0), wt(88.0)];
+        subject
+    }
+
+    /// TV-cov + `ExpressionScale` on the **non-IOV** ODE walk (#486): the outer provider's
+    /// scaled `f` / `∂f/∂η` / `∂f/∂θ` must match FD of the production TV-cov predictor (which
+    /// divides by the subject-static `obs_scale` via `apply_scaling`), and the 2nd-order
+    /// blocks must match FD of the analytic gradient — exercising the subject-static
+    /// `apply_expression_scale_outer` quotient layered onto the per-event TV-cov jet.
+    #[test]
+    fn ode_provider_tvcov_expression_scale_matches_production() {
+        let model = parse_model_string(TWOCPT_ODE_EXPRSCALE_TVCOV).expect("parse");
         assert!(
-            ode_subject_sensitivities(&tvcov, &subj, &[4.0, 12.0, 2.0, 25.0], &[0.12, -0.08])
-                .is_none(),
-            "ExpressionScale + TV covariate must fall back to FD (None)"
+            matches!(
+                model.scaling,
+                ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+            ),
+            "model must carry a differentiable scale program"
         );
+        let subject = exprscale_tvcov_subject();
+        assert!(subject.has_tv_covariates());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "TV-cov + ExpressionScale must be analytic on the non-IOV ODE walk (#486)"
+        );
+        let theta = vec![4.0, 12.0, 2.0, 25.0];
+        let eta = vec![0.12, -0.08];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+    }
+
+    /// Inner/outer parity for TV-cov + `ExpressionScale` (#486): the light `Dual1` inner
+    /// η-gradient (`run_subject_tvcov_eta` + `apply_expression_scale_inner_dispatch`) must
+    /// equal the full `Dual2` outer `df_deta` (`run_subject_tvcov` + the outer quotient).
+    /// This is the guardrail: both walks share `ode_tvcov_supported`, so the inner quotient
+    /// must move in lockstep with the outer or the EBE gradient silently diverges.
+    #[test]
+    fn ode_provider_tvcov_expression_scale_inner_eta_grad_matches_outer() {
+        let model = parse_model_string(TWOCPT_ODE_EXPRSCALE_TVCOV).expect("parse");
+        let subject = exprscale_tvcov_subject();
+        let theta = vec![4.0, 12.0, 2.0, 25.0];
+        let eta = vec![0.12, -0.08];
+        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
+        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("light");
+        assert_eq!(full.obs.len(), light.len());
+        for (a, b) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    a.df_deta[k],
+                    b.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-10
+                );
+            }
+        }
+    }
+
+    /// Build the TV-cov subject for the 1-cpt `ONECPT_ODE_TVCOV` model with an EVID=2
+    /// covariate-only breakpoint (`pk_only`) at t=3 carrying its own WT snapshot.
+    fn tvcov_pkonly_subject() -> Subject {
+        let mut subject = tvcov_subject();
+        subject.pk_only_times = vec![3.0];
+        subject.pk_only_covariates = vec![HashMap::from([("WT".to_string(), 75.0)])];
+        subject
+    }
+
+    /// TV-cov + EVID=2 pk-only covariate breakpoint on the **non-IOV** ODE walk (#486): the
+    /// analytic outer `SubjectSens` (value, `∂f/∂η`, `∂f/∂θ`, + 2nd order) must match FD of
+    /// the production TV-cov predictor, which carries the same `K_PKONLY` breakpoint. With no
+    /// κ there is no `iov_combined_pk_only` analogue to build — pk-only events seed at their
+    /// own η-snapshot exactly like obs/dose (the IOV path got this in #590).
+    #[test]
+    fn ode_provider_tvcov_pkonly_matches_production() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        let subject = tvcov_pkonly_subject();
+        assert!(
+            !subject.pk_only_times.is_empty(),
+            "fixture must carry an EVID=2 covariate breakpoint"
+        );
+        assert!(subject.has_tv_covariates());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "TV-cov + EVID=2 pk-only must be analytic on the non-IOV ODE walk (#486)"
+        );
+        let theta = vec![1.0, 20.0, 0.75];
+        let eta = vec![0.1];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+    }
+
+    /// Inner/outer parity for TV-cov + EVID=2 pk-only (#486): the light inner η-gradient must
+    /// equal the full outer `df_deta`. Both walks share `ode_tvcov_supported`, so opening the
+    /// pk-only gate enables both — this confirms the inner walk consumes the breakpoint too.
+    #[test]
+    fn ode_provider_tvcov_pkonly_inner_eta_grad_matches_outer() {
+        let model = parse_model_string(ONECPT_ODE_TVCOV).expect("parse");
+        let subject = tvcov_pkonly_subject();
+        let theta = vec![1.0, 20.0, 0.75];
+        let eta = vec![0.1];
+        let full = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("full");
+        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("light");
+        assert_eq!(full.obs.len(), light.len());
+        for (a, b) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    a.df_deta[k],
+                    b.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-10
+                );
+            }
+        }
     }
 
     /// The light `Dual1` inner provider's `f` / `∂f/∂η` must equal the full `Dual2`
@@ -6776,10 +6959,20 @@ mod tests {
         let mut rst = tv.clone();
         rst.reset_times = vec![3.0];
         assert!(ode_tvcov_supported(&model, &rst));
-        // EVID=2 pk-only breakpoints remain out of scope → FD.
+        // TV-cov + EVID=2 pk-only breakpoints → now supported (the walk carries `K_PKONLY`
+        // events seeded at the breakpoint's covariate snapshot; no κ, so no combined-pk-only
+        // analogue to build — #486).
         let mut pko = tv.clone();
         pko.pk_only_times = vec![1.5];
-        assert!(!ode_tvcov_supported(&model, &pko));
+        pko.pk_only_covariates = vec![HashMap::from([("WT".to_string(), 75.0)])];
+        assert!(ode_tvcov_supported(&model, &pko));
+        // TV-cov + an η-dependent `ExpressionScale` divisor → now supported (subject-static
+        // post-walk quotient, #486). The `ONECPT_ODE_TVCOV` Form-C model has no `obs_scale`,
+        // so check the gate on the dedicated 2-cpt ExpressionScale + TV-cov fixture.
+        let es_model = parse_model_string(TWOCPT_ODE_EXPRSCALE_TVCOV).expect("parse");
+        let es_subj = exprscale_tvcov_subject();
+        assert!(es_subj.has_tv_covariates());
+        assert!(ode_tvcov_supported(&es_model, &es_subj));
     }
 
     /// A model whose individual-parameter program carries more than `MAX_ODE_AXES`

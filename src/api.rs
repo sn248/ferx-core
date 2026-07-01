@@ -7119,7 +7119,23 @@ mod iov_integration {
             "ODE twin must be ODE-IOV-provider supported (analytic inner+outer)"
         );
         let pop = make_iov_population();
-        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bfgs, false);
+        // Use the **default** optimizer (`Auto`) — exactly what a real user gets.
+        // For this model `Auto` resolves to the gradient-based NLopt L-BFGS
+        // (analytic outer gradient is available on both the closed-form and ODE
+        // IOV paths). The previous explicit built-in `Bfgs` was the problem: from
+        // the far default start (TVCL=5.0, true ≈0.28) its line-search overshoots
+        // TVCL to the lower bound on the *ODE* path and stalls in a worse basin
+        // (OFV ~165 vs ~148), while the closed-form twin survives the same
+        // trajectory. The objective and analytic sensitivities are correct —
+        // seeding built-in BFGS at the optimum converges fine — so it was
+        // optimizer basin-capture, not an ODE-IOV gradient defect. See #439/#486.
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&ode),
+            Optimizer::NloptLbfgs,
+            "ODE IOV twin should resolve `auto` to the analytic-gradient L-BFGS"
+        );
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
+        opts.outer_maxiter = 200;
 
         let ra = fit(&ana, &pop, &ana.default_params, &opts).expect("analytical fit");
         let ro = fit(&ode, &pop, &ode.default_params, &opts).expect("ODE fit");

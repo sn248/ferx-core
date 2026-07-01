@@ -206,10 +206,33 @@ enum ExKind {
 /// 1-/2-/3-cpt model (IV bolus/infusion + oral), `tv_fn` present, no ODE.
 /// Per-subject gates (TV covariates) are checked separately in
 /// [`subject_sensitivities`].
+///
+/// A model that reads the event-time built-in `TIME` in a structural parameter
+/// (`compiled_model_uses_time_builtin`) IS admitted here: the parameter is then
+/// piecewise/time-varying, so — like a time-varying covariate — the subject is
+/// routed through the per-event event-driven `Dual2` walk
+/// ([`subject_sensitivities_tvcov`]) rather than dose superposition, which can't
+/// express a mid-decay parameter switch. The routing (`uses_time_builtin`) is in
+/// [`subject_sensitivities_impl`] / [`subject_eta_grad_impl`] (#486 / #610).
 pub fn analytical_supported(model: &CompiledModel) -> bool {
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
-        return false;
-    }
+    // A `TIME` model does NOT use the static dose-superposition path — its subjects
+    // route through the per-event event-driven walk. So being model-level "analytic"
+    // additionally requires that walk to serve it (`tvcov_analytical_supported`);
+    // otherwise the direct `pk(...=TIME)` mapping (whose mapped slot is not desugared
+    // into the program's `pk_slots`, so `tvcov_analytical_supported` declines it) would
+    // report "analytic" through `sens_supported` / `analytic_outer_gradient_available` /
+    // `analytic_inner_grad_supported_model` while every subject actually falls back to FD
+    // — a route/report drift (#637 review #1). `tvcov_analytical_supported` calls the
+    // non-recursive [`analytical_supported_core`], so there is no cycle.
+    analytical_supported_core(model)
+        && (!crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+            || tvcov_analytical_supported(model))
+}
+
+/// The model-level closed-form scope check shared by [`analytical_supported`] and
+/// [`tvcov_analytical_supported`] — everything except the `TIME`-routing clause, so the
+/// two can compose without recursion (#637 review #1).
+fn analytical_supported_core(model: &CompiledModel) -> bool {
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -616,9 +639,10 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
-        return false;
-    }
+    // A `TIME`-built-in structural parameter is served analytically: `build_iov_sources`
+    // seeds each occasion's PK-param value AND its `CombinedDerivs` at that event's time
+    // (per-event branch, gated on `uses_time_builtin`), so both IOV loops evaluate the
+    // switch at the right time (#486). No early-return needed.
     // M3 BLOQ + IOV is analytic as of #580. The IOV objective promotes M3 to the
     // censored marginal (`foce_subject_nll_iov` / `individual_nll_iov`, data term
     // `−logΦ(z)`), and the analytic gradient now differentiates that same function:
@@ -870,9 +894,15 @@ fn build_iov_sources(
         }
     }
 
-    // Combined derivatives at `(theta, combined)` evaluated at covariate map `cov`,
-    // dispatching the program-eval width `MP = n_theta + n_eff`.
-    let cd_at = |combined: &[f64], cov: &std::collections::HashMap<String, f64>| {
+    // Combined derivatives at `(theta, combined)` evaluated at covariate map `cov`
+    // and event time `time`, dispatching the program-eval width `MP = n_theta +
+    // n_eff`. The `TIME` built-in resolves `Op::PushTime` from the model-time
+    // thread-local, which `iov_combined_derivs`' `Dual2` walk reads; seed it with the
+    // per-event time (gated on `uses_time`, like the f64 `pk_param_fn` closure) so
+    // each occasion's PK-param derivatives are evaluated at that event's TIME (#486).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let cd_at = |time: f64, combined: &[f64], cov: &std::collections::HashMap<String, f64>| {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         crate::sens::provider::iov_combined_derivs_dyn(
             prog, n_theta, n_eff, n_diff, cov, theta, combined,
         )
@@ -882,21 +912,32 @@ fn build_iov_sources(
     // at that event's covariate snapshot, so a time-varying covariate is exact (no
     // per-group caching across events). When covariates are subject-static, one source
     // per occasion group is built and shared, preserving the non-TV cost.
-    let has_tv = subject.has_tv_covariates();
+    // A `TIME`-built-in structural parameter is per-event dynamic even with no TV
+    // covariates, so it must take the per-event branch (the one-source-per-group
+    // fast path below would freeze every occasion at `t = 0`) — mirroring the
+    // non-IOV `run_obs_tvcov` and the f64 `compute_event_pk_params_into` (#486).
+    // `has_tv_covariates()` covers dose/obs snapshots but NOT EVID=2 pk-only snapshots,
+    // so include them explicitly — otherwise a subject whose only per-event covariates
+    // are on pk-only records would take the shared static source and evaluate those
+    // events at the wrong covariates (matches the ODE `seed_iov_events` per-event gate;
+    // #637 Copilot #1).
+    let has_tv = subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty();
+    let per_event = has_tv || uses_time;
     let cov_static = &subject.covariates;
     let mut sources: Vec<(crate::types::PkParams, CombinedDerivs, Option<usize>)> = Vec::new();
     let mut dose_src = vec![0usize; subject.doses.len()];
     let mut obs_src = vec![0usize; subject.obs_times.len()];
     let mut pkonly_src = vec![0usize; subject.pk_only_times.len()];
 
-    if has_tv {
+    if per_event {
         for d in 0..subject.doses.len() {
             let occ = subject.dose_occasions.get(d).copied()?;
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.dose_cov(d);
-            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
-            let cd = cd_at(&combined, cov)?;
+            let t = subject.doses[d].time;
+            let pk = (model.pk_param_fn)(theta, &combined, cov, t);
+            let cd = cd_at(t, &combined, cov)?;
             dose_src[d] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
@@ -905,15 +946,17 @@ fn build_iov_sources(
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.obs_cov(j);
-            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
-            let cd = cd_at(&combined, cov)?;
+            let t = subject.obs_times[j];
+            let pk = (model.pk_param_fn)(theta, &combined, cov, t);
+            let cd = cd_at(t, &combined, cov)?;
             obs_src[j] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
         for m in 0..subject.pk_only_times.len() {
             let cov = subject.pk_only_cov(m);
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
-            let cd = cd_at(&combined_pk_only, cov)?;
+            let t = subject.pk_only_times[m];
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, t);
+            let cd = cd_at(t, &combined_pk_only, cov)?;
             pkonly_src[m] = sources.len();
             sources.push((pk, cd, None));
         }
@@ -923,7 +966,7 @@ fn build_iov_sources(
         for g in 0..k_groups {
             let combined = combined_for(g);
             let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
-            let cd = cd_at(&combined, cov_static)?;
+            let cd = cd_at(0.0, &combined, cov_static)?;
             group_source[g] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
@@ -937,7 +980,7 @@ fn build_iov_sources(
         }
         if !subject.pk_only_times.is_empty() {
             let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
-            let cd = cd_at(&combined_pk_only, cov_static)?;
+            let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
             let idx = sources.len();
             sources.push((pk, cd, None));
             for m in 0..subject.pk_only_times.len() {
@@ -1288,7 +1331,10 @@ fn run_obs_iov_eta<const N: usize>(
 /// event's* covariate snapshot via
 /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program).
 pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
-    if !analytical_supported(model) || model.has_lagtime() || model.log_transform {
+    // `analytical_supported_core` (not `analytical_supported`) so a `TIME` model doesn't
+    // recurse: `analytical_supported` calls back here for the `uses_time_builtin` case
+    // (#637 review #1).
+    if !analytical_supported_core(model) || model.has_lagtime() || model.log_transform {
         return false;
     }
     // The TV-cov event-driven walk does not yet layer the analytic
@@ -1310,13 +1356,15 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_theta + model.n_eta > MAX_TVCOV_AXES {
         return false;
     }
-    // Constant `ScalarScale` is a covariate-independent divisor (applied to the
-    // whole jet below); `ExpressionScale` / `PerCmt` need a per-event scale jet
-    // and route to FD for now.
-    if !matches!(
-        model.scaling,
-        ScalingSpec::None | ScalingSpec::ScalarScale(_)
-    ) {
+    // Output scaling: `None` / constant `ScalarScale` (a uniform per-jet divisor), or an
+    // η-dependent `ExpressionScale` whose subject-static quotient is applied post-walk by
+    // `subject_sensitivities_tvcov` / `subject_eta_grad_tvcov` (the same shared
+    // `apply_expression_scale_outer` / `_inner_dispatch` the dose-superposition path uses,
+    // #486 — closes the TV-cov + expression-scale gap). `scaling_supported` bounds the
+    // scale program to the dispatch table; `PerCmt` still routes to FD. LTBS is already
+    // declined above, so LTBS + `ExpressionScale` (whose scale-then-log order the post-walk
+    // quotient cannot reproduce) never reaches here.
+    if !scaling_supported(model) {
         return false;
     }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
@@ -1349,10 +1397,10 @@ pub fn subject_sensitivities_tvcov(
     eta: &[f64],
 ) -> Option<SubjectSens> {
     // Routed here for time-varying covariates *or* oral infusion (#350/#400) — both
-    // need the state-propagating walk rather than dose superposition.
-    if !tvcov_analytical_supported(model)
-        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
-    {
+    // need the state-propagating walk rather than dose superposition. A structural
+    // parameter reading the `TIME` built-in is piecewise/time-varying for the same
+    // reason, so it routes here too even with no TV covariates (#486 / #610).
+    if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
     // Steady-state doses equilibrate per-event in the walk (`equilibrate_ss_g`,
@@ -1399,8 +1447,7 @@ pub fn subject_sensitivities_tvcov(
 
     // Constant `ScalarScale` output divisor `f_scaled = f/k`: every derivative is
     // linear in `f` and `k` is constant, so the whole jet divides by `k` — matches
-    // `pk::apply_scaling` (`pred /= s`) on the production TV-cov path. The gate
-    // admits only `None` / `ScalarScale`, so no other scaling reaches here.
+    // `pk::apply_scaling` (`pred /= s`) on the production TV-cov path.
     if let ScalingSpec::ScalarScale(k) = model.scaling {
         if k != 1.0 {
             let inv = 1.0 / k;
@@ -1418,6 +1465,12 @@ pub fn subject_sensitivities_tvcov(
             }
         }
     }
+    // η-dependent `ExpressionScale` divisor `s(θ, η)`: apply the subject-static quotient
+    // `scaled_f = f/s` on the walked jet — the SAME shared quotient the dose-superposition
+    // path uses (#486, closing the TV-cov + expression-scale gap). Production
+    // `pk::apply_scaling` evaluates the scale once at the subject-static covariates and
+    // `t = 0` params, mirrored inside the helper.
+    apply_event_walk_expression_scale_outer(&mut sens, model, subject, prog, theta, eta)?;
     Some(sens)
 }
 
@@ -1447,9 +1500,16 @@ fn run_obs_tvcov<const M: usize>(
     // PK slot on its `(θ, η)` dual axis (`θ_m → m`, `η_k → n_theta + k`); constants
     // otherwise. The θ-θ Hessian block is unused downstream (left zero), mirroring
     // the IOV / scale seeders.
-    let mk = |cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
+    // A `TIME`-built-in structural parameter resolves `Op::PushTime` from the
+    // model-time thread-local, which `pd_from_program`'s `Dual2` walk reads. Seed
+    // it with the per-event time (gated on `uses_time`, exactly like the f64
+    // `pk_param_fn` closure) so each event's PK-param duals — value AND derivatives
+    // — are evaluated at that event's `TIME` (#486 / #610).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let mk = |time: f64, cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
+        let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual2<M> {
             let mut grad = [0.0; M];
             let mut hess = [[0.0; M]; M];
@@ -1501,13 +1561,13 @@ fn run_obs_tvcov<const M: usize>(
     // covariate snapshot (the `*_cov` accessors fall back to the static map when a
     // particular event carries no snapshot).
     let pk_at_dose: Vec<PkDual<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| mk(subject.dose_cov(k)))
+        .map(|k| mk(subject.doses[k].time, subject.dose_cov(k)))
         .collect();
     let pk_at_obs: Vec<PkDual<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| mk(subject.obs_cov(j)))
+        .map(|j| mk(subject.obs_times[j], subject.obs_cov(j)))
         .collect();
     let pk_at_pk_only: Vec<PkDual<Dual2<M>>> = (0..subject.pk_only_times.len())
-        .map(|m| mk(subject.pk_only_cov(m)))
+        .map(|m| mk(subject.pk_only_times[m], subject.pk_only_cov(m)))
         .collect();
 
     // No lagtime in TV-cov scope → zero dose lagtimes.
@@ -1584,9 +1644,7 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
-    if !tvcov_analytical_supported(model)
-        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
-    {
+    if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
@@ -1630,8 +1688,8 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     )?;
 
     // Constant `ScalarScale` divisor: `∂(f/k)/∂η = (∂f/∂η)/k` (η-independent `k`),
-    // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS / ExpressionScale
-    // keep the FD inner — gated upstream in `analytic_inner_grad_supported_model`.)
+    // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS keeps the FD inner —
+    // gated upstream; `ExpressionScale` is applied below.)
     if let ScalingSpec::ScalarScale(k) = model.scaling {
         if k != 1.0 {
             for o in out.iter_mut() {
@@ -1642,6 +1700,10 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
             }
         }
     }
+    // η-dependent `ExpressionScale` divisor: the η-only quotient — the light counterpart
+    // of the outer path, matching the static inner path (#486). Subject-static scale from
+    // `pk`/`∂p/∂η` at `t = 0`, applied to every observation (shared helper).
+    apply_event_walk_expression_scale_inner(&mut out, model, subject, prog, theta, eta)?;
     Some(out)
 }
 
@@ -1667,11 +1729,19 @@ fn run_obs_grad_tvcov<const N: usize>(
     // no-ops — flat `0..n_eta` loops (#449 re-review #5, mirroring #15).
     debug_assert_eq!(N, n_eta);
 
-    let mk = |cov: &std::collections::HashMap<String, f64>| -> Option<PkDual<Dual1<N>>> {
+    // Seed the model-time thread-local with the per-event time so a `TIME`-built-in
+    // structural parameter resolves to that event's time in both the f64 value and
+    // the `Dual1` η-derivative walk (gated on `uses_time`, like the f64 closure;
+    // #486 / #610).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let mk = |time: f64,
+              cov: &std::collections::HashMap<String, f64>|
+     -> Option<PkDual<Dual1<N>>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
         // the inner loop falls back to FD rather than panicking (#449 review #1).
         let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
-        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
+        let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
             let mut grad = [0.0; N];
             for k in 0..n_eta {
@@ -1698,13 +1768,13 @@ fn run_obs_grad_tvcov<const N: usize>(
     };
 
     let pk_at_dose: Vec<PkDual<Dual1<N>>> = (0..subject.doses.len())
-        .map(|k| mk(subject.dose_cov(k)))
+        .map(|k| mk(subject.doses[k].time, subject.dose_cov(k)))
         .collect::<Option<Vec<_>>>()?;
     let pk_at_obs: Vec<PkDual<Dual1<N>>> = (0..subject.obs_times.len())
-        .map(|j| mk(subject.obs_cov(j)))
+        .map(|j| mk(subject.obs_times[j], subject.obs_cov(j)))
         .collect::<Option<Vec<_>>>()?;
     let pk_at_pk_only: Vec<PkDual<Dual1<N>>> = (0..subject.pk_only_times.len())
-        .map(|m| mk(subject.pk_only_cov(m)))
+        .map(|m| mk(subject.pk_only_times[m], subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
 
     // The event schedule is invariant across inner BFGS steps (it depends only on the
@@ -1864,7 +1934,9 @@ fn subject_eta_grad_impl(
     // TV-cov / oral infusion: the light event-driven walk (#447). The outer gradient
     // already serves these via `subject_sensitivities_tvcov`; route the inner to the
     // matching `Dual1` walk (out-of-scope cases return `None` → FD per point).
-    if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
+    // A `TIME`-built-in structural parameter routes through the per-event walk
+    // too (piecewise/time-varying), mirroring the outer provider (#486 / #610).
+    if subject_routes_to_event_walk(model, subject) {
         return subject_eta_grad_tvcov_with_schedule(model, subject, theta, eta, cached_schedule);
     }
     // Same model/subject scope as the full provider …
@@ -2341,6 +2413,87 @@ pub(crate) fn apply_expression_scale_outer(
     );
 }
 
+/// Apply an η-dependent `ExpressionScale` `obs_scale` to an already-walked **outer** jet
+/// on the event-driven path (time-varying covariate / `TIME`). Builds the subject-static
+/// scale reference — `pk` (value) AND `pd` (`∂p/∂(θ,η)`) at the subject covariates and
+/// `t = 0`, both under one explicit [`ModelTimeGuard`] so a nested outer guard can never
+/// leave the value pinned at `t = 0` while the derivative reads a stale `TIME` (#637
+/// review #3) — then applies the shared quotient. A no-op unless the model carries a
+/// differentiable `ExpressionScale`; `None` if the scale program's axis count is outside
+/// the dispatch table (caller falls back to FD). One home for the `t = 0` wiring shared by
+/// the closed-form (`subject_sensitivities_tvcov`) and ODE (`run_subject_tvcov`) walks so
+/// a future change lands in one place (#637 review #6).
+pub(crate) fn apply_event_walk_expression_scale_outer(
+    sens: &mut SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    let ScalingSpec::ExpressionScale {
+        deriv: Some(scale_prog),
+        ..
+    } = &model.scaling
+    else {
+        return Some(());
+    };
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(0.0);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let pd =
+        crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)?;
+    apply_expression_scale_outer(
+        sens,
+        scale_prog,
+        &pk,
+        &pd,
+        prog.pk_slots_ref(),
+        theta,
+        eta,
+        &subject.covariates,
+        model.n_theta,
+        model.n_eta,
+    );
+    Some(())
+}
+
+/// Inner (`Dual1`, η-only) counterpart of [`apply_event_walk_expression_scale_outer`] —
+/// the `∂(f/s)/∂η` quotient on the light gradient, same `t = 0` guarded reference (#637
+/// review #3 / #6).
+pub(crate) fn apply_event_walk_expression_scale_inner(
+    out: &mut [ObsGrad],
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    let ScalingSpec::ExpressionScale {
+        deriv: Some(scale_prog),
+        ..
+    } = &model.scaling
+    else {
+        return Some(());
+    };
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(0.0);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let dp_deta = crate::sens::ode_provider::param_eta_derivatives_from_prog(
+        prog, model, subject, theta, eta,
+    )?;
+    apply_expression_scale_inner_dispatch(
+        out,
+        scale_prog,
+        &pk,
+        &dp_deta,
+        prog.pk_slots_ref(),
+        theta,
+        eta,
+        &subject.covariates,
+        model.n_eta,
+    );
+    Some(())
+}
+
 /// Build the `Dual2<M>` for PK slot `slot` in `(θ, η)`-axis layout (axes
 /// `0..n_theta` are θ, `n_theta + k` is `η_k`), carrying value + `∂p/∂(θ,η)` +
 /// the η-η / η-θ Hessian blocks from the outer `ParamDerivs`. A slot the program
@@ -2727,6 +2880,20 @@ pub(crate) fn subject_has_oral_infusion(model: &CompiledModel, subject: &Subject
     ) && subject.doses.iter().any(|d| d.is_infusion())
 }
 
+/// True when a subject must be served by the event-driven per-event walk rather than
+/// dose superposition: it carries **time-varying covariates**, an **oral infusion**
+/// (#350/#400 forced responses), or the model reads the **`TIME` built-in** in a
+/// structural parameter — all of which make the PK parameters per-event dynamic. Single
+/// source of truth so the outer gradient (`subject_sensitivities_impl`), the inner EBE
+/// gradient (`subject_eta_grad_impl` and `inner_optimizer::analytic_inner_grad_supported`),
+/// and the two TV-walk triggers cannot drift to different routing decisions (#637 round-2
+/// review #3).
+pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subject) -> bool {
+    subject.has_tv_covariates()
+        || subject_has_oral_infusion(model, subject)
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+}
+
 fn subject_sensitivities_impl(
     model: &CompiledModel,
     subject: &Subject,
@@ -2776,7 +2943,12 @@ fn subject_sensitivities_impl(
     // production's `compute_predictions` dispatch. The returned `SubjectSens` has
     // the same `(η, θ)` shape, so the outer gradient / inner Jacobian consume it
     // identically.
-    if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
+    //
+    // A `TIME`-built-in structural parameter is piecewise/time-varying too — it
+    // must route through the per-event walk even with no TV covariates, since the
+    // dose-superposition path below would freeze it at one `t=0` snapshot (#486 /
+    // #610).
+    if subject_routes_to_event_walk(model, subject) {
         return subject_sensitivities_tvcov(model, subject, theta, eta);
     }
     // EVID=3/4 resets are handled by restricting dose superposition to the
@@ -3480,14 +3652,32 @@ mod tests {
         assert!(analytic_outer_gradient_available(&ruv_m3));
     }
 
-    /// The `TIME` built-in routes a model through the event-driven per-event PK
-    /// path, which the closed-form `Dual2`/`Dual1` sensitivity providers do not
-    /// cover. `analytical_supported`, `iov_analytical_supported`, and
-    /// `ode_analytical_supported` must therefore all decline (→ FD) for any model
-    /// whose `[individual_parameters]` read `TIME` — otherwise the analytic fast
-    /// path would evaluate every parameter at a single frozen time and silently
-    /// disagree with the event-driven predictor. The non-`TIME` twin of each
-    /// model must still be supported, proving the guard is specific (#610).
+    /// The `TIME` built-in makes a structural parameter piecewise/time-varying, so
+    /// the subject routes through the event-driven per-event PK walk rather than
+    /// dose superposition. As of #486 every analytic provider seeds the per-event time
+    /// and serves TIME: **closed-form non-IOV** (`analytical_supported` /
+    /// `tvcov_analytical_supported`), **closed-form IOV** (`iov_analytical_supported`),
+    /// **non-IOV ODE** (`ode_analytical_supported`), and **ODE IOV** (`ode_iov_supported`,
+    /// via the per-event stacked walk) — each validated against FD of production
+    /// (`time_builtin_provider_matches_fd_of_production`,
+    /// `iov_time_builtin_provider_matches_fd_of_predict_iov`,
+    /// `ode_time_builtin_provider_matches_fd_of_production`,
+    /// `ode_iov_time_builtin_provider_matches_fd_of_predict_iov`).
+    ///
+    /// `TIME` composes with an η-dependent `ExpressionScale` obs_scale too — the
+    /// event-driven walk applies the subject-static scale quotient post-walk (validated
+    /// in `expression_scale_on_event_walk_matches_fd_closed_form`,
+    /// `ode_expression_scale_on_event_walk_matches_production`, and
+    /// `ode_iov_time_expression_scale_matches_fd_of_predict_iov`). The direct
+    /// `pk(...=TIME)` mapping is now desugared into a synthetic `__ferx_pktime_*`
+    /// individual parameter and served analytically too (see the `ANALYTICAL_TIME_DIRECT`
+    /// block below and `time_builtin_direct_pk_mapping_matches_fd_of_production`); the only
+    /// remaining `TIME`-specific fallbacks are edge combinations the event-driven walk
+    /// itself cannot serve (an ODE `init(...)` baseline or a built-in input-rate forcing
+    /// under `TIME`, asserted below). The pre-existing scale fallbacks (LTBS +
+    /// `ExpressionScale`; closed-form IOV + any scaling) are unchanged and independent of
+    /// `TIME`. The non-`TIME` twin of each model must stay supported, proving the guards
+    /// are specific (#486 / #610).
     #[test]
     fn time_builtin_indiv_params_force_fd_fallback() {
         // Analytical 1-cpt IV: a `$PK IF(TIME...)`-style switch on CL.
@@ -3605,9 +3795,15 @@ mod tests {
             "TIME switch sets the uses_time_builtin flag"
         );
         assert!(!uses_time(&ana_n), "control model must not set the flag");
+        // Closed-form non-IOV now serves TIME via the per-event walk (#486): the
+        // model is admitted and routes through `tvcov_analytical_supported`.
         assert!(
-            !analytical_supported(&ana_t),
-            "analytic FOCEI must decline for TIME"
+            analytical_supported(&ana_t),
+            "closed-form non-IOV now admits TIME (routed to the per-event walk)"
+        );
+        assert!(
+            tvcov_analytical_supported(&ana_t),
+            "TIME routes through the TV-cov event-driven walk"
         );
         assert!(
             analytical_supported(&ana_n),
@@ -3620,9 +3816,11 @@ mod tests {
             iov_t.n_kappa > 0 && iov_n.n_kappa > 0,
             "both IOV models carry a kappa"
         );
+        // Closed-form IOV now serves TIME (per-event stacked seeding in
+        // `build_iov_sources`, #486).
         assert!(
-            !iov_analytical_supported(&iov_t),
-            "IOV analytic must decline for TIME"
+            iov_analytical_supported(&iov_t),
+            "closed-form IOV now serves TIME via the per-event walk"
         );
         assert!(
             iov_analytical_supported(&iov_n),
@@ -3635,11 +3833,500 @@ mod tests {
             uses_time(&ode_t),
             "ODE indiv-param TIME switch sets the flag"
         );
+        // Non-IOV ODE now serves TIME via the event-driven TV-cov walk (#486).
         assert!(
-            !ode_supported(&ode_t),
-            "ODE analytic must decline for indiv-param TIME"
+            ode_supported(&ode_t),
+            "non-IOV ODE now serves indiv-param TIME via the per-event walk"
         );
         assert!(ode_supported(&ode_n), "non-TIME ODE twin stays analytic");
+
+        // ODE **IOV** now serves TIME via the per-event stacked walk (#486). Build an
+        // ODE + kappa + TIME model to pin `ode_iov_supported == true`.
+        const ODE_IOV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+        let ode_iov_t = parse_model_string(ODE_IOV_TIME).expect("parses ODE IOV TIME");
+        assert!(ode_iov_t.n_kappa > 0 && uses_time(&ode_iov_t));
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&ode_iov_t),
+            "ODE IOV now serves TIME via the per-event stacked walk (#486)"
+        );
+
+        // #637 round-2 review #1: a TIME + `init(...)` ODE model must report FD at the
+        // model level. TIME forces the event-driven walk (`ode_subject_supported`
+        // declines it), but that walk cannot seed a non-zero `init(...)` state, so every
+        // subject falls back to FD — `ode_analytical_supported` / `analytic_outer_gradient_available`
+        // must therefore report FD, not "analytic".
+        const ODE_TIME_INIT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let ode_time_init = parse_model_string(ODE_TIME_INIT).expect("parses ODE TIME init");
+        assert!(uses_time(&ode_time_init) && ode_time_init.ode_spec.is_some());
+        assert!(
+            !ode_supported(&ode_time_init),
+            "TIME + init(...) ODE must decline at the model level (no analytic walk)"
+        );
+        assert!(
+            !analytic_outer_gradient_available(&ode_time_init),
+            "TIME + init(...) ODE outer route must report FD, not analytic"
+        );
+
+        // Direct `pk(...=TIME)` mapping (not an `[individual_parameters]` statement): the
+        // parser now desugars the `=TIME` binding into a synthetic
+        // `__ferx_pktime_<slot> = TIME` individual parameter (mirroring the #631 Form-C
+        // readout desugaring), so the mapped slot enters the program's `pk_slots` and
+        // rides the same per-event analytic walk as an `[individual_parameters]` TIME
+        // switch — no longer FD (#486 direct-mapping follow-up). Use a 2-cpt `q=TIME`
+        // mapping so the mapped slot is not a denominator (a `v=TIME` model divides by
+        // `V = 0` at the `t = 0` dose — a user degeneracy, not a gate concern).
+        const ANALYTICAL_TIME_DIRECT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let direct = parse_model_string(ANALYTICAL_TIME_DIRECT).expect("parses direct pk=TIME");
+        assert!(
+            uses_time(&direct),
+            "direct pk(...=TIME) mapping sets the uses_time_builtin flag"
+        );
+        assert!(
+            analytical_supported(&direct) && tvcov_analytical_supported(&direct),
+            "direct pk(...=TIME) mapping is now served by the per-event analytic walk (desugared)"
+        );
+        assert!(
+            analytic_outer_gradient_available(&direct),
+            "direct pk(...=TIME) outer gradient route is now analytic"
+        );
+    }
+
+    /// The closed-form non-IOV provider's exact value/∂η/∂²η/∂θ/∂²η∂θ for a model
+    /// whose structural parameter reads the `TIME` built-in must match central
+    /// finite differences of the production predictor `compute_predictions_with_tv`
+    /// (the independent f64 event-driven path that threads the same per-event TIME).
+    /// No TV covariates are present — the subject is routed to the per-event walk
+    /// purely by `uses_time_builtin` (#486 / #610). Covers a `$PK IF(TIME...)` switch
+    /// (1-cpt IV, 2-cpt IV) and a continuous `TVCL + c·TIME` term (1-cpt oral).
+    #[test]
+    fn time_builtin_provider_matches_fd_of_production() {
+        // (a) 1-cpt IV: CL switches at TIME = 45 (NONMEM `IF (TIME.GE.45) CL=...`).
+        const ONECPT_IV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // (b) 1-cpt oral: CL varies continuously with TIME (`TVCL + 0.05·TIME`), so
+        // both ∂CL/∂TVCL and the TIME-scaled ∂CL/∂ETA_CL are exercised per event.
+        const ONECPT_ORAL_TIME: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = (TVCL + 0.05 * TIME) * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // (c) 2-cpt IV: same TIME switch on CL, widening the dual to M = 7.
+        const TWOCPT_IV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let iv_bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        // Observations straddle the TIME = 45 switch so both arms of the `if` drive
+        // at least one prediction (the switch is data-driven, so it is fixed under
+        // the η/θ perturbation — the prediction is smooth in η/θ within each arm).
+        let straddle = [10.0, 30.0, 50.0, 70.0, 90.0];
+
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(ONECPT_IV_TIME).expect("parse 1cpt iv TIME");
+                let s = subject_with_doses_and_resets(vec![iv_bolus(0.0)], &straddle, Vec::new());
+                (m, s, vec![10.0, 6.0, 50.0], vec![0.15, -0.10])
+            },
+            {
+                let m = parse_model_string(ONECPT_ORAL_TIME).expect("parse 1cpt oral TIME");
+                let s = subject_with_doses_and_resets(
+                    vec![iv_bolus(0.0)],
+                    &[1.0, 4.0, 10.0, 24.0, 48.0],
+                    Vec::new(),
+                );
+                (m, s, vec![1.0, 10.0, 1.5], vec![0.15, -0.10, 0.20])
+            },
+            {
+                let m = parse_model_string(TWOCPT_IV_TIME).expect("parse 2cpt iv TIME");
+                let s = subject_with_doses_and_resets(vec![iv_bolus(0.0)], &straddle, Vec::new());
+                (m, s, vec![10.0, 6.0, 50.0, 5.0, 100.0], vec![0.15, -0.10])
+            },
+        ];
+
+        for (m, s, theta, eta) in &cases {
+            assert!(
+                crate::parser::model_parser::compiled_model_uses_time_builtin(m),
+                "fixture must read the TIME built-in"
+            );
+            assert!(
+                !s.has_tv_covariates(),
+                "fixture must stay on the no-TV path (routed purely by uses_time_builtin)"
+            );
+            assert!(
+                tvcov_analytical_supported(m),
+                "TIME model must be provider-supported via the per-event walk"
+            );
+            assert!(
+                subject_sensitivities(m, s, theta, eta).is_some(),
+                "TIME subject must take the analytic per-event provider"
+            );
+            check_full_provider_vs_fd(m, s, theta, eta);
+        }
+    }
+
+    /// #486: the light `Dual1` inner η-gradient must equal the full `Dual2` outer
+    /// `df_deta` (η-block) for a `TIME`-built-in subject — both run the same
+    /// event-driven walk, and the outer is FD-validated by
+    /// [`time_builtin_provider_matches_fd_of_production`].
+    #[test]
+    fn time_builtin_eta_grad_matches_full() {
+        const ONECPT_IV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(ONECPT_IV_TIME).expect("parse 1cpt iv TIME");
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[10.0, 30.0, 50.0, 70.0, 90.0],
+            Vec::new(),
+        );
+        let theta = [10.0, 6.0, 50.0];
+        let eta = [0.15, -0.10];
+        let full = subject_sensitivities(&m, &s, &theta, &eta).expect("full provider");
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light inner provider");
+        assert_eq!(full.obs.len(), light.len());
+        for (o, g) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
+            for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-10, epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// #486: a **direct `pk(...=TIME)` structural mapping** (here `q=TIME` on a 2-cpt IV,
+    /// so the mapped slot is not a denominator — `v=TIME` would divide by `V = 0` at the
+    /// `t = 0` dose). The parser desugars it into a synthetic `__ferx_pktime_q = TIME`
+    /// individual parameter, so `Q` = event time per event (`∂Q/∂θ = ∂Q/∂η = 0`) while
+    /// `CL`/`V1`'s derivatives stay exact. value + ∂η + ∂²η + ∂θ + ∂²η∂θ must match central
+    /// FD of production (which threads the same per-event TIME through the desugared param).
+    #[test]
+    fn time_builtin_direct_pk_mapping_matches_fd_of_production() {
+        const DIRECT_Q_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(DIRECT_Q_TIME).expect("parse direct q=TIME");
+        assert!(crate::parser::model_parser::compiled_model_uses_time_builtin(&m));
+        assert!(
+            tvcov_analytical_supported(&m),
+            "direct pk(q=TIME) desugars to an indiv-param → analytic"
+        );
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 10.0, 24.0, 48.0],
+            Vec::new(),
+        );
+        assert!(!s.has_tv_covariates());
+        check_full_provider_vs_fd(&m, &s, &[10.0, 50.0, 100.0], &[0.10, -0.05]);
+    }
+
+    /// #486: the direct `pk(q=TIME)` desugaring must be *exactly* the explicit
+    /// `[individual_parameters] QT = TIME; pk(q=QT)` form — a pure rename into a synthetic
+    /// parameter. This ties the direct mapping to the `[individual_parameters]` TIME path
+    /// that #637 validated live against NONMEM (`METHOD=1 INTER`, ~5 sig figs), so the
+    /// direct form inherits that numerical validation by transitivity. All sensitivity
+    /// outputs (value + ∂η + ∂θ + 2nd-order) must agree to 1e-12.
+    #[test]
+    fn time_builtin_direct_pk_mapping_equivalent_to_explicit_indiv_param() {
+        const DIRECT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const EXPLICIT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+  QT = TIME
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=QT, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m_direct = parse_model_string(DIRECT).expect("parse direct");
+        let m_explicit = parse_model_string(EXPLICIT).expect("parse explicit");
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 10.0, 24.0, 48.0],
+            Vec::new(),
+        );
+        let theta = [10.0, 50.0, 100.0];
+        let eta = [0.10, -0.05];
+        let sd = subject_sensitivities(&m_direct, &s, &theta, &eta).expect("direct sens");
+        let se = subject_sensitivities(&m_explicit, &s, &theta, &eta).expect("explicit sens");
+        assert_eq!(sd.obs.len(), se.obs.len());
+        for (a, b) in sd.obs.iter().zip(se.obs.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-13);
+            for (x, y) in a.df_deta.iter().zip(b.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            for (x, y) in a.df_dtheta.iter().zip(b.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            for (x, y) in a.d2f_deta2.iter().zip(b.d2f_deta2.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            // The mixed η-θ second derivative feeds the FOCEI Laplace `log|H̃|`
+            // θ-gradient this work targets, so it must match too.
+            for (x, y) in a.d2f_deta_dtheta.iter().zip(b.d2f_deta_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+        }
+    }
+
+    /// #486: an η-dependent `ExpressionScale` `obs_scale` on the **event-driven walk** —
+    /// for a `TIME` switch AND a time-varying covariate. The walk now applies the same
+    /// subject-static scale quotient (`apply_expression_scale_outer` / `_inner_dispatch`)
+    /// the dose-superposition path uses, so value/∂η/∂²η/∂θ/∂²η∂θ must match FD of
+    /// production and the light inner must track the outer η-block. (Closes the TV-cov +
+    /// expression-scale gap, not just the TIME one.)
+    #[test]
+    fn expression_scale_on_event_walk_matches_fd_closed_form() {
+        const IV_TIME_SCALED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.05, 50.0)
+  theta TVCL_LATE(0.5, 0.05, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const IV_TVCOV_SCALED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.05, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let check_parity = |m: &CompiledModel, s: &Subject, theta: &[f64], eta: &[f64]| {
+            assert!(
+                matches!(m.scaling, ScalingSpec::ExpressionScale { .. }),
+                "fixture must carry an ExpressionScale obs_scale"
+            );
+            assert!(
+                tvcov_analytical_supported(m),
+                "ExpressionScale event-walk model must be provider-supported"
+            );
+            check_full_provider_vs_fd(m, s, theta, eta);
+            // Light inner η-gradient must track the outer η-block (both apply the scale).
+            let full = subject_sensitivities(m, s, theta, eta).expect("outer");
+            let light = subject_eta_grad(m, s, theta, eta).expect("inner");
+            for (o, g) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
+                for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
+                    approx::assert_relative_eq!(a, b, max_relative = 1e-10, epsilon = 1e-12);
+                }
+            }
+        };
+        // TIME switch + obs_scale (no TV covariates → routed by uses_time_builtin).
+        let m_time = parse_model_string(IV_TIME_SCALED).expect("parse IV TIME scaled");
+        let s_time = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[10.0, 30.0, 50.0, 70.0, 90.0],
+            Vec::new(),
+        );
+        check_parity(&m_time, &s_time, &[1.0, 0.5, 20.0], &[0.15, -0.10]);
+        // Time-varying covariate + obs_scale (the broader gap this closes).
+        let m_tv = parse_model_string(IV_TVCOV_SCALED).expect("parse IV tvcov scaled");
+        let s_tv = tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 72.0, 80.0, 85.0, 90.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        assert!(s_tv.has_tv_covariates());
+        check_parity(&m_tv, &s_tv, &[1.0, 20.0, 0.75], &[0.15, -0.10]);
     }
 
     /// A TTE (`[event_model]`) objective has no analytic outer gradient (the
@@ -6166,6 +6853,60 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
+    /// #486: a `TIME`-switched CL on an **ODE IOV** model (Form-C `y = central/V`
+    /// readout). With no TV covariates the per-event stacked walk is reached purely by
+    /// `uses_time_builtin`; the value/∂/∂² over `[η_bsv, κ_g0, κ_g1]` + θ must match
+    /// central FD of `predict_iov` (which threads the same per-event TIME through the
+    /// ODE event-driven predictor).
+    #[test]
+    fn ode_iov_time_builtin_provider_matches_fd_of_predict_iov() {
+        const WARFARIN_IOV_ODE_TIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 20.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(WARFARIN_IOV_ODE_TIME).expect("parse ODE IOV TIME");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some());
+        assert!(!iov_subject().has_tv_covariates());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV TIME (Form-C readout) must be provider-supported"
+        );
+        // obs [1,6,12 | 25,30,36] straddle TIME=20. stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &iov_subject(),
+            &[0.2, 0.1, 10.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     #[test]
     fn ode_iov_above_legacy_axis_cap_stays_analytic() {
         let model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
@@ -6676,6 +7417,53 @@ mod tests {
         let subject = iov_subject();
         // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    /// #486: ODE IOV + `TIME` switch + η-dependent `ExpressionScale` `obs_scale = V`.
+    /// The per-event stacked walk (TIME) composes with the per-occasion post-walk scale
+    /// quotient (built at `t = 0`, matching production's `apply_scaling`); value/∂/∂²
+    /// over `[η_bsv, κ_g0, κ_g1]` + θ must match FD of `predict_iov`.
+    #[test]
+    fn ode_iov_time_expression_scale_matches_fd_of_predict_iov() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 20.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(M).expect("parse ODE IOV TIME expr-scale");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        // obs [1,6,12 | 25,30,36] straddle TIME=20. stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &iov_subject(),
+            &[0.2, 0.1, 10.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
     }
 
     #[test]
@@ -7502,6 +8290,59 @@ mod tests {
             &model,
             &subject,
             &[0.2, 10.0, 0.5, 20.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// #486: a `TIME`-switched CL on a **closed-form IOV** model. With no TV
+    /// covariates the subject routes to the per-event stacked walk purely by
+    /// `uses_time_builtin`; the value/∂/∂² over `[η_bsv, κ_g0, κ_g1]` + θ must match
+    /// central FD of `predict_iov` (which threads the same per-event TIME).
+    #[test]
+    fn iov_time_builtin_provider_matches_fd_of_predict_iov() {
+        const IOV_ORAL_TIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 20.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+        let model = parse_model_string(IOV_ORAL_TIME).expect("parse IOV oral TIME");
+        assert_eq!(model.n_kappa, 1);
+        let subject = iov_subject(); // obs [1,6,12 | 25,30,36] straddle TIME=20
+        assert!(
+            !subject.has_tv_covariates(),
+            "no TV cov: routed by uses_time only"
+        );
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV TIME must be provider-supported"
+        );
+        // θ = [TVCL, TVCL_LATE, TVV, TVKA]; stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 0.1, 10.0, 1.5],
             &[0.12, -0.08, 0.20, 0.05, -0.10],
         );
     }

@@ -3156,8 +3156,8 @@ fn assemble_score_cross_product(
     // Unlike the FD-built R-matrix — which reconverges η̂ at every perturbed point
     // and so captures the `log|H̃|` EBE-response `½·∂log|H̃|/∂η̂·dη̂/dθ` — the raw
     // analytic gradient holds η̂ fixed and drops it. Add it back here (the #274
-    // `tᵢ` term, in −logL units; `point_grad` adds `2·tᵢ` to the −2logL gradient)
-    // so the score matches how NONMEM differences the individual objective with
+    // `tᵢ` term, in −logL units; in −2logL units this contributes `2·tᵢ` to the
+    // gradient) so the score matches how NONMEM differences the individual objective with
     // its conditional estimate responding to θ. This is what makes the FOCEI
     // S/RSR match NONMEM (warfarin RSR ≈ 1.8% with it, ≈ 5% without); the
     // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
@@ -3294,9 +3294,11 @@ pub(crate) fn compute_covariance(
     // warfarin, which previously forced eigenvalue clipping (#129) and inflated
     // the SEs.
     //
-    // This single helper is the reconvergence used by all three covariance paths
-    // — the base-OFV evaluation, the non-IOV gradient-FD `point_grad`, and the
-    // IOV scalar-FD `serial_ofv` — so they cannot drift apart (#298). It is
+    // This single helper is the reconvergence used by both covariance-OFV
+    // evaluations — the base-OFV evaluation and the second-difference stencil's
+    // `serial_ofv` (which now serves the non-IOV and IOV cases alike, since the
+    // FD-of-OFV Hessian is the sole R stencil) — so they cannot drift apart
+    // (#298). It is
     // serial (not the parallel `run_inner_loop_warm`) because the covariance step
     // parallelises over perturbed POINTS, not subjects; nested parallelism is
     // what #256 removed. `find_ebe` is deterministic per subject, so the
@@ -3426,206 +3428,21 @@ pub(crate) fn compute_covariance(
     }
 
     let mut hess = DMatrix::zeros(n, n);
-    let is_iov = kappas.iter().any(|k| !k.is_empty());
-    // Route non-interaction FOCE with f-dependent error (proportional/combined)
-    // through the OFV second-difference stencil (the IOV path), which builds
-    // the true Hessian of the actual marginal. The analytical SB gradient is an
-    // envelope approximation with no EBE-response Δ (that correction exists only
-    // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
-    // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
-    // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
-    // Route through the OFV second-difference Hessian when: (a) f-dependent FOCE
-    // (the analytical SB gradient comes out indefinite there), or (b) the user
-    // opts in via `covariance_ofv_hessian`. The latter trades speed for an R
-    // that recomputes `a = ∂f/∂η` at every perturbed point, capturing the
-    // `∂a/∂θ` curvature the analytical stencil drops — which removes the
-    // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high vs a Richardson
-    // FD-of-OFV ground truth).
-    // IIV on residual error (#409): the analytical point-grad stencil has no
-    // rule for the per-subject `exp(2·η_ruv)` variance scaling or its θ/σ/η
-    // curvature, so take the OFV second-difference Hessian (it FD-differences
-    // the real scaled marginal end-to-end).
-    let force_ofv_hessian = (!options.interaction && model.error_spec.has_f_dependent_variance())
-        || options.covariance_ofv_hessian
-        || model.residual_error_eta.is_some();
-    let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
     // stencil result is not a genuine zero curvature). HashSet for O(1) ops.
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
-    if use_analytical {
-        // Issue #209 + #256 + #274: central FD of the analytical population
-        // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
-        //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
-        // `point_grad` reconverges the EBEs serially at each perturbed point, so
-        // the curvature includes the EBE response (and the determinant curvature).
-        //
-        // #256: the work-list is point-level, not the per-subject `par_iter` the
-        // gradient used to fan out into. Each point runs its subjects serially, so
-        // there is no nested parallelism, and the parallel width (2·n_free)
-        // saturates the pool even when n_subj < n_cores — removing the fork/join
-        // overhead of firing 4·n_free rayon barriers in series (~9–11× faster).
-        //
-        // #274: for FOCEI the per-point gradient adds the dropped `log|H̃|`
-        // EBE-response term `2·Σᵢ tᵢ` (`subject_eta_response_correction`). The
-        // fixed-η̂ analytic gradient invokes the envelope theorem, which zeros only
-        // the inner objective — not `log|H̃|` — so without this term the non-IOV
-        // FD Hessian omits the determinant EBE-response curvature `Δ` that the IOV
-        // scalar-OFV stencil captures. Adding it makes the two stencils consistent
-        // and recovers ∇²(−2logL). Mu-ref θ block only; vanishes for additive error.
-        // Count subject-points where the FOCEI Δ correction was skipped because
-        // the Laplace gradient fell back to FD (non-PD H̃) — those contributions
-        // keep the pre-#274 fixed-η̂ curvature, so a non-zero count is surfaced as
-        // a diagnostic (#298).
-        let delta_skips = std::sync::atomic::AtomicUsize::new(0);
-        let point_grad = |xv: &[f64]| -> Vec<f64> {
-            let (_, ehs, hms, _) = reconverge_point(xv);
-            let np = xv.len();
-            // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
-            // Laplace marginals already carry Ω — issue #243/#249).
-            //
-            // Build the per-subject gradients serially (subjects are serial inside
-            // each point — the #256 flatten parallelises over points, not subjects)
-            // and reduce through `assemble_population_gradient`, the same reduction
-            // `ad_population_gradient` uses — so the summation order matches and the
-            // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
-            // The Δ correction below is kept as a separate loop (NOT fused): summing
-            // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
-            //
-            // `subject_nll_pop_grad_with_cache` also hands back the per-subject
-            // Laplace intermediates (when this subject took the FOCEI analytical
-            // path); the Δ loop below reuses them so it does not recompute the
-            // predictions or re-factorise H̃.
-            let mut grads: Vec<Vec<f64>> = Vec::with_capacity(n_subj_cov);
-            let mut caches: Vec<Option<crate::estimation::gauss_newton::LaplaceGradCache>> =
-                Vec::with_capacity(n_subj_cov);
-            for i in 0..n_subj_cov {
-                let (_, gi, ci) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
-                    xv,
-                    template,
-                    model,
-                    population,
-                    i,
-                    &ehs[i],
-                    &hms[i],
-                    &[],
-                    &bounds,
-                    options,
-                );
-                grads.push(gi);
-                caches.push(ci);
-            }
-            let mut g = assemble_population_gradient(&grads, np);
-            // #274 Δ correction (FOCEI only); summed in subject order to match.
-            if options.interaction {
-                for i in 0..n_subj_cov {
-                    match crate::estimation::gauss_newton::subject_eta_response_correction(
-                        caches[i].as_ref(),
-                        xv,
-                        template,
-                        model,
-                        population,
-                        i,
-                        &ehs[i],
-                        &hms[i],
-                        &bounds,
-                        options,
-                    ) {
-                        Some(ti) => {
-                            for (gk, tk) in g.iter_mut().zip(ti.iter()) {
-                                *gk += 2.0 * *tk;
-                            }
-                        }
-                        None => {
-                            delta_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-            g
-        };
-
-        // One (k, hₖ) spec per free parameter; the two perturbed points (±hₖ) are
-        // kept adjacent so `chunks_exact(2)` re-pairs (g₊, g₋) structurally — the
-        // pairing is no longer a positional `2·pair` index that a reordering of
-        // the point build could silently desync (#298).
-        let specs: Vec<(usize, f64)> = free_idx
-            .iter()
-            .map(|&k| (k, eps * (1.0 + x_hat[k].abs())))
-            .collect();
-        let pts: Vec<Vec<f64>> = specs
-            .iter()
-            .flat_map(|&(k, hk)| {
-                let mut x_p = x_hat.to_vec();
-                x_p[k] += hk;
-                let mut x_m = x_hat.to_vec();
-                x_m[k] -= hk;
-                [x_p, x_m]
-            })
-            .collect();
-        let report = cov_progress("Hessian", pts.len(), options.verbose);
-        let point_grads: Vec<Vec<f64>> = pts
-            .par_iter()
-            .map(|xv| {
-                // Cooperative cancel: skip this point's serial subject sweep and
-                // return a NaN gradient so the queue drains; bailed on below.
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    report();
-                    return vec![f64::NAN; n];
-                }
-                let g = point_grad(xv);
-                report();
-                g
-            })
-            .collect();
-        if crate::cancel::is_cancelled(&options.cancel) {
-            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
-        }
-        for (&(k, hk), pair) in specs.iter().zip(point_grads.chunks_exact(2)) {
-            let (g_p, g_m) = (&pair[0], &pair[1]);
-            for &j in &free_idx {
-                let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
-                if h_jk.is_finite() {
-                    hess[(j, k)] = h_jk;
-                } else if j == k {
-                    fd_diag_nan.insert(k);
-                } else {
-                    fd_offdiag_nan.insert(k);
-                    fd_offdiag_nan.insert(j);
-                }
-            }
-        }
-        let skipped = delta_skips.load(std::sync::atomic::Ordering::Relaxed);
-        if options.interaction && skipped > 0 && options.verbose {
-            eprintln!(
-                "  [covariance] log|H̃| EBE-response correction skipped at {} subject-point(s) \
-                 where the Laplace gradient fell back to FD (non-PD H̃); those contributions \
-                 retain the pre-#274 fixed-η̂ curvature.",
-                skipped
-            );
-        }
-        // Symmetrise: each column is differenced independently, so H[j,k] and
-        // H[k,j] can differ slightly; average before inversion.
-        for &i in &free_idx {
-            for &j in &free_idx {
-                if j > i {
-                    let avg = (hess[(i, j)] + hess[(j, i)]) * 0.5;
-                    hess[(i, j)] = avg;
-                    hess[(j, i)] = avg;
-                }
-            }
-        }
-    } else {
-        // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
-        // off-diagonal), reconverging the EBEs at each perturbed point. Taken
-        // when the analytical fixed-EBE gradient does not cover the true marginal
-        // curvature: (a) IOV — no analytical gradient covers the kappa block; or
-        // (b) `force_ofv_hessian` — non-IOV FOCE with f-dependent error, whose SB
-        // gradient lacks the EBE-response Δ and yields an indefinite analytical
-        // Hessian. `pop_nll` dispatches on the kappa count, so this stencil is
-        // correct for both the IOV (joint η, κ) and the non-IOV (η-only) cases.
+    // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
+    // off-diagonal), reconverging the EBEs at each perturbed point. The sole
+    // covariance R stencil: it recomputes the marginal curvature end-to-end
+    // (`a = ∂f/∂η` and the `log|H̃|` EBE-response included) at every perturbed
+    // point, so it serves FOCE, FOCEI and IOV, and additive/proportional/combined
+    // error uniformly — no envelope approximation, no held-fixed `a`.
+    {
+        // `pop_nll` dispatches on the kappa count, so this stencil is correct for
+        // both the IOV (joint η, κ) and the non-IOV (η-only) cases.
         //
         // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
         // points (subjects iterated serially inside `serial_ofv`) instead of the
@@ -4741,116 +4558,6 @@ mod tests {
         assert!(
             s.iter().all(|v| *v == 0.0),
             "cancelled S must be all-zero (per-subject scores short-circuited)"
-        );
-    }
-
-    /// Build the near-optimum synthetic inputs shared by the analytical
-    /// gradient-FD covariance tests: 8 subjects, fixed Ω/Σ, EBEs at zero.
-    /// `covariance_ofv_hessian = false` + `interaction = true` + non-IOV routes
-    /// `compute_covariance` through the analytical `point_grad` Hessian stencil
-    /// (`use_analytical = true`), distinct from the OFV second-difference path
-    /// the `_cancelled` test above exercises.
-    #[allow(clippy::type_complexity)]
-    fn analytical_cov_fixture() -> (
-        CompiledModel,
-        Population,
-        ModelParameters,
-        Vec<f64>,
-        Vec<DVector<f64>>,
-        Vec<DMatrix<f64>>,
-        Vec<Vec<DVector<f64>>>,
-    ) {
-        let model = make_model();
-        let mut population = make_population(8);
-        for s in &mut population.subjects {
-            s.observations = vec![1.80967, 1.34064, 0.89866];
-        }
-        let mut template = model.default_params.clone();
-        template.omega_fixed = vec![true];
-        template.sigma_fixed = vec![true];
-        let x = pack_params(&template);
-
-        let (n_subj, n_eta, n_obs) = (8, 1, 3);
-        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
-        let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
-            .map(|_| DMatrix::from_element(n_obs, n_eta, 0.1))
-            .collect();
-        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
-        (model, population, template, x, eta_hats, h_matrices, kappas)
-    }
-
-    /// Analytical gradient-FD Hessian path runs the perturbed-point sweep to
-    /// completion (no cancel): exercises `cov_progress("Hessian", …)` and the
-    /// `point_grad` map that the default OFV-Hessian path skips. The fixed-Ω/Σ
-    /// near-optimum fixture yields a usable (PD) free-block, so the result is
-    /// `Success` with a finite covariance matrix.
-    #[test]
-    fn test_compute_covariance_analytical_path() {
-        use crate::types::FitOptions;
-        let (model, population, template, x, eta_hats, h_matrices, kappas) =
-            analytical_cov_fixture();
-
-        let mut options = FitOptions::default();
-        options.interaction = true; // FOCEI
-        options.covariance_ofv_hessian = false; // → analytical `point_grad` stencil
-        options.verbose = true; // drive the progress reporter closure
-
-        let result = compute_covariance(
-            &x,
-            &template,
-            &model,
-            &population,
-            &eta_hats,
-            &h_matrices,
-            &kappas,
-            &options,
-        );
-        // The fixed-Ω/Σ near-optimum yields a PD free-block, so the analytical
-        // stencil returns a finite `Success`. A single `matches!` keeps the
-        // other variants from becoming dead (uncoverable) arms.
-        assert!(
-            matches!(
-                &result,
-                CovarianceStepResult::Success(out) if out.matrix.iter().all(|v| v.is_finite())
-            ),
-            "analytical-path covariance must be a finite Success"
-        );
-    }
-
-    /// As `test_compute_covariance_cancelled`, but on the analytical
-    /// `point_grad` path (`covariance_ofv_hessian = false`): a pre-set cancel
-    /// flag short-circuits every perturbed point (each returns a NaN gradient
-    /// via the in-loop cancel check) and the post-loop bail returns
-    /// `Unusable(cancelled)` rather than inverting a NaN-laden Hessian.
-    #[test]
-    fn test_compute_covariance_analytical_cancelled() {
-        use crate::cancel::CancelFlag;
-        use crate::types::FitOptions;
-        let (model, population, template, x, eta_hats, h_matrices, kappas) =
-            analytical_cov_fixture();
-
-        let flag = CancelFlag::new();
-        flag.cancel(); // pre-cancel: every perturbed point short-circuits
-
-        let mut options = FitOptions::default();
-        options.interaction = true;
-        options.covariance_ofv_hessian = false; // → analytical `point_grad` stencil
-        options.verbose = true;
-        options.cancel = Some(flag);
-
-        let result = compute_covariance(
-            &x,
-            &template,
-            &model,
-            &population,
-            &eta_hats,
-            &h_matrices,
-            &kappas,
-            &options,
-        );
-        assert!(
-            matches!(&result, CovarianceStepResult::Unusable(msg) if msg.contains("cancelled")),
-            "cancelled analytical-path covariance must be Unusable(cancelled)"
         );
     }
 

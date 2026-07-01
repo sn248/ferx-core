@@ -1342,10 +1342,9 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         || matches!(model.gradient_method, GradientMethod::Fd)
         || model.is_sde()
         || model.log_transform
-        // Correlated residual error (#main feature) is not carried by the analytic
-        // inner kernels yet — route to FD. (An eta-dependent `ExpressionScale` is NOT a
-        // bail here; see the doc above.)
-        || !model.residual_correlations.is_empty()
+        // Correlated residual error (`block_sigma`) is now served analytically by the
+        // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
+        // longer a bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
         // Custom residual-error magnitude (#484): the magnitude's θ-dependence is
         // not in the analytic kernels yet — route to FD (which is magnitude-aware).
         || model.has_custom_ruv_magnitude()
@@ -1432,7 +1431,8 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
         if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
-            || !model.residual_correlations.is_empty()
+            // Correlated residual (`block_sigma`, #627) now served analytically: the
+            // dense-R inner gradient reuses the Dual1 walk's per-obs `∂f/∂η`, so no bail.
             // Custom residual-error magnitude (#484): the magnitude's θ-dependence
             // is not in the light Dual1 ODE kernel either, so the analytic inner
             // gradient would omit the per-observation multiplier and mismatch the
@@ -1600,6 +1600,12 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         eta,
         cached_schedule,
     )?;
+    // Correlated residual (`block_sigma`, #627): the per-obs `coef·∂f/∂η` loop below
+    // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
+    // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
+    if !model.residual_correlations.is_empty() {
+        return dense_residual_inner_gradient(model, subject, theta, eta, omega, sigma, &sens);
+    }
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     // IIV on residual error (`Y = IPRED + EPS·EXP(η_ruv)`, #409/#474): the residual
@@ -1647,6 +1653,119 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     let prior = &omega.inv * &eta_v;
     for (k, g) in grad.iter_mut().enumerate() {
         *g += prior[k];
+    }
+    Some(grad)
+}
+
+/// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient — the correlated-residual
+/// generalisation of the per-obs `coef·∂f/∂η` loop in
+/// [`analytic_eta_nll_gradient_with_schedule`]. `block_sigma` is rejected up front
+/// together with M3, FREM, IOV (κ) and `iiv_on_ruv`, so this path is pure Gaussian.
+///
+/// For the inner NLL data term `½(rᵀR⁻¹r + log|R|)` with `r = y − f(η)`,
+/// `∂r/∂η_k = −a_k`, `∂R/∂η_k = Σ_m H[m,k]·∂R/∂f_m`, `s = R⁻¹r`, `M_k = R⁻¹∂R/∂η_k`:
+/// ```text
+///   ∂NLL_data/∂η_k = −a_kᵀ s + ½( tr(M_k) − sᵀ ∂R/∂η_k s )
+/// ```
+/// plus the `Ω⁻¹η` prior. Reduces exactly to the diagonal `coef·∂f/∂η` loop when
+/// `R` is diagonal. `R` / `∂R/∂f` are built exactly as
+/// [`crate::stats::likelihood::foce_subject_nll_interaction_dense`] (same
+/// `compute_r_matrix_with_correlations` / `compute_dr_df_matrices`, same `#484`
+/// magnitude multiplier) so the inner EBE stays consistent with the marginal it
+/// optimises. `sens` supplies per-obs `∂f/∂η` for both the analytical and the ODE
+/// (`Dual1`) provider, so this one branch serves both inner paths.
+#[allow(clippy::too_many_arguments)]
+fn dense_residual_inner_gradient(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &crate::types::OmegaMatrix,
+    sigma: &[f64],
+    sens: &[crate::sens::provider::ObsGrad],
+) -> Option<Vec<f64>> {
+    use nalgebra::{DMatrix, DVector};
+    let n_eta = model.n_eta;
+    let eta_v = DVector::from_column_slice(eta);
+    let prior = &omega.inv * &eta_v;
+    let n_obs = sens.len();
+    if n_obs == 0 {
+        return Some(prior.as_slice().to_vec());
+    }
+    let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
+    let corr = &model.residual_correlations;
+    // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
+    let r = match ruv_mult.as_deref() {
+        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+            &model.error_spec,
+            &ipreds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma,
+            corr,
+            mult,
+        ),
+        None => crate::stats::residual_error::compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &ipreds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma,
+            corr,
+        ),
+    };
+    let chol = r.clone().cholesky()?;
+    let r_inv = chol.inverse();
+    let residuals = DVector::from_iterator(
+        n_obs,
+        subject
+            .observations
+            .iter()
+            .zip(ipreds.iter())
+            .map(|(&y, &f)| y - f),
+    );
+    let s = chol.solve(&residuals); // R⁻¹ r
+    let dr = crate::stats::residual_error::compute_dr_df_matrices(
+        &model.error_spec,
+        &ipreds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma,
+        corr,
+        ruv_mult.as_deref(),
+    );
+    let mut grad = vec![0.0f64; n_eta];
+    for k in 0..n_eta {
+        // −a_kᵀ s, where a_k = (∂f_m/∂η_k)_m is column k of H.
+        let mut term_a = 0.0;
+        for m in 0..n_obs {
+            term_a += sens[m].df_deta[k] * s[m];
+        }
+        // ∂R/∂η_k = Σ_m H[m,k]·∂R/∂f_m.
+        let mut dr_k = DMatrix::<f64>::zeros(n_obs, n_obs);
+        for m in 0..n_obs {
+            let h_mk = sens[m].df_deta[k];
+            if h_mk != 0.0 {
+                dr_k += h_mk * &dr[m];
+            }
+        }
+        // tr(M_k) = tr(R⁻¹ ∂R/∂η_k) = Σ_{p,q} r_inv[p,q]·dr_k[q,p].
+        let mut tr_mk = 0.0;
+        for p in 0..n_obs {
+            for q in 0..n_obs {
+                tr_mk += r_inv[(p, q)] * dr_k[(q, p)];
+            }
+        }
+        // sᵀ ∂R/∂η_k s.
+        let quad = s.dot(&(&dr_k * &s));
+        grad[k] = -term_a + 0.5 * (tr_mk - quad) + prior[k];
     }
     Some(grad)
 }
@@ -5162,6 +5281,154 @@ mod iov_tests {
         }
     }
 
+    /// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient must match a central
+    /// FD of the production `individual_nll`, which routes a correlated-residual model
+    /// through the dense data term. The `combined(PROP,ADD)` + correlated `block_sigma`
+    /// modifies the diagonal residual variance and its `∂/∂f` (the within-observation
+    /// `2ρσ_iσ_j c_i c_j` cross term) — exactly the term the plain scalar `dvar_df` omits
+    /// and the dense kernel (`compute_dr_df_matrices`) carries. Pins that the dense inner
+    /// branch reduces correctly and stays consistent with the marginal it optimises.
+    #[test]
+    fn dense_residual_inner_grad_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  omega ETA_CL ~ 0.09 FIX\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse correlated block_sigma model");
+        assert!(
+            !model.residual_correlations.is_empty(),
+            "fixture must carry a residual correlation"
+        );
+        assert!(
+            !analytic_inner_common_bail(&model),
+            "block_sigma must now take the analytic inner gradient (#627)"
+        );
+
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 5],
+            obs_cmts: vec![1; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: vec![1; 5],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        // Nonzero residuals: predictions at η=0.1 nudged, scored at a different η.
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1],
+        );
+        subject.observations = preds.iter().map(|p| p * 1.15 + 0.3).collect();
+        check_inner_ruv_grad(&model, &subject, &[-0.2]);
+    }
+
+    /// ODE variant of [`dense_residual_inner_grad_matches_fd`]: the dense-R inner branch
+    /// reuses the light `Dual1` ODE walk's per-obs `∂f/∂η`, so the same correlated
+    /// `block_sigma` model on an ODE structural model must also match FD of `individual_nll`.
+    /// Exercises the ODE-branch gate flip (`analytic_inner_grad_supported`, #627).
+    #[test]
+    fn dense_residual_ode_inner_grad_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  omega ETA_CL ~ 0.09 FIX\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+        )
+        .expect("parse ODE correlated block_sigma model");
+        assert!(!model.residual_correlations.is_empty());
+        assert!(model.ode_spec.is_some());
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 5],
+            obs_cmts: vec![1; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: vec![1; 5],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            analytic_inner_grad_supported(&model, &subject),
+            "ODE block_sigma subject should take the analytic (Dual1) inner gradient (#627)"
+        );
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1],
+        );
+        subject.observations = preds.iter().map(|p| p * 1.15 + 0.3).collect();
+        check_inner_ruv_grad(&model, &subject, &[-0.2]);
+    }
+
+    /// `block_sigma` + η-dependent `ExpressionScale` `obs_scale` (#627 × #486): the dense
+    /// inner gradient must still match FD of `individual_nll`. The scale enters only
+    /// through `∂f/∂η` (quotient rule, from the provider) and the scaled prediction that
+    /// `R` is built on, so the dense branch composes with it. Pins the numerical side of
+    /// `expression_scale_with_correlated_residual_is_analytic_both_loops`.
+    #[test]
+    fn dense_expression_scale_inner_grad_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  omega ETA_CL ~ 0.09 FIX\n  omega ETA_V ~ 0.04 FIX\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 1.00] FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse block_sigma + ExpressionScale");
+        assert!(matches!(
+            model.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        ));
+        assert!(!analytic_inner_common_bail(&model));
+        let mut subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 5],
+            obs_cmts: vec![1; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: vec![1; 5],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(
+            &model,
+            &subject,
+            &model.default_params.theta,
+            &[0.1, -0.05],
+        );
+        subject.observations = preds.iter().map(|p| p * 1.1 + 5.0).collect();
+        check_inner_ruv_grad(&model, &subject, &[-0.15, 0.12]);
+    }
+
     /// Parse an ODE + LTBS (`log_additive`) + `iiv_on_ruv` model and build a
     /// subject with log-scale observations, shared by the two ODE-LTBS inner tests.
     fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
@@ -5724,15 +5991,15 @@ mod iov_tests {
         );
     }
 
-    /// Interaction of the #486 analytic `ExpressionScale` path with main's correlated
-    /// residual error (`block_sigma`): correlated residuals are not carried by the analytic
-    /// kernels, so a model with BOTH an η-dependent `obs_scale` and a residual correlation
-    /// must route to FD on BOTH loops (`analytic_inner_common_bail` true,
-    /// `analytic_outer_gradient_available` false) — the scale never bypasses the correlation
-    /// bail. The uncorrelated control proves it is the correlation, not the scale, forcing FD.
-    /// Pins the rebase merge of the two features.
+    /// Interaction of the #486 analytic `ExpressionScale` path with correlated residual
+    /// error (`block_sigma`): as of #627 the dense-R gradient serves correlated residuals
+    /// on BOTH loops, and the η-dependent `obs_scale` composes with it (the scale enters
+    /// only through `∂f/∂η` and the scaled prediction, both of which the dense assembly
+    /// consumes). So a model with BOTH features is now analytic on both loops —
+    /// `analytic_inner_common_bail` false, `analytic_outer_gradient_available` true. The
+    /// diagonal control stays analytic too. Inverts the previous FD-pinning assertion.
     #[test]
-    fn expression_scale_with_correlated_residual_routes_to_fd_both_loops() {
+    fn expression_scale_with_correlated_residual_is_analytic_both_loops() {
         use crate::parser::model_parser::parse_model_string;
         let corr = parse_model_string(
             "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n",
@@ -5746,12 +6013,12 @@ mod iov_tests {
             "fixture must carry both an ExpressionScale obs_scale and a residual correlation"
         );
         assert!(
-            analytic_inner_common_bail(&corr),
-            "correlated residual must force the inner gradient to FD (not bypassed by obs_scale)"
+            !analytic_inner_common_bail(&corr),
+            "block_sigma + ExpressionScale is now analytic inner (#627)"
         );
         assert!(
-            !crate::sens::provider::analytic_outer_gradient_available(&corr),
-            "correlated residual must force the outer gradient to FD"
+            crate::sens::provider::analytic_outer_gradient_available(&corr),
+            "block_sigma + ExpressionScale is now analytic outer (#627)"
         );
 
         // Control: same obs_scale, diagonal (uncorrelated) residual → analytic on both loops.
@@ -5760,14 +6027,10 @@ mod iov_tests {
         )
         .expect("parse ExpressionScale + diagonal residual");
         assert!(diag.residual_correlations.is_empty());
-        assert!(
-            !analytic_inner_common_bail(&diag),
-            "uncorrelated ExpressionScale must stay analytic inner (the scale alone is fine)"
-        );
-        assert!(
-            crate::sens::provider::analytic_outer_gradient_available(&diag),
-            "uncorrelated ExpressionScale must stay analytic outer"
-        );
+        assert!(!analytic_inner_common_bail(&diag));
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            &diag
+        ));
     }
 
     // `analytical_ad_unsupported` is the VESTIGIAL retired-AD classifier (not consulted by

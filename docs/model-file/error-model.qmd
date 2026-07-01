@@ -308,6 +308,18 @@ over the full dense residual covariance `R` (it reduces to the diagonal FOCEI
 importance weights already use the dense `R`; the Student-t proposal precision is
 also built from `R⁻¹` so the correlated posterior shape is sampled efficiently.
 
+Both loops of a `foce` / `focei` correlated fit run **exact analytic gradients**
+(no finite differences): the within-observation cross term is carried through the
+same dense-`R` derivative kernels the objective uses (`compute_dr_df_matrices`,
+`compute_d2r_df2_matrices`), so the inner EBE η-gradient and the outer θ/Ω/σ
+gradient are noise-free and the `auto` optimizer resolves to a gradient-based
+method. The OFV is unchanged (Eval 1 on the anchor below is still 18.722087). In
+the analytic scope (analytical 1-/2-/3-cpt, single endpoint) the correlation only
+couples the σ-loadings *within* one observation, so `R` stays diagonal and the
+dense assembly reduces to the scalar contractions fed correlation-aware `(R, ∂R/∂f,
+∂²R/∂f²)`; a genuine cross-endpoint off-diagonal `R` (which needs a per-CMT /
+Form-C readout) falls back to per-subject finite differences.
+
 Validation: `examples/correlated_residual_combined.ferx` and
 `nonmem_anchor/correlated_residual_combined.ctl` run the same fixed-parameter
 one-compartment IV model with `$SIGMA BLOCK(2) FIX`. On

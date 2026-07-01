@@ -241,6 +241,125 @@ fn ruv_kappa(eps: f64, r: f64, d: f64) -> f64 {
     2.0 * eps / r + eps * eps * d / (r * r)
 }
 
+/// Per-observation correlation-aware residual scalars `(R_jj, ∂R_jj/∂f_j, ∂²R_jj/∂f_j²)`
+/// for a `block_sigma` (#627) model, or `None` to bail to FD.
+///
+/// In the analytic outer scope (analytical 1-/2-/3-cpt, single endpoint) a
+/// `block_sigma` correlation only couples the σ-loadings **within** one observation
+/// (`combined(...)` endpoints), so the residual covariance `R` stays **diagonal** —
+/// but each diagonal entry, and its `f`-derivatives, carry the within-observation
+/// cross term `2ρσ_iσ_j c_i c_j` that the plain scalar `ErrorSpec::dvar_df` /
+/// `d2var_df2` omit. With `R` diagonal, the dense Almquist assembly
+/// (`H̃ = HᵀR⁻¹H + ½B + Ω⁻¹`, `B_{kl} = tr(M_kM_l)`) reduces **exactly** to the scalar
+/// path (`p = 1/R + ½(d/R)²`, `ctc = Σ c̃c̃ᵀ`), so the whole outer gradient is the
+/// existing assembly fed these correlation-aware `(r,d,d2)` — no separate dense
+/// linear algebra needed. Values come from the **same** builders the marginal
+/// (`foce_subject_nll_interaction_dense`) uses, so the gradient stays consistent with
+/// the objective bit-for-bit.
+///
+/// A genuine cross-endpoint off-diagonal `R` (paired total/unbound rows) would need
+/// the full dense `M_k`/`B_{kl}` assembly, but such models require a per-CMT / Form-C
+/// readout that is out of analytic scope (they run FD). The off-diagonal check is a
+/// defensive guard: if one ever reaches here, bail to FD rather than silently drop the
+/// off-diagonals.
+fn corr_residual_diag(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    sigma: &[f64],
+) -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    use crate::stats::residual_error::{
+        compute_d2r_df2_matrices, compute_dr_df_matrices, compute_r_matrix_with_correlations,
+    };
+    let corr = &model.residual_correlations;
+    let es = &model.error_spec;
+    let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
+    let n = ipreds.len();
+    let r = compute_r_matrix_with_correlations(
+        es,
+        &ipreds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma,
+        corr,
+    );
+    // Guard: only diagonal R is served by the scalar reduction (see the doc above).
+    for a in 0..n {
+        for b in 0..n {
+            if a != b && r[(a, b)].abs() > 1e-12 {
+                return None;
+            }
+        }
+    }
+    let dr = compute_dr_df_matrices(
+        es,
+        &ipreds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma,
+        corr,
+        None,
+    );
+    let d2 = compute_d2r_df2_matrices(
+        es,
+        &ipreds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma,
+        corr,
+        None,
+    );
+    let mut rv = vec![0.0; n];
+    let mut dv = vec![0.0; n];
+    let mut d2v = vec![0.0; n];
+    for j in 0..n {
+        rv[j] = r[(j, j)];
+        dv[j] = dr[j][(j, j)];
+        d2v[j] = d2[j][j][(j, j)];
+    }
+    Some((rv, dv, d2v))
+}
+
+/// Correlation-aware per-observation `(R_jj, ∂R_jj/∂f_j)` at a given σ, for the
+/// σ-block's central FD (`d2` is not needed there). Diagonals of the same builders
+/// as [`corr_residual_diag`]; the diagonal guard is already applied there so this
+/// reads the diagonal directly.
+fn corr_residual_rd_at_sigma(
+    model: &CompiledModel,
+    subject: &Subject,
+    ipreds: &[f64],
+    sigma: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::stats::residual_error::compute_dr_df_matrices;
+    let corr = &model.residual_correlations;
+    let es = &model.error_spec;
+    let n = ipreds.len();
+    let dr = compute_dr_df_matrices(
+        es,
+        ipreds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma,
+        corr,
+        None,
+    );
+    let mut rv = vec![0.0; n];
+    let mut dv = vec![0.0; n];
+    for j in 0..n {
+        rv[j] = es.variance_at_with_correlations(subject.obs_cmts[j], ipreds[j], sigma, corr);
+        dv[j] = dr[j][(j, j)];
+    }
+    (rv, dv)
+}
+
 fn prepare(
     model: &CompiledModel,
     subject: &Subject,
@@ -318,17 +437,31 @@ fn prepare_stacked(
     };
 
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    // Correlated residual (`block_sigma`, #627): precompute the correlation-aware
+    // per-obs `(r, d, d2)` diagonals once (block_sigma excludes M3/ruv/IOV, so
+    // `ruv_scale = 1`). `None` bails to FD (a rare off-diagonal R). Everything else in
+    // the assembly is unchanged — see `corr_residual_diag`.
+    let corr_diag = if !model.residual_correlations.is_empty() {
+        Some(corr_residual_diag(model, subject, sens, sigma)?)
+    } else {
+        None
+    };
     for obs in sens.obs.iter() {
         let f = obs.f;
         // obs index → cmt: provider obs are parallel to subject.obs_times.
         let j = et.len();
         let cmt = subject.obs_cmts[j];
-        let r = model.error_spec.variance_at(cmt, f, sigma) * ruv_scale;
+        let (r, d, d2) = match &corr_diag {
+            Some((rv, dv, d2v)) => (rv[j], dv[j], d2v[j]),
+            None => (
+                model.error_spec.variance_at(cmt, f, sigma) * ruv_scale,
+                model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale,
+                model.error_spec.d2var_df2(cmt, sigma) * ruv_scale,
+            ),
+        };
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
-        let d = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
-        let d2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
         let y = subject.observations[j];
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         let is_cens = m3 && cens != 0;
@@ -702,6 +835,12 @@ fn sigma_block(
     let sigma = &params.sigma.values;
     let n_sigma = sigma.len();
     let mut grad = vec![0.0f64; n_sigma];
+    // Correlated residual (`block_sigma`, #627): the σ FD must differentiate the
+    // correlation-aware variance / `∂R/∂f` (which carry the within-observation cross
+    // term), not the plain scalar error functions. Diagonal-R only (guaranteed by
+    // `corr_residual_diag`'s guard in `prepare_stacked`).
+    let correlated = !model.residual_correlations.is_empty();
+    let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
 
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
@@ -709,6 +848,15 @@ fn sigma_block(
         sp[k] += h;
         let mut sm = sigma.clone();
         sm[k] -= h;
+        // Correlation-aware `(R_jj, ∂R_jj/∂f_j)` at σ±h, built once per σ_k.
+        let (corr_sp, corr_sm) = if correlated {
+            (
+                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sp)),
+                Some(corr_residual_rd_at_sigma(model, subject, &ipreds, &sm)),
+            )
+        } else {
+            (None, None)
+        };
 
         let mut fixed = 0.0;
         let mut m_vec = DVector::<f64>::zeros(n_eta);
@@ -746,11 +894,24 @@ fn sigma_block(
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
             // Evaluate the four closed-form error functions once at σ±h and reuse
-            // them for `r_sig`/`d_sig` and the residual-eta `g_sig` below.
-            let vp = model.error_spec.variance_at(cmt, f, &sp);
-            let vm = model.error_spec.variance_at(cmt, f, &sm);
-            let dp_var = model.error_spec.dvar_df(cmt, f, &sp);
-            let dm_var = model.error_spec.dvar_df(cmt, f, &sm);
+            // them for `r_sig`/`d_sig` and the residual-eta `g_sig` below. For a
+            // correlated model these are the correlation-aware variance / `∂R/∂f`.
+            let vp = match &corr_sp {
+                Some((rv, _)) => rv[j],
+                None => model.error_spec.variance_at(cmt, f, &sp),
+            };
+            let vm = match &corr_sm {
+                Some((rv, _)) => rv[j],
+                None => model.error_spec.variance_at(cmt, f, &sm),
+            };
+            let dp_var = match &corr_sp {
+                Some((_, dv)) => dv[j],
+                None => model.error_spec.dvar_df(cmt, f, &sp),
+            };
+            let dm_var = match &corr_sm {
+                Some((_, dv)) => dv[j],
+                None => model.error_spec.dvar_df(cmt, f, &sm),
+            };
             // ∂R/∂σ_k, ∂d/∂σ_k by central FD. `et.r`/`et.d` carry the `exp(2·η_ruv)`
             // scale, so lift these too.
             let r_sig = prep.ruv_scale * (vp - vm) / (2.0 * h);
@@ -1215,6 +1376,19 @@ pub fn subject_packed_gradient_foce(
         return None;
     }
 
+    // Correlated residual (`block_sigma`, #627): `R⁰` (frozen at η=0) and its `∂/∂f`
+    // carry the within-observation `combined` cross term. `R⁰` is diagonal in the
+    // analytic FOCE scope, so `R̃ = JΩJᵀ + diag(R⁰)` is unchanged apart from the
+    // correlation-aware `(r0,d0)`; a rare off-diagonal bails per-subject to FD via
+    // `corr_residual_diag` → `None`. (FOCE is first-order in R — no `∂²R/∂f²`.)
+    let correlated = !model.residual_correlations.is_empty();
+    let corr = &model.residual_correlations;
+    let corr_rd0 = if correlated {
+        Some(corr_residual_diag(model, subject, &sens0, sigma)?)
+    } else {
+        None
+    };
+
     // J = ∂f/∂η (nq×n_eta), ρ = y − f0 = ε + J·η̂, R⁰ and d⁰ at f(η=0) — quant rows.
     let mut jmat = DMatrix::<f64>::zeros(nq, n_eta);
     let mut rho = DVector::<f64>::zeros(nq);
@@ -1230,12 +1404,18 @@ pub fn subject_packed_gradient_foce(
         rho[i] = subject.observations[j] - (obs.f - jeta);
         let cmt = subject.obs_cmts[j];
         let f0act = sens0.obs[j].f;
-        let r = model.error_spec.variance_at(cmt, f0act, sigma);
+        let (r, dd) = match &corr_rd0 {
+            Some((rv, dv, _)) => (rv[j], dv[j]),
+            None => (
+                model.error_spec.variance_at(cmt, f0act, sigma),
+                model.error_spec.dvar_df(cmt, f0act, sigma),
+            ),
+        };
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
         r0[i] = r;
-        d0[i] = model.error_spec.dvar_df(cmt, f0act, sigma);
+        d0[i] = dd;
     }
 
     // Censored rows: `−logΦ(z)`, z = (LLOQ − f(η̂))/√R⁰. Precompute the inverse
@@ -1371,9 +1551,23 @@ pub fn subject_packed_gradient_foce(
         for (i, &j) in quant.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
             let f0act = sens0.obs[j].f;
-            let dr0 = (model.error_spec.variance_at(cmt, f0act, &sp)
-                - model.error_spec.variance_at(cmt, f0act, &sm))
-                / (2.0 * hsig);
+            // Correlation-aware `∂R⁰/∂σ` when block_sigma present (within-obs cross term).
+            let (vp, vm) = if correlated {
+                (
+                    model
+                        .error_spec
+                        .variance_at_with_correlations(cmt, f0act, &sp, corr),
+                    model
+                        .error_spec
+                        .variance_at_with_correlations(cmt, f0act, &sm, corr),
+                )
+            } else {
+                (
+                    model.error_spec.variance_at(cmt, f0act, &sp),
+                    model.error_spec.variance_at(cmt, f0act, &sm),
+                )
+            };
+            let dr0 = (vp - vm) / (2.0 * hsig);
             nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
         for c in &cens {
@@ -1981,12 +2175,34 @@ pub fn subject_eta_dx(
     // σ coords: M_σ = ½ Σⱼ ∂αⱼ/∂σ · aⱼ (∂R/∂σ,∂d/∂σ by FD of closed form); ×σ.
     let sigma_start = omega_start + entries.len();
     let sigma = &params.sigma.values;
+    // Correlated residual (`block_sigma`, #627): σ FD must use the correlation-aware
+    // variance / `∂R/∂f` (mirrors `sigma_block`). Diagonal-R only (guarded in `prepare`).
+    let correlated = !model.residual_correlations.is_empty();
+    let eta_dx_ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
         let mut sp = sigma.clone();
         sp[k] += h;
         let mut sm = sigma.clone();
         sm[k] -= h;
+        let (corr_sp, corr_sm) = if correlated {
+            (
+                Some(corr_residual_rd_at_sigma(
+                    model,
+                    subject,
+                    &eta_dx_ipreds,
+                    &sp,
+                )),
+                Some(corr_residual_rd_at_sigma(
+                    model,
+                    subject,
+                    &eta_dx_ipreds,
+                    &sm,
+                )),
+            )
+        } else {
+            (None, None)
+        };
         let mut mvec = DVector::<f64>::zeros(n_eta);
         for (j, obs) in sens.obs.iter().enumerate() {
             let cmt = subject.obs_cmts[j];
@@ -2020,14 +2236,19 @@ pub fn subject_eta_dx(
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
             // `et.r`/`et.d` carry the `exp(2·η_ruv)` scale, so lift `∂R/∂σ`,`∂d/∂σ`
-            // too (mirrors `sigma_block`); `ruv_scale == 1` when there is no ruv.
-            let r_sig = prep.ruv_scale
-                * (model.error_spec.variance_at(cmt, f, &sp)
-                    - model.error_spec.variance_at(cmt, f, &sm))
-                / (2.0 * h);
-            let d_sig = prep.ruv_scale
-                * (model.error_spec.dvar_df(cmt, f, &sp) - model.error_spec.dvar_df(cmt, f, &sm))
-                / (2.0 * h);
+            // too (mirrors `sigma_block`); `ruv_scale == 1` when there is no ruv. For a
+            // correlated model these use the correlation-aware variance / `∂R/∂f`.
+            let (vp, vm, dp_var, dm_var) = match (&corr_sp, &corr_sm) {
+                (Some((rvp, dvp)), Some((rvm, dvm))) => (rvp[j], rvm[j], dvp[j], dvm[j]),
+                _ => (
+                    model.error_spec.variance_at(cmt, f, &sp),
+                    model.error_spec.variance_at(cmt, f, &sm),
+                    model.error_spec.dvar_df(cmt, f, &sp),
+                    model.error_spec.dvar_df(cmt, f, &sm),
+                ),
+            };
+            let r_sig = prep.ruv_scale * (vp - vm) / (2.0 * h);
+            let d_sig = prep.ruv_scale * (dp_var - dm_var) / (2.0 * h);
             let inv_r = 1.0 / r;
             let inv_r2 = inv_r * inv_r;
             let inv_r3 = inv_r2 * inv_r;
@@ -2885,6 +3106,324 @@ mod tests {
         let model = parse_model_string(WARFARIN_RUV).expect("parse");
         assert_eq!(model.residual_error_eta, Some(3));
         run_ruv_packed_check(&model, &[0.22, 11.0, 1.4]);
+    }
+
+    /// 1-cpt IV, two BSV etas, correlated `combined` residual error (`block_sigma`, #627).
+    const BLOCK_SIGMA_1CPT: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n";
+
+    fn dense_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
+        let n = times.len();
+        let mut subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.to_vec(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1; n],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &[0.12, -0.08]);
+        subject.observations = preds.iter().map(|p| p * 0.85 + 0.2).collect();
+        subject
+    }
+
+    /// Correlation-aware EBE: Newton on the dense inner NLL using the diagonal-but-
+    /// correlated `(r,d,d2)` from [`corr_residual_diag`]. The scalar [`precise_ebe`] uses
+    /// the plain error functions (no within-obs cross term) and would converge to the
+    /// wrong mode for `block_sigma`, breaking the envelope theorem the gradient assumes.
+    fn precise_ebe_corr(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+    ) -> Vec<f64> {
+        let warm = find_ebe(model, subject, params, 80, 1e-12, None, None);
+        let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
+        let n_eta = model.n_eta;
+        let sigma = &params.sigma.values;
+        let omega_inv = &params.omega.inv;
+        for _ in 0..60 {
+            let sens =
+                crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &eta)
+                    .unwrap();
+            let (rv, dv, d2v) = corr_residual_diag(model, subject, &sens, sigma).unwrap();
+            let mut grad = DVector::<f64>::from_column_slice(
+                &(omega_inv * DVector::from_column_slice(&eta))
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            );
+            let mut hess = omega_inv.clone();
+            for (j, obs) in sens.obs.iter().enumerate() {
+                let t = err_terms(rv[j], dv[j], d2v[j], subject.observations[j] - obs.f);
+                let (g1, g2) = (0.5 * t.alpha, 0.5 * t.alpha_p);
+                let a = obs.df_deta.as_slice();
+                for k in 0..n_eta {
+                    grad[k] += g1 * a[k];
+                    for l in 0..n_eta {
+                        hess[(k, l)] += g2 * a[k] * a[l] + g1 * obs.d2f_deta2[k * n_eta + l];
+                    }
+                }
+            }
+            let step = hess.cholesky().unwrap().solve(&grad);
+            for k in 0..n_eta {
+                eta[k] -= step[k];
+            }
+            if step.norm() < 1e-13 {
+                break;
+            }
+        }
+        eta
+    }
+
+    /// Dense (`block_sigma`) FOCEI marginal at a given η̂. The production
+    /// `foce_subject_nll(.., interaction=true)` dispatches to
+    /// `foce_subject_nll_interaction_dense` for correlated models.
+    fn marginal_nll_dense_at(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+        eta: &[f64],
+    ) -> f64 {
+        let eta_v = DVector::from_column_slice(eta);
+        let jac = eta_jacobian_any(model, subject, &params.theta, eta);
+        let h = DMatrix::from_row_slice(subject.obs_times.len(), model.n_eta, &jac);
+        crate::stats::likelihood::foce_subject_nll(
+            model,
+            subject,
+            &params.theta,
+            &eta_v,
+            &h,
+            &params.omega,
+            &params.sigma.values,
+            true,
+        )
+    }
+
+    /// The analytic FOCEI packed gradient for a correlated `block_sigma` model must match
+    /// Richardson reconverged FD of ferx's own dense FOCEI marginal across every θ/Ω/σ
+    /// coordinate (#627). The within-observation `combined` cross term modifies the
+    /// residual variance and its `∂/∂f`, `∂²/∂f²`, which the scalar path omits — so this
+    /// confirms the correlation-aware `(r,d,d2)` reduction of the dense Almquist assembly.
+    #[test]
+    fn population_packed_gradient_block_sigma_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let model = parse_model_string(BLOCK_SIGMA_1CPT).expect("parse block_sigma");
+        assert!(
+            !model.residual_correlations.is_empty(),
+            "fixture must carry a residual correlation"
+        );
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            &model
+        ));
+
+        let theta = &[1.1, 11.0];
+        let s1 = dense_subject(&model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let s2 = dense_subject(&model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0]);
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_corr(&model, s, &params)))
+            .collect();
+
+        let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            .expect("block_sigma is analytic");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_corr(&model, s, &p);
+                    marginal_nll_dense_at(&model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "x[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[k],
+                fd,
+                (analytic[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// FOCE (non-interaction) analog of `population_packed_gradient_block_sigma_matches_fd`.
+    /// The Sheiner–Beal linearized marginal freezes `R⁰` at η=0, so `block_sigma` only
+    /// needs the correlation-aware `(r0, d0)` and `∂R⁰/∂σ` (no `∂²R/∂f²`). Must match
+    /// Richardson reconverged FD of ferx's dense FOCE OFV across every θ/Ω/σ coord (#627).
+    #[test]
+    fn population_packed_gradient_block_sigma_foce_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let src = BLOCK_SIGMA_1CPT.replace("method = focei", "method = foce");
+        let model = parse_model_string(&src).expect("parse block_sigma foce");
+        assert!(!model.residual_correlations.is_empty());
+
+        let theta = &[1.1, 11.0];
+        let s1 = dense_subject(&model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let s2 = dense_subject(&model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0]);
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_corr(&model, s, &params)))
+            .collect();
+
+        let analytic = population_gradient_sens_foce(&model, &pop, &template, &x, &ehs)
+            .expect("block_sigma foce is analytic");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_corr(&model, s, &p);
+                    marginal_nll_foce_at(&model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// `block_sigma` + η-dependent `ExpressionScale` `obs_scale` (#627 × #486): the analytic
+    /// FOCEI packed gradient must still match Richardson reconverged FD of the dense marginal
+    /// across every θ/Ω/σ coord. Pins the numerical side of the outer half of
+    /// `expression_scale_with_correlated_residual_is_analytic_both_loops`.
+    #[test]
+    fn population_packed_gradient_block_sigma_expression_scale_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let src = BLOCK_SIGMA_1CPT.replace(
+            "[structural_model]",
+            "[scaling]\n  obs_scale = 1000 / V\n[structural_model]",
+        );
+        let model = parse_model_string(&src).expect("parse block_sigma + obs_scale");
+        assert!(matches!(
+            model.scaling,
+            crate::types::ScalingSpec::ExpressionScale { .. }
+        ));
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            &model
+        ));
+
+        let theta = &[1.1, 11.0];
+        let s1 = dense_subject(&model, theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let s2 = dense_subject(&model, theta, &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0]);
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_corr(&model, s, &params)))
+            .collect();
+
+        let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            .expect("block_sigma + obs_scale is analytic");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_corr(&model, s, &p);
+                    marginal_nll_dense_at(&model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
+        }
     }
 
     /// Closed-form `iiv_on_ruv` + **M3 BLOQ** (#4c): the analytic FOCEI packed

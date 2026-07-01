@@ -60,6 +60,14 @@ section of the SDLC for the versioning policy).
   `correlated_residual_combined` anchor, ferx FOCEI OFV 18.722087 matches NONMEM
   `METHOD=1 INTER` (18.722087) to better than 1e-5. The Gauss-Newton
   (`gn` / `gn_hybrid`) paths remain diagonal-only and are still rejected.
+- `block_sigma` correlated-residual `foce` / `focei` fits now run **exact analytic
+  gradients on both loops** instead of finite differences (#627). The within-observation
+  `combined(...)` cross term is carried through the same dense-`R` builders the marginal
+  uses (`compute_dr_df_matrices`, `compute_d2r_df2_matrices`), so the inner EBE η-gradient
+  and the outer θ/Ω/σ gradient are noise-free and the `auto` optimizer resolves to a
+  gradient-based method. The OFV is unchanged (Eval 1 on the anchor is still 18.722087);
+  a rare cross-endpoint off-diagonal-`R` subject falls back to per-subject finite
+  differences. (The `gn` / `gn_hybrid` paths stay diagonal-only.)
 - **AUC-target attainment metric + vancomycin AUC-TDM example/anchor** (#391, S2.5b). A new
   optional `[adaptive_dosing] auc_target = [low, high]` key adds `auc_target_attainment` to
   `AdaptiveSubjectMetrics` — the fraction of inter-decision windows whose area under the monitored

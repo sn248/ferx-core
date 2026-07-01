@@ -359,7 +359,10 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
-        && model.residual_correlations.is_empty()
+        // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
+        // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
+        // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
+        // off-diagonal-R subject bails per-subject to FD via `corr_residual_diag` → `None`.
         && !model.has_tte()
         // Custom residual-error magnitude (#484): θ-dependent variance not yet in
         // the analytic outer θ/σ kernels — FD gradient only (it is magnitude-aware).
@@ -3478,6 +3481,15 @@ mod tests {
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
         assert!(analytic_outer_gradient_available(&ruv_m3));
+        // Correlated residual (`block_sigma`) is now analytic on the outer loop (#627):
+        // the dense assembly reduces to the scalar path fed correlation-aware `(r,d,d2)`.
+        // (Previously this predicate short-circuited to FD on any residual correlation.)
+        let block_sigma = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse block_sigma model");
+        assert!(!block_sigma.residual_correlations.is_empty());
+        assert!(analytic_outer_gradient_available(&block_sigma));
     }
 
     /// The `TIME` built-in routes a model through the event-driven per-event PK

@@ -19,6 +19,18 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **M3 BLOQ censored rows now enter the FOCEI Laplace determinant `log|H̃|`** for a
+  consistent likelihood (#486). Previously censored rows contributed to the data term and
+  the true inner Hessian but were dropped from the outer `log|H̃|` — an internal
+  inconsistency with quantified rows. They now enter `H̃` at FOCEI (Gauss-Newton) order
+  (structural `g2·a·aᵀ`, plus the `iiv_on_ruv` residual-eta cross terms), with the exact
+  analytic gradient matching reconverged finite differences to ~1e-6 across non-IOV/IOV and
+  closed-form/ODE, including the `M3 + IOV + iiv_on_ruv` triple. **M3 FOCEI OFV values shift
+  accordingly** (estimates/SEs are essentially unchanged), and the OFV now matches NONMEM
+  `METHOD=1 LAPLACE` M3 up to the residual FOCEI-vs-LAPLACE second-order term. FOCE
+  (Sheiner–Beal) is a distinct objective and is unchanged.
+
 ### Added
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences

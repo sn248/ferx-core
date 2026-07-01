@@ -754,8 +754,12 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> 
 /// serves both the production `f64` predictor (`T = f64`, byte-identical to the
 /// original) and the analytic ODE sensitivity provider's dual walk (`T = Dual*`),
 /// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
-/// #4 / #451). The dual caller passes `dose_lagtimes = &[]` (lagtime gated off) and
-/// `reset_floor = NEG_INFINITY` (reset gated off), so those branches are inert there.
+/// #4 / #451). The two dual callers each feed one branch live: the TV-cov
+/// event-driven walk (`integrate_tvcov_g`) passes the tracked dual `dose_lagtimes`
+/// for an in-scope estimated lagtime (#486), and the static walk (`integrate_g`)
+/// passes the tracked `reset_floor` for an in-scope EVID 3/4 reset (#486).
+/// `integrate_g` still passes `dose_lagtimes = &[]` (its gate excludes lagtime
+/// subjects, which always route to the TV-cov walk instead).
 ///
 /// `params` is the flat individual-parameter vector the `prepared` constants were
 /// built from; it is read here only for the optional pathway-fraction multiplier

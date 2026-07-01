@@ -667,8 +667,10 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     if !ode.diffusion_var.is_empty() {
         return false;
     }
-    // The IOV walk reuses `integrate_tvcov_g`, which carries no input-rate (`R_in`)
-    // forcing, so any built-in absorption model routes to FD.
+    // `integrate_tvcov_g` now carries input-rate (`R_in`) forcing (#486), but that
+    // support has only been validated on the non-IOV event-driven walk; extending
+    // IOV to built-in absorption models is an unaudited scope expansion, not a
+    // technical limitation of the walk itself, so it still routes to FD here.
     if !ode.input_rate.is_empty() {
         return false;
     }
@@ -764,8 +766,6 @@ pub fn ode_subject_sensitivities(
     // needed here. `pk` and `pd` are each evaluated once and threaded into the drivers,
     // so neither recomputes them.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    // (reset+absorption FD fallback is enforced by the shared `ode_subject_supported`
-    // gate above, so both the outer and inner paths decline it together — #430 review #1.)
     // Individual-parameter η/θ derivatives (cheap: one dual eval, no integration).
     // Besides feeding the chain, the `∂p/∂η` rows tell us which individual parameters
     // carry IIV, which decides the dual's Hessian width.
@@ -2891,6 +2891,16 @@ fn jdotg_value<T: crate::sens::num::PkNum>(
     out.iter().map(|o| o.grad[0]).collect()
 }
 
+/// The jet-only part of a moving-boundary time `x` (an estimated lagtime or
+/// modeled infusion duration): `x − x.val()` has value `0` (the boundary's f64
+/// position is unchanged) but the same derivatives as `x`, so it is the `δ` fed
+/// into a saltation correction (e.g. `δlag`, `δt_inf`). Shared by every call site
+/// so the convention can't drift between them.
+#[inline]
+fn jet_only<T: crate::sens::num::PkNum>(x: T) -> T {
+    x - T::from_f64(x.val())
+}
+
 /// Estimated-lagtime event-time saltation at an **infusion rate boundary** (the rate
 /// turning on at `t_dose + lag` or off at `t_dose + lag + dur`), where the window shifts
 /// with `lag`. Unlike a bolus, the state is continuous and only `ẋ` jumps by the forcing
@@ -3117,18 +3127,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // are exact). `dose_lag_slot` is empty when the model has no lagtime (byte-identical to
     // the pre-lag walk).
     let has_lagtime = !dose_lag_slot.is_empty();
-    let lag_val = |k: usize| -> f64 {
-        if has_lagtime {
-            pk_at_dose[k][dose_lag_slot[k]].val()
-        } else {
-            0.0
-        }
-    };
-    // Dual counterpart of `lag_val`, carrying `∂lag/∂(θ,η)` (incl. the lagtime axis
-    // itself) — fed into `add_prepared_input_rate_forcing` as `dose_lagtimes` so a
-    // built-in input-rate forcing's `tad = t − (dose.time + lag)` carries the exact
-    // continuous `∂R_in/∂lag` for `t` after the dose's (lagged) arrival (#486); the
-    // *onset* discontinuity at the arrival itself is injected separately as a rate-on
+    // Carries `∂lag/∂(θ,η)` (incl. the lagtime axis itself) — fed into
+    // `add_prepared_input_rate_forcing` as `dose_lagtimes` so a built-in input-rate
+    // forcing's `tad = t − (dose.time + lag)` carries the exact continuous
+    // `∂R_in/∂lag` for `t` after the dose's (lagged) arrival (#486); the *onset*
+    // discontinuity at the arrival itself is injected separately as a rate-on
     // saltation (mirroring the lagged-infusion rate-on injection below). A flat
     // constant (`T::from_f64(0.0)`) when there is no lagtime, so `tad` reduces to the
     // pre-#486 fixed-boundary computation.
@@ -3139,6 +3142,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             T::from_f64(0.0)
         }
     };
+    // Value-only counterpart of `lag_dual`, for callers that only need `lag.val()`.
+    let lag_val = |k: usize| -> f64 { lag_dual(k).val() };
 
     // #530: per-dose modeled rate/duration slot (empty when every dose is fixed). A modeled
     // dose is unresolved in `subject.doses` (`rate`/`duration == 0`), so its effective
@@ -3477,7 +3482,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // carries every other parameter's exact sensitivity.
                         if has_lagtime {
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
-                            let dlag = lag - T::from_f64(lag.val());
+                            let dlag = jet_only(lag);
                             let dose_mass = f_bio_at_dose[idx] * T::from_f64(d.amt);
                             let mut onset = T::from_f64(0.0);
                             for (f, prep) in ode.input_rate.iter().zip(&prepared_forcings) {
@@ -3508,7 +3513,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // saltation (`s = −1`).
                         if has_lagtime {
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
-                            let dlag = lag - T::from_f64(lag.val());
+                            let dlag = jet_only(lag);
                             // Rate-on at `t+lag`: the start shifts with `lag` only (not with
                             // the bioavailable window length); `dr` = effective forcing. Its
                             // `J·g` eval is anchored at `t_event` (TAD=0, this dose just
@@ -3545,7 +3550,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // reduces to `−g(x⁺)·δlag + ½ẋ̇⁺·δlag²` — the single-dose time-shift.)
                         let params = &pk_at_dose[idx];
                         let lag = params[dose_lag_slot[idx]];
-                        let dlag = lag - T::from_f64(lag.val());
+                        let dlag = jet_only(lag);
                         // TAD anchor for the *pre*-dose velocity `g(x⁻)`: the most recent
                         // earlier dose. On the first dose `last_dose_eff` is `NEG_INFINITY`,
                         // which `eval_rhs_anchored` turns into `TAD = NaN` — fine for a
@@ -3672,12 +3677,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 && d.cmt - 1 < n_states
             {
                 let dlag = if has_lagtime {
-                    let lag = pk_at_dose[idx][dose_lag_slot[idx]];
-                    lag - T::from_f64(lag.val())
+                    jet_only(pk_at_dose[idx][dose_lag_slot[idx]])
                 } else {
                     T::from_f64(0.0)
                 };
-                let dtinf = inf_eff[idx].1 - T::from_f64(inf_eff[idx].1.val());
+                let dtinf = jet_only(inf_eff[idx].1);
                 let d_off = dlag + dtinf;
                 inject_rate_saltation::<T>(
                     &mut u,
@@ -7766,6 +7770,11 @@ mod tests {
         let eta = vec![0.1, -0.05];
         check_vs_production(&model, &subj, &theta, &eta);
         check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        // The onset saltation's 2nd-order coefficient (`coef2` in `inject_rate_saltation`,
+        // fed `dr = rate_at_zero(...)` here) is otherwise only value/1st-order checked
+        // above; FOCEI's inner Newton step and Laplace `log|H̃|` consume the 2nd-order
+        // blocks, so validate them against FD of the analytic 1st-order gradient too.
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
     }
 
     // A one-compartment `first_order()` absorption model (feeds `central` directly,
@@ -7829,6 +7838,12 @@ mod tests {
         let eta = vec![0.1, -0.05];
         check_vs_production(&model, &subj, &theta, &eta);
         check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        // The sharpest 2nd-order check of the new onset saltation: `Δr = dose·ka` is
+        // nonzero here (unlike IG/transit's vanishing onset), so `coef2`'s `rate_at_zero`
+        // contribution is live. FOCEI's inner Newton step / Laplace `log|H̃|` consume
+        // `d2f_deta2`/`d2f_deta_dtheta`, so validate them against FD of the analytic
+        // 1st-order gradient (only value/1st-order is checked above).
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
     }
 
     // TRANSIT_ODE (depot → central, forcing on depot) with an estimated
@@ -7884,6 +7899,10 @@ mod tests {
         let eta = vec![0.1, 0.05];
         check_vs_production(&model, &subj, &theta, &eta);
         check_inner_outer_eta_parity(&model, &subj, &theta, &eta);
+        // 2nd-order check of the `rate_at_zero` zero-jump arm's saltation coefficient —
+        // only value/1st-order is checked above, but FOCEI's inner Newton step / Laplace
+        // `log|H̃|` consume the 2nd-order blocks.
+        check_hessian_vs_fd_of_grad(&model, &subj, &theta, &eta);
     }
 
     /// `transit()` + an EVID 3/4 reset (#486, cell (b)): the static walk still

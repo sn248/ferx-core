@@ -1860,4 +1860,94 @@ mod tests {
             }
         }
     }
+
+    /// Direct Tier-1 coverage of every `rate_at_zero` match arm (#486 review): the
+    /// function's only caller (the event-driven walk's onset saltation, gated on
+    /// `has_lagtime`) currently reaches just `Transit`/`InverseGaussian`/`FirstOrder`
+    /// (`ode_analytical_supported`'s lagtime gate excludes `Weibull`/`ZeroOrder` from
+    /// that combination), so the `Weibull` and `ZeroOrder` arms — and `Transit`'s
+    /// degenerate `n ≤ 0` case — are otherwise never exercised, direct or indirect.
+    /// Pinning them here means a future gate relaxation that makes one of them live
+    /// inherits a regression test instead of shipping untested.
+    #[test]
+    fn rate_at_zero_transit_arms() {
+        let dose = 100.0;
+        // n = 0 (Bateman-degenerate): finite jump to dose·ktr.
+        let ktr = 2.0;
+        let prep = PreparedInputRate::transit(0.0, 1.0 / ktr);
+        assert_relative_eq!(prep.rate_at_zero(dose), dose * ktr, max_relative = 1e-12);
+        // n > 0: vanishes (the Γ-density dominates to zero at onset).
+        let prep = PreparedInputRate::transit(3.0, 2.0);
+        assert_eq!(prep.rate_at_zero(dose), 0.0);
+        // n < 0 (transient domain excursion, clamped to 0 by the constructor): same
+        // finite jump as the n = 0 case.
+        let prep = PreparedInputRate::transit(-1.0, 1.0 / ktr);
+        assert_relative_eq!(prep.rate_at_zero(dose), dose * ktr, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn rate_at_zero_inverse_gaussian_always_vanishes() {
+        let dose = 100.0;
+        for &(mat, cv2) in &[(1.0, 0.5), (5.0, 0.1), (0.2, 2.0)] {
+            let prep = PreparedInputRate::inverse_gaussian(mat, cv2);
+            assert_eq!(
+                prep.rate_at_zero(dose),
+                0.0,
+                "IG onset must vanish for every valid (mat, cv2), got mat={mat}, cv2={cv2}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_at_zero_zero_order_is_zero() {
+        // ZeroOrder's own onset/cutoff is handled by its separate moving-window
+        // mechanism (#530), not this path — always 0 here regardless of `dur`.
+        let prep = PreparedInputRate::zero_order(3.0);
+        assert_eq!(prep.rate_at_zero(100.0), 0.0);
+    }
+
+    #[test]
+    fn rate_at_zero_first_order_is_finite_jump() {
+        let dose = 100.0;
+        for &ka in &[0.1, 1.0, 5.0] {
+            let prep = PreparedInputRate::first_order(ka);
+            assert_relative_eq!(prep.rate_at_zero(dose), dose * ka, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn rate_at_zero_zero_dose_is_zero() {
+        // The `dose.val() <= 0.0` guard short-circuits every variant to 0.
+        let prep = PreparedInputRate::first_order(1.0);
+        assert_eq!(prep.rate_at_zero(0.0), 0.0);
+        assert_eq!(prep.rate_at_zero(-5.0), 0.0);
+    }
+
+    /// Weibull's three onset sub-cases (`β > 1` finite-zero, `β = 1` finite-jump,
+    /// `β < 1` divergent) are currently unreachable from any caller (the lagtime
+    /// gate excludes Weibull entirely, see [`rate_at_zero`]'s doc comment), so this
+    /// is their only test coverage. `β = 1` branches on **exact** `f64` equality —
+    /// pinned deliberately here (not loosened to an epsilon tolerance) so a caller
+    /// that one day admits Weibull to this path inherits a visible, documented
+    /// discontinuity at `β = 1 ± ε` rather than a silent one.
+    #[test]
+    fn rate_at_zero_weibull_arms() {
+        let dose = 100.0;
+        let td = 2.0;
+        // β > 1: vanishes.
+        let prep = PreparedInputRate::weibull(td, 1.5);
+        assert_eq!(prep.rate_at_zero(dose), 0.0);
+        // β = 1: finite jump to dose/td (c0 = ln(β) − ln(td) = −ln(td) at β = 1).
+        let prep = PreparedInputRate::weibull(td, 1.0);
+        assert_relative_eq!(prep.rate_at_zero(dose), dose / td, max_relative = 1e-12);
+        // β < 1: the true onset is +∞ (an integrable spike) — this arm returns NaN
+        // by design (callers must not reach it; see the doc comment).
+        let prep = PreparedInputRate::weibull(td, 0.5);
+        assert!(prep.rate_at_zero(dose).is_nan());
+        // The β = 1 branch is an exact-equality check: β = 1 + f64::EPSILON already
+        // takes the `β > 1` (vanishes) arm, not the finite-jump one — a real
+        // discontinuity at the boundary, not just in the divergent direction.
+        let prep = PreparedInputRate::weibull(td, 1.0 + f64::EPSILON);
+        assert_eq!(prep.rate_at_zero(dose), 0.0);
+    }
 }

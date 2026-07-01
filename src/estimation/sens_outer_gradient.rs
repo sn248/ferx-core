@@ -56,8 +56,8 @@ struct ErrTerms {
     // `v = R·exp(2·η_ruv)` has `∂²L/∂η_ruv² = C·z`, `∂²L/∂η_l∂η_ruv = C·m·a_l`,
     // `∂²L/∂η_ruv∂θ = C·m·b`, `∂²L/∂η_ruv∂σ = ½·(C·z)·(∂v/∂σ)/v`. So the true
     // inner Hessian's residual-eta row/col reads `ruv_cz`/`ruv_cm` instead of the
-    // Gaussian `2ε²/R`/`ruv_kappa`. `H̃`/`log|H̃|` exclude censored rows entirely
-    // (matching `gaussian_foce_accum`), so no `c̃`-column term is stored.
+    // Gaussian `2ε²/R`/`ruv_kappa`. Since #486 these `ruv_cz`/`ruv_cm` terms also enter
+    // `H̃`/`log|H̃|` (with their θ/σ/η derivatives), consistently with quantified rows.
     ruv_cz: f64, // C·z  (residual-eta diagonal of the true inner Hessian)
     ruv_cm: f64, // C·m  (residual-eta × structural-η / θ / σ coupling)
     /// True for an M3-censored row. The residual-eta blocks read the censored
@@ -209,9 +209,9 @@ struct Prep {
     /// Exact `∂log|H̃|/∂η` (a-fixed part + `∂²f/∂η²` curvature).
     g_eta: Vec<f64>,
     // Per-observation M3-censored flag lives on `et[j].censored` (single source).
-    // Censored rows enter `H` (true inner Hessian) and the data gradient but carry
-    // `p = β = 0`, so they are excluded from `H̃` / `log|H̃|` — matching
-    // `gaussian_foce_accum`, which accumulates `hrh`/`ctc` over quantified rows only.
+    // Censored rows enter `H` (true inner Hessian), the data gradient, AND `H̃`/`log|H̃|`
+    // at FOCEI order (`p = g2`, `β = dg2/df`; residual-eta `C·z`/`C·m`) — consistently with
+    // quantified rows (#486), matching `gaussian_foce_accum`'s `cens_hess`.
     /// IIV-on-RUV (`Y = IPRED + EPS·EXP(η_ruv)`, #474): the random-effect index
     /// that scales the residual variance by `exp(2·η_ruv)`, or `None`. When set,
     /// the variance terms `r`/`d` in `et` already carry that factor, and the

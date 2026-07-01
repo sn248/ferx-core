@@ -909,9 +909,9 @@ fn build_iov_sources(
     }
     // Modeled-`RATE=-1/-2` doses are served analytically now (#486): the walk carries
     // the dual rate + moving infusion-end boundary (`run_obs_iov` resolves each dose at
-    // its occasion's PK jet). The steady-state combination (no modeled-window jet in
-    // the closed-form dual SS equilibration) and the missing-slot case decline to FD
-    // via the shared gate.
+    // its occasion's PK jet). The steady-state combination is analytic too (#486:
+    // `equilibrate_ss_g` threads the per-occasion modeled-window jet into its per-cycle
+    // active/quiet split); only the missing-slot case declines to FD via the shared gate.
     if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
@@ -1761,10 +1761,10 @@ pub fn subject_sensitivities_tvcov(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    // Modeled-`RATE=-1/-2` dose × steady state (no modeled-window jet in the
-    // closed-form dual SS equilibration) and the missing-slot case decline to FD via
-    // the shared gate. Plain modeled doses are served analytically below via the
-    // per-dose duals (#486).
+    // Modeled-`RATE=-1/-2` doses — including combined with steady state (#486:
+    // `equilibrate_ss_g` threads the modeled-window jet into its per-cycle active/quiet
+    // split) — are served analytically below via the per-dose duals; only the
+    // missing-slot case declines to FD via the shared gate.
     if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
@@ -2050,9 +2050,9 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     }
     // Modeled-`RATE=-1/-2` doses are served analytically by the walk now (#486): the
     // dual rate + moving infusion-end boundary (`run_obs_grad_tvcov` builds the
-    // per-dose duals). The steady-state combination (no modeled-window jet in the
-    // closed-form dual SS equilibration) and the missing-slot case decline to FD via
-    // the shared gate.
+    // per-dose duals). The steady-state combination is analytic too (#486:
+    // `equilibrate_ss_g` threads the modeled-window jet into its per-cycle active/quiet
+    // split); only the missing-slot case declines to FD via the shared gate.
     if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
@@ -5911,6 +5911,129 @@ mod tests {
         }
     }
 
+    /// **Closed-form modeled-duration × SS under IOV — κ-coupled window** (#486 review #1).
+    /// The relaxed `modeled_dose_analytic_gate` is shared by the closed-form **IOV** entry
+    /// (`build_iov_sources`), so a modeled SS dose is now analytic there too. Here `D1` is
+    /// κ-coupled (`D1 = TVD1·exp(ETA_D1 + KAPPA_D1)`), so each occasion's SS window length
+    /// differs — this pins that the per-occasion modeled-window jet threaded into
+    /// `equilibrate_ss_g` lands in the correct stacked-κ axis. FD of `predict_iov` is the
+    /// independent oracle.
+    #[test]
+    fn provider_modeled_duration_ss_iov_kappa_coupled_matches_fd_of_predict_iov() {
+        const CF_IOV_MODELED_SS: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_D1 ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1 + KAPPA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let model = parse_model_string(CF_IOV_MODELED_SS).expect("parse cf IOV modeled SS");
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        let theta = [0.2, 10.0, 5.0];
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1]; κ on D1 → each occasion's SS window differs.
+        let stacked = [0.12, -0.08, 0.05, 0.06, -0.11];
+        assert!(
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).is_some(),
+            "closed-form IOV modeled-duration + SS must be analytic now (#486)"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **Closed-form modeled-duration × SS under time-varying covariates** (#486 review #1).
+    /// The relaxed gate is also shared by the non-IOV TV-cov entry
+    /// (`subject_sensitivities_tvcov`); a covariate (`WT` on `CL`) varies across the records
+    /// of a single SS modeled dose. Validated vs central FD of `compute_predictions_with_tv`
+    /// (which resolves `D1` and equilibrates the SS train per evaluation).
+    #[test]
+    fn provider_modeled_duration_ss_tvcov_matches_fd_of_production() {
+        const CF_TVCOV_MODELED_SS: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(CF_TVCOV_MODELED_SS).expect("parse cf tvcov modeled SS");
+        let mut subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[1.0, 4.0, 6.0, 8.0, 11.0],
+        );
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        subject.dose_covariates = vec![wt(60.0)];
+        subject.obs_covariates = vec![wt(65.0), wt(70.0), wt(75.0), wt(80.0), wt(85.0)];
+        assert!(subject.has_tv_covariates());
+        assert!(
+            subject_sensitivities(
+                &model,
+                &subject,
+                &[10.0, 50.0, 2.0, 0.75],
+                &[0.12, -0.08, 0.05]
+            )
+            .is_some(),
+            "closed-form TV-cov modeled-duration + SS must be analytic now (#486)"
+        );
+        check_full_provider_vs_fd(
+            &model,
+            &subject,
+            &[10.0, 50.0, 2.0, 0.75],
+            &[0.12, -0.08, 0.05],
+        );
+    }
+
     /// **Reset regression (#486 review #3).** A modeled-duration dose that starts
     /// *before* an EVID3/4 reset must not thread its window jet into the post-reset
     /// sub-intervals: the walk's rate loop drops a pre-reset dose (`t_start <
@@ -8837,6 +8960,131 @@ mod tests {
         assert!(
             !crate::sens::ode_provider::ode_iov_supported(&weibull),
             "weibull forcing under IOV stays FD (#486 scope)"
+        );
+    }
+
+    /// **ODE IOV + `parallel` dual-pathway absorption** (#486 review — the multi-forcing
+    /// case). Two concurrent `first_order` forcings (`FR1·first_order(ka1) +
+    /// FR2·first_order(ka2)`) feed the central compartment. The gate admits it (both kinds
+    /// are `FirstOrder`); this pins that the per-occasion accumulation of two `R_in`
+    /// contributions stays analytic and matches central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_parallel_provider_matches_fd_of_predict_iov() {
+        const PARALLEL_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL + KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA1 = TVKA1
+  KA2 = TVKA2
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(PARALLEL_IOV).expect("parse parallel IOV");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "parallel (two first_order) must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5, 0.3, 0.6],
+            &[0.12, -0.08, 0.06, -0.11],
+        );
+    }
+
+    /// **ODE IOV + `first_order` absorption × estimated (bare) lagtime** (#486 review). The
+    /// non-IOV path admits `first_order` + lagtime (#643 onset saltation `Δr = R_in(0⁺)`);
+    /// the IOV walk is the same, so it must too. Pins that the per-occasion rate-on onset
+    /// saltation at the lagged arrival stays analytic under κ (FD of `predict_iov` is the
+    /// oracle). A **bare** `LAGTIME` is used — a compartment-indexed `ALAGn` is a distinct
+    /// per-dose shift the single-slot IOV walk cannot represent and is declined upstream.
+    #[test]
+    fn ode_iov_first_order_lagtime_matches_fd_of_predict_iov() {
+        const FO_LAG_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL + KAPPA_CL)
+  V       = TVV  * exp(ETA_V)
+  KA      = TVKA
+  LAGTIME = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(FO_LAG_IOV).expect("parse first_order+lag IOV");
+        assert!(model.has_lagtime());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "first_order + lagtime must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.0, 0.5],
+            &[0.12, -0.08, 0.06, -0.11],
+        );
+    }
+
+    /// **ODE IOV + `zero_order` absorption × EVID 3/4 reset** (#486 review). Resets are
+    /// admitted by `ode_iov_subject_supported` and the zero-order window is kind-agnostic to
+    /// the `reset_floor` cutoff (#653), so the combination stays analytic under IOV. A reset
+    /// at `t = 15` (after the first window, before the second dose) zeros the state; central
+    /// FD of `predict_iov` (which cancels the pre-reset trajectory) is the oracle.
+    #[test]
+    fn ode_iov_zero_order_reset_matches_fd_of_predict_iov() {
+        let model = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
+        let mut subject = iov_subject();
+        subject.reset_times = vec![15.0];
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
         );
     }
 

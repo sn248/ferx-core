@@ -733,12 +733,13 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // Built-in absorption input-rate forcing under IOV (#486). The shared
     // `integrate_tvcov_g` walk delivers each forcing per-occasion — its rate/window is
     // rebuilt from that dose's own occasion-seeded `pk_at_dose[k]` jet, so κ rides through
-    // exactly as η/θ do — so `zero_order(dur)` and `first_order` (hence a `mixed`
-    // `FR·first_order + FR·zero_order` dose) are analytic under IOV, mirroring the non-IOV
-    // TV-cov walk (#653). The other kinds (igd / transit / weibull / parallel) under IOV
-    // stay unaudited → FD; the SS × input-rate combination is declined per subject in
-    // `ode_iov_subject_supported` (the SS dual equilibration's zero-order/forcing handling
-    // is not yet validated under κ).
+    // exactly as η/θ do — so `zero_order(dur)` and `first_order` are analytic under IOV,
+    // and hence so is any composition of them: a `mixed` `FR·first_order + FR·zero_order`
+    // dose and a `parallel` two-`first_order` pathway (both encoded as multiple
+    // `ZeroOrder`/`FirstOrder` forcings), mirroring the non-IOV TV-cov walk (#653/#586).
+    // Only the smooth-density kinds (igd / transit / weibull) under IOV stay unaudited → FD;
+    // the SS × input-rate combination is declined per subject in `ode_iov_subject_supported`
+    // (the SS dual equilibration's zero-order/forcing handling is not yet validated under κ).
     if ode.input_rate.iter().any(|f| {
         !matches!(
             f.kind,

@@ -51,9 +51,11 @@ section of the SDLC for the versioning policy).
   each forcing's rate and moving-boundary window are rebuilt from that dose's own
   per-occasion PK jet — the κ (occasion) sensitivity rides through exactly as η/θ do.
   Validated against finite differences of the production `predict_iov` (value, gradient, and
-  Hessian over the stacked `[η, κ]` vector), including a κ-coupled `DUR` axis-placement check.
-  Other input-rate kinds (igd / transit / weibull / parallel) under IOV, and any built-in
-  forcing combined with a steady-state dose under IOV, remain on finite differences.
+  Hessian over the stacked `[η, κ]` vector), including a κ-coupled `DUR` axis-placement check,
+  a `parallel` two-`first_order` pathway, and the `first_order` + estimated-lagtime and
+  `+ EVID 3/4 reset` combinations. The smooth-density input-rate kinds (igd / transit /
+  weibull) under IOV, and any built-in forcing combined with a steady-state dose under IOV,
+  remain on finite differences.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`) combined with steady-state dosing on the
   closed-form (analytical 1-/2-/3-cpt) models** now get exact analytic FOCE/FOCEI
   sensitivities instead of finite differences (#486), the last modeled-dose gap after #652

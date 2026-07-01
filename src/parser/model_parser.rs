@@ -4563,9 +4563,6 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.fd_hessian_step = v;
         }
-        "covariance_ofv_hessian" => {
-            opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
-        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -9166,6 +9163,17 @@ impl ModelTimeGuard {
     pub(crate) fn enter(time: f64) -> Self {
         let prev = MODEL_TIME.with(|cell| cell.replace(time));
         ModelTimeGuard(prev)
+    }
+
+    /// Enter the guard only when `cond` holds (typically `uses_time_builtin`),
+    /// returning `Some(guard)` that restores on drop or `None` when the model does
+    /// not read the `TIME` built-in. Collapses the repeated
+    /// `cond.then(|| ModelTimeGuard::enter(time))` idiom at the per-event seed seams so a
+    /// future widening of the gating condition (e.g. the direct `pk(...=TIME)` mapping)
+    /// updates one call each and can't silently miss a seam (#637 review #7).
+    #[inline]
+    pub(crate) fn enter_if(cond: bool, time: f64) -> Option<Self> {
+        cond.then(|| Self::enter(time))
     }
 }
 
@@ -15768,7 +15776,6 @@ mod tests {
                 // are method-specific, so none must warn under any method.
                 "covariance_method = s".to_string(),
                 "covariance_fallback = sir".to_string(),
-                "covariance_ofv_hessian = true".to_string(),
                 "verbose = false".to_string(),
                 "sir = true".to_string(),
                 "bloq_method = m3".to_string(),
@@ -15947,6 +15954,17 @@ mod tests {
         let err = parse_fit_options(&["n_exploraton = 200".to_string()]).unwrap_err();
         assert!(err.contains("unknown key"), "got: {err}");
         assert!(err.contains("n_exploraton"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_fit_options_covariance_ofv_hessian_removed() {
+        // The `covariance_ofv_hessian` option was removed in #639 (the analytical-
+        // gradient covariance R stencil it selected is gone; the reconverged-OFV
+        // second difference is the sole stencil). An old model file that still sets
+        // it must now fail loudly as an unknown key, not silently be accepted.
+        let err = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap_err();
+        assert!(err.contains("unknown key"), "got: {err}");
+        assert!(err.contains("covariance_ofv_hessian"), "got: {err}");
     }
 
     #[test]
@@ -16160,12 +16178,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_parameter_scaling_and_ofv_hessian() {
+    fn test_parse_parameter_scaling() {
         use crate::types::ParameterScaling;
-        // Defaults: parameter_scaling = Auto, covariance_ofv_hessian = true.
+        // Default: parameter_scaling = Auto.
         let def = parse_fit_options(&[]).unwrap();
         assert_eq!(def.parameter_scaling, ParameterScaling::Auto);
-        assert!(def.covariance_ofv_hessian);
         // parameter_scaling keywords, case-insensitive.
         for (input, expected) in [
             ("auto", ParameterScaling::Auto),
@@ -16177,9 +16194,6 @@ mod tests {
             assert_eq!(opts.parameter_scaling, expected, "input `{input}`");
         }
         assert!(parse_fit_options(&["parameter_scaling = bogus".to_string()]).is_err());
-        // covariance_ofv_hessian bool.
-        let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
-        assert!(!off.covariance_ofv_hessian);
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────

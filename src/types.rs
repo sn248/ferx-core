@@ -2904,9 +2904,19 @@ impl CompiledModel {
     /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
     /// combined alike.
     /// One predicate in the `iiv_on_ruv` × {plain | IOV | M3} × {closed-form | ODE}
-    /// routing decision: `true` only for **ODE M3 BLOQ + `iiv_on_ruv`** (the censored
-    /// × residual-eta cross-terms are implemented in the shared assembly, #4c, but the
-    /// ODE path is not yet regression-tested for that combo, so it stays on FD).
+    /// routing decision. **As of #486 this gate forces FD for no combination** — every
+    /// `iiv_on_ruv` model (closed-form / ODE, plain / IOV / M3 BLOQ, including the triples)
+    /// is served by the shared, provider-agnostic gradient assembly. The censored ×
+    /// residual-eta cross-terms (`h·z` inner column, `C·z`/`C·m·a` true-Hessian / mixed
+    /// blocks, the σ-cross) live in `residual_inner_obs` (inner) and `prepare` /
+    /// `prepare_stacked` (outer), keyed on `subject.cens[j]` and `residual_error_eta` over
+    /// whatever `ObsSens` the walk emits. So the **non-IOV ODE M3 BLOQ + `iiv_on_ruv`**
+    /// combination — the last holdout — is analytic too (the #547 pattern: the ODE walk
+    /// emits the same per-observation shape the closed-form M3 + `iiv_on_ruv` assembly
+    /// already handled; the ODE and closed-form packed gradients are bit-identical and both
+    /// match reconverged FD to ~1e-7, inner and outer, #486). The predicate is retained as
+    /// the canonical "does `iiv_on_ruv` force FD here?" marker — now uniformly `false` — so
+    /// the inner/outer gates and their tests document the closed frontier in one place.
     ///
     /// **This is NOT the single source of truth for the full routing** — the decision
     /// is spread across several predicates that must move together, so a future scope
@@ -2917,18 +2927,19 @@ impl CompiledModel {
     /// - [`iov_analytical_supported`](crate::sens::provider::iov_analytical_supported)
     ///   (closed-form IOV: declines M3, served for plain/`iiv_on_ruv`);
     /// - [`ode_iov_supported`](crate::sens::ode_provider::ode_iov_supported)
-    ///   (ODE IOV + `iiv_on_ruv` routes to FD here, not via this gate);
+    ///   (ODE IOV + `iiv_on_ruv`, including the M3 triple, routed here);
     /// - [`analytical_supported`](crate::sens::provider::analytical_supported)
     ///   (closed-form M3 + `iiv_on_ruv`, #4c).
     ///
-    /// Net effect today: analytic for **closed-form M3 + `iiv_on_ruv`** (#4c) and
-    /// **closed-form IOV + `iiv_on_ruv`** (#4b/#474); FD for ODE M3 + `iiv_on_ruv`
-    /// (here) and ODE IOV + `iiv_on_ruv` (via `ode_iov_supported`).
+    /// Net effect today: analytic for **every** `iiv_on_ruv` combination —
+    /// **closed-form M3 + `iiv_on_ruv`** (#4c), **closed-form IOV + `iiv_on_ruv`**
+    /// (#4b/#474), **ODE IOV + `iiv_on_ruv`** incl. the M3 triple (#486, via
+    /// `ode_iov_supported`), and **non-IOV ODE M3 + `iiv_on_ruv`** (#486).
     #[inline]
     pub fn iiv_on_ruv_forces_fd(&self) -> bool {
-        self.residual_error_eta.is_some()
-            && matches!(self.bloq_method, BloqMethod::M3)
-            && self.ode_spec.is_some()
+        // No remaining `iiv_on_ruv` combination forces FD (#486); see the doc above.
+        let _ = self;
+        false
     }
 
     /// Whether a custom residual-error magnitude (#484) is active. The

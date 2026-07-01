@@ -599,21 +599,21 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     if ode.rhs_program.is_none() {
         return false;
     }
-    // M3 BLOQ: the IOV objective promotes M3 to the censored marginal, but the IOV
-    // analytic gradient assembly carries no censored-row term — it would differentiate
-    // a different function than it minimises. Route IOV+M3 to FD (mirrors
-    // `iov_analytical_supported`).
-    if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
-        return false;
-    }
-    // IIV on residual error (`iiv_on_ruv`): `η_ruv` scales the variance by `exp(2·η_ruv)`,
-    // which the analytic IOV outer gradient (`subject_packed_gradient_iov`) does not apply —
-    // it would differentiate an unscaled residual variance while the inner loop bails to FD
-    // (`analytic_inner_common_bail`), an inner/outer mismatch. Route to FD until the
-    // variance-scaling analytic gradient lands (#474). (#466 review round 2.)
-    if model.residual_error_eta.is_some() {
-        return false;
-    }
+    // M3 BLOQ is analytic on the ODE IOV path (#486, mirroring closed-form #580/#591).
+    // Censoring is provider-agnostic: the inner (`residual_inner_obs`) and outer
+    // (`prepare_stacked`) assemblies apply the censored `−logΦ` coefficient keyed on
+    // `subject.cens[j]`, over whatever `ObsSens`/`ObsGrad` the walk emits — the ODE IOV
+    // walk emits the standard shape, so M3 rides the same stacked `[η_bsv, κ]` assembly
+    // the closed-form path uses. No M3 clause here. (The ODE M3 + `iiv_on_ruv` triple
+    // stays FD via the residual-eta clause below.)
+    // IIV on residual error (`iiv_on_ruv`) is analytic on the ODE IOV path (#486). `η_ruv`
+    // scales the residual variance by `exp(2·η_ruv)` but does not enter the structural
+    // prediction, so the ODE walk emits a zero `∂f/∂η_ruv` column on the η_ruv axis (its
+    // `CombinedDerivs.deta` is 0 for every PK param, exactly as on the closed-form walk).
+    // The variance scaling and the `η_ruv` gradient column are then applied downstream by
+    // the provider-agnostic assembly (`residual_inner_obs` / `prepare_stacked` via
+    // `residual_var_scale`, keyed on `residual_error_eta`) — the same shared gradient the
+    // closed-form IOV `iiv_on_ruv` path uses. Combined with M3 this is the full triple.
     // FREM + IOV: the analytic IOV inner gradient never substitutes the FREM covariate
     // pseudo-obs variance, and the IOV objective returns a `1e18` sentinel for FREM+IOV.
     // Route to FD. (#466 review round 2.)

@@ -656,6 +656,11 @@ pub fn find_ebe(
     } else {
         None
     };
+    // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
+    // computed once per subject here — not inside `agrad`, which BFGS calls on
+    // every inner step (and every line-search trial) — instead of re-walking
+    // every magnitude expression on each of those calls (#486 review).
+    let mult = model.ruv_obs_mult(subject, &params.theta);
 
     // Objective evaluated directly at eta_true (the optimiser variable).
     let obj = |e: &[f64]| -> f64 {
@@ -702,6 +707,7 @@ pub fn find_ebe(
             &params.omega,
             &params.sigma.values,
             schedule.as_ref(),
+            mult.as_deref(),
         ) {
             Some(g) => {
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -916,6 +922,9 @@ fn find_ebe_iov(
     // ODE objectives carry the adaptive-solver gradient-noise floor; enable the
     // objective-stall stop only for them (see `find_ebe`).
     let enable_stall = model.ode_spec.is_some();
+    // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
+    // computed once per subject here rather than inside `agrad` (see `find_ebe`).
+    let mult = model.ruv_obs_mult(subject, &params.theta);
     // One gradient closure for both the optimizer and the fallback stationarity check
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
@@ -941,6 +950,7 @@ fn find_ebe_iov(
             n_eta,
             n_kappa,
             k_occasions,
+            mult.as_deref(),
         ) {
             Some(g) => g,
             None => gradient_fd(&obj, p, n_flat),
@@ -1583,12 +1593,31 @@ pub(crate) fn analytic_eta_nll_gradient(
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
 ) -> Option<Vec<f64>> {
-    analytic_eta_nll_gradient_with_schedule(model, subject, theta, eta, omega, sigma, None)
+    // Custom / time-varying residual-magnitude (#484/#576): η-independent, so a
+    // one-off caller like this can just compute it inline (unlike `find_ebe`'s
+    // per-BFGS-step closure, which hoists it — see `analytic_eta_nll_gradient_with_schedule`).
+    let mult = model.ruv_obs_mult(subject, theta);
+    analytic_eta_nll_gradient_with_schedule(
+        model,
+        subject,
+        theta,
+        eta,
+        omega,
+        sigma,
+        None,
+        mult.as_deref(),
+    )
 }
 
 /// As [`analytic_eta_nll_gradient`], but reusing the per-subject `EventSchedule` the
 /// inner optimizer cached once, so the TV-cov provider doesn't rebuild it every inner
 /// BFGS step (#449 re-review #6). `None` rebuilds locally.
+///
+/// `mult` is the subject's custom-magnitude multiplier matrix (#484/#576,
+/// [`CompiledModel::ruv_obs_mult`]) — the caller computes it, so a per-BFGS-step
+/// closure (`find_ebe`'s `agrad`) can compute it **once** outside the loop instead
+/// of re-walking every magnitude expression on every inner iteration (#486 review).
+/// `None` when no magnitude is active.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     model: &CompiledModel,
@@ -1598,6 +1627,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
     // Light first-order provider (value + ∂f/∂η only); the inner gradient never
     // needs the second-order / θ blocks the full `subject_sensitivities` carries.
@@ -1624,9 +1654,6 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     } else {
         1.0
     };
-    // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
-    // evaluated once per subject (not per inner BFGS step) at the current θ.
-    let mult = model.ruv_obs_mult(subject, theta);
     let mut grad = vec![0.0_f64; n_eta];
     let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
@@ -1641,7 +1668,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
             subject.observations[j],
             obs.f,
             sigma,
-            mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice()),
+            mult.and_then(|m| m.get(j)).map(|v| v.as_slice()),
             ruv_scale,
             ruv_active,
             cens,
@@ -1674,6 +1701,11 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
 /// each occasion block. The BSV-η gradient equals the gradient w.r.t. the psi-space
 /// optimiser variable (a constant `mu` shift drops out), and κ is unshifted, so the
 /// returned vector is directly the optimiser gradient (#439 ODE IOV).
+///
+/// `mult` is the subject's custom-magnitude multiplier matrix (#484/#576,
+/// [`CompiledModel::ruv_obs_mult`]), computed once by the caller and shared with
+/// the non-IOV inner (`analytic_eta_nll_gradient_with_schedule`) — see its doc for
+/// why this is a caller-supplied parameter rather than computed here.
 #[allow(clippy::too_many_arguments)]
 fn analytic_eta_nll_gradient_iov(
     model: &CompiledModel,
@@ -1686,6 +1718,7 @@ fn analytic_eta_nll_gradient_iov(
     n_eta: usize,
     n_kappa: usize,
     k_occasions: usize,
+    mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
     let sens = crate::sens::provider::subject_eta_grad_iov(model, subject, theta, stacked_true)?;
     let n_stacked = n_eta + k_occasions * n_kappa;
@@ -1716,9 +1749,6 @@ fn analytic_eta_nll_gradient_iov(
     // (the `η_ruv` index lives in the BSV block of the stacked vector). Only the ODE
     // triple stays FD (via `iiv_on_ruv_forces_fd`).
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
-    // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
-    // evaluated once per subject at the current θ (shared with the non-IOV inner).
-    let mult = model.ruv_obs_mult(subject, theta);
     let mut grad = vec![0.0_f64; n_stacked];
     let mut ruv_grad = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
@@ -1736,7 +1766,7 @@ fn analytic_eta_nll_gradient_iov(
             subject.observations[j],
             obs.f,
             sigma,
-            mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice()),
+            mult.and_then(|m| m.get(j)).map(|v| v.as_slice()),
             ruv_scale,
             ruv_active,
             cens,
@@ -3981,6 +4011,7 @@ mod iov_tests {
             n_eta,
             n_kappa,
             k,
+            None,
         )
         .expect("analytic IOV inner gradient");
 
@@ -4307,6 +4338,7 @@ mod iov_tests {
             n_eta,
             n_kappa,
             k,
+            None,
         )
         .expect("analytic IOV + iiv_on_ruv inner gradient");
 
@@ -4419,6 +4451,7 @@ mod iov_tests {
             n_eta,
             n_kappa,
             k,
+            None,
         )
         .expect("analytic IOV + M3 inner gradient");
 
@@ -4529,6 +4562,7 @@ mod iov_tests {
             n_eta,
             n_kappa,
             k,
+            None,
         )
         .expect("analytic IOV + M3 inner gradient (right-censored)");
 
@@ -4645,6 +4679,7 @@ mod iov_tests {
                 n_eta,
                 n_kappa,
                 k,
+                None,
             )
             .expect("analytic ODE IOV + M3 inner gradient");
 
@@ -4757,6 +4792,7 @@ mod iov_tests {
                 n_eta,
                 n_kappa,
                 k,
+                None,
             )
             .expect("analytic ODE IOV + M3 + iiv_on_ruv inner gradient");
 
@@ -4871,6 +4907,7 @@ mod iov_tests {
             n_eta,
             n_kappa,
             k,
+            None,
         )
         .expect("analytic IOV + M3 + iiv_on_ruv inner gradient");
 

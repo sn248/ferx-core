@@ -222,6 +222,12 @@ struct Prep {
     /// residual-eta `log|H̃|` θ-derivative. Empty when no `ruv`.
     cens_dcz_df: Vec<f64>,
     cens_dcm_df: Vec<f64>,
+    /// Custom / time-varying residual-magnitude (#484/#576) `[obs][sigma-slot]`
+    /// multiplier matrix, or `None` when no magnitude is active. Computed once
+    /// here; `sigma_block` reuses it instead of recomputing `model.ruv_obs_mult`
+    /// (which re-walks every magnitude expression per observation) a second time
+    /// for the same subject/θ (#486 review).
+    mult: Option<Vec<Vec<f64>>>,
 }
 
 /// Residual-eta coupling `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²` — the `f`-derivative
@@ -638,6 +644,7 @@ fn prepare_stacked(
         ruv_scale,
         cens_dcz_df,
         cens_dcm_df,
+        mult,
     })
 }
 
@@ -704,11 +711,14 @@ fn theta_block(prep: &Prep, sens: &SubjectSens, n_theta: usize) -> Vec<f64> {
         // exactly the shape `sigma_block` already handles for σ, substituted
         // `r_sig → dr_dtheta[m]`, `d_sig → dd_dtheta[m]`. Adds the data+lnR term,
         // the log|H̃| `∂p/∂θ` term, and the EBE response's `dalpha`-driven M-vector
-        // contribution (plus the residual-eta row under `iiv_on_ruv`).
-        // `dr_dtheta` is empty for every row when no magnitude is active (the
-        // common case), and `prepare_stacked` already declines a subject that
-        // combines an active magnitude with an M3-censored row, so `et.censored`
-        // is never true here when `dr_dtheta` is non-empty.
+        // contribution. `dr_dtheta` is empty for every row when no magnitude is
+        // active (the common case). `prepare_stacked` declines a subject up front
+        // whenever an active magnitude combines with an M3-censored row OR
+        // `iiv_on_ruv` (`prep.ruv`), so `et.censored` and `prep.ruv.is_some()` are
+        // never true here when `dr_dtheta` is non-empty — there is deliberately no
+        // residual-eta `m_vec[rr]` term below; add one (mirroring `sigma_block`'s
+        // `m_vec[rr] += eps*eps*inv_r2*r_sig`) with its own FD-vs-analytic
+        // validation if that gate is ever relaxed.
         for (j, et) in prep.et.iter().enumerate() {
             if et.dr_dtheta.is_empty() {
                 continue;
@@ -731,11 +741,6 @@ fn theta_block(prep: &Prep, sens: &SubjectSens, n_theta: usize) -> Vec<f64> {
                 + ((r - eps * eps) * inv_r2) * d_th;
             for k in 0..n_eta {
                 m_vec[k] += 0.5 * dalpha * sens.obs[j].df_deta[k];
-            }
-            if let Some(rr) = prep.ruv {
-                // M[ruv] += ∂(1−ε²/R)/∂θ = ε²/R² · Rθ (mirrors the σ-block's
-                // `m_vec[rr] += eps*eps*inv_r2*r_sig`).
-                m_vec[rr] += eps * eps * inv_r2 * r_th;
             }
         }
         let deta = -(&prep.h_inner_inv * m_vec);
@@ -920,8 +925,12 @@ fn sigma_block(
     // aware `r`/`d` this block otherwise consumes from `prep.et`. `prepare_stacked`
     // already declines a subject that combines an active magnitude with `iiv_on_ruv`
     // or an M3-censored row, so the residual-eta and censored branches below never
-    // see a non-empty `mult` row.
-    let mult = model.ruv_obs_mult(subject, &params.theta);
+    // see a non-empty `mult` row. Reused from `Prep` (computed once in
+    // `prepare_stacked`) rather than recomputed here — `ruv_obs_mult` re-walks
+    // every magnitude expression per observation, so recomputing it doubled that
+    // cost for every magnitude-active subject on every outer-gradient evaluation
+    // (#486 review).
+    let mult = &prep.mult;
 
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);

@@ -1452,7 +1452,14 @@ pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send
 /// consumption order. `per_sigma[k] == None` means slot `k` is a bare sigma
 /// (multiplier ≡ 1, the legacy path); `Some(f)` makes the slot's magnitude
 /// vary with TIME / covariates / theta.
+///
+/// `#[non_exhaustive]`: `per_sigma_deriv` (#576/#486) is the first field added
+/// since this type shipped; marking the struct non-exhaustive now means a
+/// future field addition can't again break an external struct-literal
+/// construction — build via [`Default::default()`] plus field assignment (or
+/// `..Default::default()`) instead.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct RuvMagnitude {
     pub per_sigma: Vec<Option<RuvMagFn>>,
     /// Parallel to `per_sigma`: the compiled `Dual1` θ-derivative program for the
@@ -1786,6 +1793,22 @@ impl ErrorSpec {
         }
     }
 
+    /// Flat sigma-vector index of `cmt`'s proportional sigma (the slot a
+    /// magnitude multiplier scales for the `f`-derivative chain): slot `0` for
+    /// `Single`, the endpoint's first `sigma_idx` for `PerCmt`. `None` when
+    /// `PerCmt` has no endpoint registered for `cmt`, or that endpoint declares
+    /// no sigma at all — both cases the `_scaled` derivative callers treat as
+    /// "no residual error here" (`0.0`). Single source for
+    /// [`dvar_df_scaled`](Self::dvar_df_scaled) and
+    /// [`d2var_df2_scaled`](Self::d2var_df2_scaled) so the two can't resolve a
+    /// different slot for the same `(cmt, mult)` (#486 review).
+    fn prop_sigma_slot(&self, cmt: usize) -> Option<usize> {
+        match self {
+            ErrorSpec::Single(_) => Some(0),
+            ErrorSpec::PerCmt(map) => map.get(&cmt)?.sigma_idx.first().copied(),
+        }
+    }
+
     /// `dvar_df` with a per-observation custom magnitude (#484).
     ///
     /// The proportional loading carries the multiplier `m_prop`, so the
@@ -1796,15 +1819,8 @@ impl ErrorSpec {
     ///
     /// [`dvar_df`]: ErrorSpec::dvar_df
     pub fn dvar_df_scaled(&self, cmt: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64 {
-        let prop_slot = match self {
-            ErrorSpec::Single(_) => 0,
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => match ep.sigma_idx.first() {
-                    Some(&i) => i,
-                    None => return 0.0,
-                },
-                None => return 0.0,
-            },
+        let Some(prop_slot) = self.prop_sigma_slot(cmt) else {
+            return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
         self.dvar_df(cmt, f, sigma) * m * m
@@ -1857,15 +1873,8 @@ impl ErrorSpec {
     /// [`dvar_df`]: ErrorSpec::dvar_df
     /// [`d2var_df2`]: ErrorSpec::d2var_df2
     pub fn d2var_df2_scaled(&self, cmt: usize, sigma: &[f64], mult: &[f64]) -> f64 {
-        let prop_slot = match self {
-            ErrorSpec::Single(_) => 0,
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => match ep.sigma_idx.first() {
-                    Some(&i) => i,
-                    None => return 0.0,
-                },
-                None => return 0.0,
-            },
+        let Some(prop_slot) = self.prop_sigma_slot(cmt) else {
+            return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
         self.d2var_df2(cmt, sigma) * m * m
@@ -4763,7 +4772,14 @@ impl Optimizer {
     /// (see `build_info::gradient_method_outer`), so `auto` lands on the
     /// gradient-based optimizer exactly when there is an exact gradient to feed
     /// it (#490).
-    pub fn resolve_auto(self, model: &CompiledModel) -> Optimizer {
+    ///
+    /// `interaction` is `options.interaction` (`true` for `method = focei`,
+    /// `false` for plain `method = foce`) — a custom residual-magnitude model's
+    /// direct-θ channel is FOCEI-only (#486 review), so a magnitude-active model
+    /// under plain FOCE must still resolve to `Bobyqa` even though
+    /// `analytic_outer_gradient_available` (interaction-agnostic) says the model
+    /// is in scope.
+    pub fn resolve_auto(self, model: &CompiledModel, interaction: bool) -> Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
@@ -4771,7 +4787,7 @@ impl Optimizer {
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
         // gradient.
-        if crate::sens::provider::analytic_outer_gradient_available(model) {
+        if crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction) {
             Optimizer::NloptLbfgs
         } else {
             Optimizer::Bobyqa
@@ -5488,7 +5504,7 @@ mod tests {
         // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
         let m = test_helpers::analytical_model(GradientMethod::Auto);
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::Auto.resolve_auto(&m, true),
             Optimizer::NloptLbfgs,
             "analytic-gradient model should resolve auto → nlopt_lbfgs"
         );
@@ -5502,11 +5518,38 @@ mod tests {
         let forced_fd = test_helpers::analytical_model(GradientMethod::Fd);
         for m in [&ode, &forced_fd] {
             assert_eq!(
-                Optimizer::Auto.resolve_auto(m),
+                Optimizer::Auto.resolve_auto(m, true),
                 Optimizer::Bobyqa,
                 "FD-only model should resolve auto → bobyqa"
             );
         }
+    }
+
+    /// #486 review: a custom residual-magnitude model's direct-θ channel is
+    /// FOCEI-only (`subject_packed_gradient_foce`/`_foce_iov` decline it), so
+    /// `auto` must resolve to `Bobyqa` under plain `method = foce`
+    /// (`interaction = false`) even though `analytic_outer_gradient_available`
+    /// (interaction-agnostic) reports the model in scope — and still resolve to
+    /// `NloptLbfgs` under FOCEI (`interaction = true`).
+    #[test]
+    fn resolve_auto_respects_interaction_for_custom_magnitude() {
+        let content = "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_LATE(1.5, 0.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))\n";
+        let m = crate::parser::model_parser::parse_model_string(content).expect("parse");
+        assert!(m.has_custom_ruv_magnitude());
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&m),
+            "the interaction-agnostic gate still reports this model in scope"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, false),
+            Optimizer::Bobyqa,
+            "plain FOCE + custom magnitude has no analytic gradient — must not pick a gradient optimizer"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, true),
+            Optimizer::NloptLbfgs,
+            "FOCEI + custom magnitude has the analytic gradient"
+        );
     }
 
     #[test]
@@ -5522,7 +5565,7 @@ mod tests {
             Optimizer::Bobyqa,
             Optimizer::TrustRegion,
         ] {
-            assert_eq!(opt.resolve_auto(&m), opt);
+            assert_eq!(opt.resolve_auto(&m, true), opt);
         }
     }
 

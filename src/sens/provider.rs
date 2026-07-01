@@ -408,6 +408,26 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
         && !model.iiv_on_ruv_forces_fd()
 }
 
+/// [`analytic_outer_gradient_available`] further narrowed by whether the fit
+/// actually runs with FOCEI interaction (#486 review): a custom residual-
+/// magnitude model's direct-θ channel is assembled only in the FOCEI
+/// (`subject_packed_gradient`/`subject_packed_gradient_iov`) per-subject path.
+/// Plain `method = foce` (non-interaction, `subject_packed_gradient_foce` /
+/// `subject_packed_gradient_foce_iov`) declines whenever
+/// `model.has_custom_ruv_magnitude()` and falls back to FD — but
+/// `analytic_outer_gradient_available` itself has no way to see
+/// `interaction` (it takes only `model`), so it can't reflect that on its
+/// own. Every other exclusion in `analytic_outer_gradient_available` is
+/// interaction-independent, so this only narrows the magnitude case.
+///
+/// [`crate::types::Optimizer::resolve_auto`] and
+/// `build_info::gradient_method_outer` both consult this (instead of the bare
+/// model-only predicate) so `auto`'s pick and the reported gradient method
+/// agree with what the outer loop actually computes for FOCE vs FOCEI.
+pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interaction: bool) -> bool {
+    analytic_outer_gradient_available(model) && (interaction || !model.has_custom_ruv_magnitude())
+}
+
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
 /// the master switch is armed and the subject is in the per-subject ODE scope —
 /// either the static superposition walk ([`ode_subject_supported`]) or the
@@ -4365,7 +4385,7 @@ mod tests {
             "TTE objective is FD-only: no analytic outer gradient"
         );
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::Auto.resolve_auto(&m, true),
             Optimizer::Bobyqa,
             "auto must resolve to derivative-free Bobyqa for a TTE model"
         );

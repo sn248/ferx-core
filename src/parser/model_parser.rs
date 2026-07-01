@@ -8754,7 +8754,21 @@ fn compile_ruv_mag_deriv_program(
     n_theta: usize,
 ) -> RuvMagDerivProgram {
     let mut e = expr.clone();
-    let var_idx: HashMap<String, usize> = [(sigma_name.to_string(), 0)].into_iter().collect();
+    // Slot 0 = the pinned scaled sigma (bound to 1.0 at eval time). Slot 1 =
+    // `MACHEPS`, which `validate_ruv_expr` explicitly permits inside a magnitude
+    // expression alongside the scaled sigma. `eval_expression` (the runtime
+    // f64 closure) special-cases the `MACHEPS` name string at eval time, but
+    // bytecode compilation resolves every `Variable` name to a fixed slot up
+    // front — so without a reserved slot here, `resolve_expr_indices` would map
+    // `MACHEPS` to `VariableIdx(usize::MAX)`, which silently evaluates to `0.0`
+    // instead of `f64::EPSILON` (mirrors the ODE var builder's `macheps_slot`).
+    let var_idx: HashMap<String, usize> = [
+        (sigma_name.to_string(), 0),
+        ("MACHEPS".to_string(), 1),
+        ("macheps".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
     let mut cov_set = std::collections::HashSet::new();
     collect_covariates(&e, &mut cov_set);
     let mut cov_names: Vec<String> = cov_set.into_iter().collect();
@@ -8812,8 +8826,16 @@ fn build_ruv_magnitude(
         any = true;
         // The scaled sigma resolves to a `Variable` (bound to 1.0 at eval);
         // unknown identifiers fall back to model covariates. TIME/time parse
-        // as event-time built-ins.
-        let defined = [sigma_name.clone()];
+        // as event-time built-ins. `MACHEPS`/`macheps` must resolve to a
+        // `Variable` too (not fall through to `Covariate`) — `validate_ruv_expr`'s
+        // `Variable` arm already permits it, but without a `defined_vars` entry
+        // the parser would classify it as an (undeclared, rejected) covariate
+        // instead, since this context sets `fallback_covariate: true` (#486 review).
+        let defined = [
+            sigma_name.clone(),
+            "MACHEPS".to_string(),
+            "macheps".to_string(),
+        ];
         let ctx = ParseCtx {
             theta_names,
             eta_names,
@@ -11957,20 +11979,40 @@ impl RuvMagDerivProgram {
         if theta.is_empty() {
             return Some(Vec::new());
         }
+        // Mirror the runtime `RuvMagFn` closure's `TIME`/`time` covariate-map
+        // injection: a legacy pre-built expression may still carry `TIME` as an
+        // `Expression::Covariate` node (parsed models use the `Expression::Time`
+        // built-in, read directly from `time` via `Op::PushTime`, and never reach
+        // this branch) — without it, such a `cov_name` would look up the
+        // observation's covariate map (which never carries a literal "TIME" key)
+        // and silently default to `0.0` instead of the actual observation time.
         let cov_vec: Vec<f64> = self
             .cov_names
             .iter()
-            .map(|n| cov.get(n).copied().unwrap_or(0.0))
+            .map(|n| {
+                if n.eq_ignore_ascii_case("TIME") {
+                    time
+                } else {
+                    cov.get(n).copied().unwrap_or(0.0)
+                }
+            })
             .collect();
-        let sigma_pin_f64 = 1.0_f64;
+        // `theta_d`/`prog_vars` are exactly `$n`-sized at each dispatch arm (unlike
+        // `ScaleDerivProgram::eval_scale_dual1`'s padded-to-N buffers), so a plain
+        // stack array avoids the sibling's per-call heap `Vec` for the axis-bounded
+        // pieces (#486 review); `cov_vec`/`stack` stay on the heap, matching that
+        // sibling's own precedent — they are not axis-bounded.
         macro_rules! run {
             ($n:literal) => {{
-                let theta_d: Vec<Dual1<$n>> = theta
-                    .iter()
-                    .enumerate()
-                    .map(|(m, &v)| Dual1::var(v, m))
-                    .collect();
-                let sigma_pin = [Dual1::<$n>::constant(sigma_pin_f64)];
+                let mut theta_d = [Dual1::<$n>::constant(0.0); $n];
+                for (m, d) in theta_d.iter_mut().enumerate() {
+                    *d = Dual1::var(theta[m], m);
+                }
+                // Slot 0 = the pinned scaled sigma (1.0); slot 1 = MACHEPS.
+                let prog_vars = [
+                    Dual1::<$n>::constant(1.0),
+                    Dual1::<$n>::constant(f64::EPSILON),
+                ];
                 let empty_nn: Vec<Vec<f64>> = Vec::new();
                 let mut stack: Vec<Dual1<$n>> = Vec::new();
                 let d = with_model_time(time, || {
@@ -11979,7 +12021,7 @@ impl RuvMagDerivProgram {
                         &theta_d,
                         &[],
                         &cov_vec,
-                        &sigma_pin,
+                        &prog_vars,
                         &empty_nn,
                         &mut stack,
                     )
@@ -17504,6 +17546,77 @@ mod tests {
             "RUV_LATE is used by the magnitude expression, got: {:?}",
             warns
         );
+    }
+
+    /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
+    /// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
+    /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
+    /// for it now. Regression case: `WT + MACHEPS` guards a denominator; at
+    /// `WT = 0.0` the pre-fix bug (`MACHEPS` silently resolving to `0.0` in the
+    /// bytecode path) would divide by exactly zero and produce a non-finite
+    /// `∂mult/∂θ`.
+    #[test]
+    fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_LATE(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE / (WT + MACHEPS)))
+[covariates]
+  WT continuous
+"#;
+        let model = parse_model_string(content).unwrap();
+        let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+        let deriv = rm.per_sigma_deriv[0]
+            .as_ref()
+            .expect("prop slot has a deriv program");
+
+        let theta = vec![0.2, 10.0, 1.5];
+        let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
+        let grad = deriv
+            .theta_grad(&theta, &cov_zero, 10.0)
+            .expect("theta_grad supported");
+        assert!(
+            grad.iter().all(|g| g.is_finite()),
+            "MACHEPS must guard the WT=0 denominator, got {:?}",
+            grad
+        );
+        // ∂mult/∂RUV_LATE = 1/(WT+MACHEPS) = 1/EPSILON — a large but finite value.
+        approx::assert_relative_eq!(grad[2], 1.0 / f64::EPSILON, max_relative = 1e-9);
+    }
+
+    /// xhigh review: a *legacy* pre-built magnitude expression that still
+    /// represents `TIME` as an `Expression::Covariate("TIME")` node (rather than
+    /// the `Expression::Time` built-in every parsed `.ferx` model produces) must
+    /// still resolve `TIME` to the observation time in `theta_grad`, mirroring the
+    /// runtime `RuvMagFn` closure's `cov.insert("TIME", time)` injection. Without
+    /// it, `cov_vec` would look up "TIME" in the (never-populated) observation
+    /// covariate map and silently default to `0.0`.
+    #[test]
+    fn test_ruv_magnitude_deriv_program_resolves_time_as_covariate_node() {
+        // RUV_LATE * TIME, built directly as an AST (bypassing the parser, which
+        // would emit `Expression::Time` instead) to exercise the legacy branch.
+        let expr = Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            Box::new(Expression::Covariate("TIME".to_string())),
+        );
+        let deriv = compile_ruv_mag_deriv_program(&expr, "UNUSED_SIGMA", 1);
+        let empty_cov = std::collections::HashMap::new();
+        let grad = deriv
+            .theta_grad(&[2.0], &empty_cov, 10.0)
+            .expect("theta_grad supported");
+        // d(RUV_LATE * TIME)/d(RUV_LATE) = TIME = 10.0, not 0.0.
+        approx::assert_relative_eq!(grad[0], 10.0, max_relative = 1e-12);
     }
 
     #[test]

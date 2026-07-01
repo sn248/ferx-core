@@ -29,7 +29,19 @@ section of the SDLC for the versioning policy).
   closed-form/ODE, including the `M3 + IOV + iiv_on_ruv` triple. **M3 FOCEI OFV values shift
   accordingly** (estimates/SEs are essentially unchanged), and the OFV now matches NONMEM
   `METHOD=1 LAPLACE` M3 up to the residual FOCEI-vs-LAPLACE second-order term. FOCE
-  (Sheiner–Beal) is a distinct objective and is unchanged.
+  (Sheiner–Beal) is a distinct objective, updated separately (see the next entry).
+- **FOCE (Sheiner–Beal) M3 BLOQ now uses the linearized-marginal moments** for the
+  censored tail probability — `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)` with the marginal mean
+  `f0 = f(η̂) − Hη̂` and marginal variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰`, the same moments the
+  quantified rows use — instead of the conditional prediction and residual variance
+  (#646). This makes plain FOCE a self-consistent Sheiner–Beal objective (matching
+  Monolix's linearization likelihood and first-order/Tobit theory); the analytic FOCE
+  gradient is updated to match, including a new direct Ω-gradient channel for the censored
+  variance, on both the non-IOV and IOV paths. **FOCE M3 OFV and estimates shift** (most
+  when between-subject variance is large, where `HΩHᵀ` dominates `R⁰`). FOCEI M3 keeps the
+  conditional censored term — the treatment NONMEM's `METHOD=1 LAPLACE` M3 uses (NONMEM
+  runs M3 only under LAPLACE), which ferx's first-order FOCEI matches up to the
+  FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get

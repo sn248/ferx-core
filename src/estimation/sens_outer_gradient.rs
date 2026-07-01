@@ -89,6 +89,194 @@ fn m3_censored_g1(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> f64 {
     h * m
 }
 
+/// Per-censored-row `(a_var, Jⱼ)` for the marginal-variance `∂R̃ⱼⱼ/∂Ω` channel (#646).
+struct CensMargRow {
+    a_var: f64,
+    jrow: DVector<f64>,
+}
+
+/// Natural-space censored contributions to the **FOCE (Sheiner–Beal)** packed
+/// gradient under the marginal-moment M3 treatment (#646). Each BLOQ row enters as
+/// `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)`, with the linearized-marginal mean `f0 = f(η̂) − Jⱼη̂`
+/// and variance `R̃ⱼⱼ = Jⱼ Ω Jⱼᵀ + R⁰ⱼ` — the SAME moments the quantified rows use,
+/// so FOCE stays a consistent Sheiner–Beal objective (matching Monolix's
+/// linearization likelihood and first-order/Tobit theory), unlike the conditional
+/// FOCEI censored term. Shared by the non-IOV and IOV FOCE gradients: `theta`,
+/// `sigma`, and `coupling = ∂/∂η̂` are uniform, but the two callers pack `Ω`
+/// differently, so the direct `Ω` channel is applied per caller via
+/// [`CensMargGrad::omega_entry`]. `omega`/`eta_hat`/`n` are the stacked system (η
+/// for non-IOV, `[η, κ]` for IOV). All contributions are zero when the subject has
+/// no censored rows.
+struct CensMargGrad {
+    theta: Vec<f64>,
+    sigma: Vec<f64>,
+    coupling: DVector<f64>,
+    rows: Vec<CensMargRow>,
+}
+
+impl CensMargGrad {
+    /// Precompute `(Jⱼ L) = Lᵀ Jⱼ` (length `n`) for every censored row against the
+    /// caller's Cholesky factor `L` — the plain factor for non-IOV, the block-diagonal
+    /// `L_full` for IOV. Done once, then reused for every packed Ω entry, mirroring the
+    /// quant SB path's one-shot `jl = J·L` (so `(Jⱼ L)_col` is not recomputed per row).
+    fn prep_jl(&self, l: &DMatrix<f64>) -> Vec<DVector<f64>> {
+        self.rows.iter().map(|c| l.tr_mul(&c.jrow)).collect()
+    }
+
+    /// Censored contribution to `∂F/∂L_{row,col}` of the (stacked) Ω Cholesky factor:
+    /// `Σ_c a_varc · ∂R̃ⱼⱼ/∂L_{row,col} = Σ_c a_varc · 2·(Jⱼ L)_col · Jⱼ[row]`, reading
+    /// `(Jⱼ L)_col` from `jl` (from [`CensMargGrad::prep_jl`]). The caller maps
+    /// `(row,col)` to its packed slot.
+    fn omega_entry(&self, row: usize, col: usize, jl: &[DVector<f64>]) -> f64 {
+        self.rows
+            .iter()
+            .zip(jl)
+            .map(|(c, jlc)| c.a_var * 2.0 * jlc[col] * c.jrow[row])
+            .sum()
+    }
+}
+
+/// Build the [`CensMargGrad`] for a subject's FOCE (Sheiner–Beal) packed gradient.
+/// `sens`/`sens0` are the providers at η̂ and at the all-zero random effects; `n`,
+/// `omega`, and `eta_hat` are the stacked system. Returns zero contributions when
+/// `!m3`. `None` only on a non-finite variance (same guard as the caller's SB path).
+#[allow(clippy::too_many_arguments)]
+fn censored_marginal_foce_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    sens: &SubjectSens,
+    sens0: &SubjectSens,
+    sigma: &[f64],
+    omega: &DMatrix<f64>,
+    eta_hat: &[f64],
+    n: usize,
+    n_theta: usize,
+    m3: bool,
+) -> Option<CensMargGrad> {
+    let n_sigma = sigma.len();
+    let mut theta = vec![0.0f64; n_theta];
+    let mut sigma_g = vec![0.0f64; n_sigma];
+    let mut coupling = DVector::<f64>::zeros(n);
+    if !m3 {
+        return Some(CensMargGrad {
+            theta,
+            sigma: sigma_g,
+            coupling,
+            rows: Vec::new(),
+        });
+    }
+    // Per-censored-row marginal coefficients:
+    //   a_mean = ∂L/∂mean = h·σ/w,   a_var = ∂L/∂var = h·σ·(LLOQ−f0)/(2w³),
+    //   jrow = Jⱼ = ∂f/∂η,  ojc = Ω Jⱼᵀ,  d0 = ∂R⁰/∂f,  f0act = f(η=0).
+    struct C {
+        j: usize,
+        a_mean: f64,
+        a_var: f64,
+        jrow: DVector<f64>,
+        ojc: DVector<f64>,
+        d0: f64,
+        f0act: f64,
+        cmt: usize,
+    }
+    let mut cens: Vec<C> = Vec::new();
+    for j in 0..subject.observations.len() {
+        let cs = subject.cens.get(j).copied().unwrap_or(0);
+        if cs == 0 {
+            continue;
+        }
+        let cmt = subject.obs_cmts[j];
+        let f0act = sens0.obs[j].f;
+        let r0c = model.error_spec.variance_at(cmt, f0act, sigma);
+        if !(r0c.is_finite() && r0c > 0.0) {
+            return None;
+        }
+        let jrow = DVector::from_column_slice(&sens.obs[j].df_deta);
+        let ojc = omega * &jrow; // Ω Jⱼᵀ
+        let var = jrow.dot(&ojc) + r0c; // R̃ⱼⱼ = Jⱼ Ω Jⱼᵀ + R⁰ⱼ
+        if !(var.is_finite() && var > 0.0) {
+            return None;
+        }
+        let w = var.sqrt();
+        let jeta: f64 = (0..n).map(|kk| jrow[kk] * eta_hat[kk]).sum();
+        let resid = subject.observations[j] - (sens.obs[j].f - jeta); // LLOQ − f0
+        let sgn = if cs < 0 { -1.0 } else { 1.0 };
+        let h = crate::stats::special::inv_mills(sgn * resid / w);
+        cens.push(C {
+            j,
+            a_mean: h * sgn / w,
+            a_var: h * sgn * resid / (2.0 * w * w * w),
+            jrow,
+            ojc,
+            d0: model.error_spec.dvar_df(cmt, f0act, sigma),
+            f0act,
+            cmt,
+        });
+    }
+    // θ: ∂mean/∂θ_m = ∂f/∂θ_m − Σ_l (∂J_l/∂θ_m)η̂_l;
+    //    ∂var/∂θ_m  = 2·Σ_l (∂J_l/∂θ_m)(Ω Jᵀ)_l + d0·∂f(η=0)/∂θ_m.
+    for m in 0..n_theta {
+        let mut acc = 0.0;
+        for c in &cens {
+            let obs_c = &sens.obs[c.j];
+            let mut dmean = obs_c.df_dtheta[m];
+            let mut djoj = 0.0;
+            for li in 0..n {
+                let djl = obs_c.d2f_deta_dtheta[li * n_theta + m];
+                dmean -= djl * eta_hat[li];
+                djoj += djl * c.ojc[li];
+            }
+            let dvar = 2.0 * djoj + c.d0 * sens0.obs[c.j].df_dtheta[m];
+            acc += c.a_mean * dmean + c.a_var * dvar;
+        }
+        theta[m] = acc;
+    }
+    // σ: only R⁰ (not Jⱼ Ω Jⱼᵀ) depends on σ, so ∂var/∂σ = ∂R⁰/∂σ (central FD).
+    for kk in 0..n_sigma {
+        let hsig = sigma_fd_step(sigma[kk]);
+        let mut sp = sigma.to_vec();
+        sp[kk] += hsig;
+        let mut sm = sigma.to_vec();
+        sm[kk] -= hsig;
+        let mut acc = 0.0;
+        for c in &cens {
+            let dr0 = (model.error_spec.variance_at(c.cmt, c.f0act, &sp)
+                - model.error_spec.variance_at(c.cmt, c.f0act, &sm))
+                / (2.0 * hsig);
+            acc += c.a_var * dr0;
+        }
+        sigma_g[kk] = acc;
+    }
+    // coupling ∂/∂η̂_k: ∂mean/∂η̂_k = −(A_c η̂)_k;  ∂var/∂η̂_k = 2·(A_c Ω Jᵀ)_k.
+    for kk in 0..n {
+        let mut acc = 0.0;
+        for c in &cens {
+            let obs_c = &sens.obs[c.j];
+            let mut dmean = 0.0;
+            let mut dvar = 0.0;
+            for li in 0..n {
+                let a_kl = obs_c.d2f_deta2[kk * n + li];
+                dmean -= a_kl * eta_hat[li];
+                dvar += a_kl * c.ojc[li];
+            }
+            acc += c.a_mean * dmean + c.a_var * 2.0 * dvar;
+        }
+        coupling[kk] = acc;
+    }
+    let rows = cens
+        .iter()
+        .map(|c| CensMargRow {
+            a_var: c.a_var,
+            jrow: c.jrow.clone(),
+        })
+        .collect();
+    Some(CensMargGrad {
+        theta,
+        sigma: sigma_g,
+        coupling,
+        rows,
+    })
+}
+
 fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
     let inv_r = 1.0 / r;
     let inv_r2 = inv_r * inv_r;
@@ -1335,50 +1523,6 @@ pub fn subject_packed_gradient_foce(
         d0[i] = model.error_spec.dvar_df(cmt, f0act, sigma);
     }
 
-    // Censored rows: `−logΦ(z)`, z = (LLOQ − f(η̂))/√R⁰. Precompute the inverse
-    // Mills ratio h and the population variance / its f-derivative per row.
-    struct Cens {
-        j: usize,
-        resid: f64, // limit − f(η̂)
-        w: f64,     // √R⁰
-        h: f64,     // φ(z)/Φ(z) at the signed tail z = σ·resid/w
-        sgn: f64,   // tail sign σ: +1 below-LLOQ, −1 above-ULOQ
-        d0: f64,    // ∂R⁰/∂f at f(η=0)
-        f0act: f64, // f(η=0)
-        cmt: usize,
-    }
-    let mut cens: Vec<Cens> = Vec::new();
-    if m3 {
-        for j in 0..n_obs {
-            let cens_sign = subject.cens.get(j).copied().unwrap_or(0);
-            if cens_sign == 0 {
-                continue;
-            }
-            let cmt = subject.obs_cmts[j];
-            let f0act = sens0.obs[j].f;
-            let r0c = model.error_spec.variance_at(cmt, f0act, sigma);
-            if !(r0c.is_finite() && r0c > 0.0) {
-                return None;
-            }
-            let w = r0c.sqrt();
-            let resid = subject.observations[j] - sens.obs[j].f;
-            // σ = +1 below-LLOQ (lower tail), −1 above-ULOQ (upper tail); the signed
-            // z = σ·resid/w matches `m3_logcdf`, and every censored gradient term below
-            // carries the same σ.
-            let sgn = if cens_sign < 0 { -1.0 } else { 1.0 };
-            cens.push(Cens {
-                j,
-                resid,
-                w,
-                h: crate::stats::special::inv_mills(sgn * resid / w),
-                sgn,
-                d0: model.error_spec.dvar_df(cmt, f0act, sigma),
-                f0act,
-                cmt,
-            });
-        }
-    }
-
     // R̃ = J Ω Jᵀ + diag(R⁰) over quant rows; u = R̃⁻¹ ρ; ΩJᵀ reused throughout.
     let jo = &jmat * omega; // J Ω
     let mut rtilde = &jo * jmat.transpose();
@@ -1393,9 +1537,14 @@ pub fn subject_packed_gradient_foce(
     let n_sigma = sigma.len();
     let mut fixed = vec![0.0f64; x.len()];
 
-    // θ (fixed η̂): SB part over quant rows + censored `−logΦ` θ-gradient.
+    // Marginal-moment M3 censored contributions (#646), shared with the IOV path.
+    let cg = censored_marginal_foce_grad(
+        model, subject, &sens, &sens0, sigma, omega, eta_hat, n_eta, n_theta, m3,
+    )?;
+
+    // θ (fixed η̂): SB part over quant rows + the marginal censored θ-gradient (`cg.theta`,
+    // built in `censored_marginal_foce_grad` from ∂f0/∂θ and ∂R̃ⱼⱼ/∂θ — #646).
     //   SB: u·Qₘ + tr(R̃⁻¹EₘΩJᵀ) − u·(EₘΩJᵀu) + ½Σ ∂R⁰/∂θ (R̃⁻¹ᵢᵢ − u²ᵢ).
-    //   censored: h·[ b̂ⱼₘ/w + (LLOQ−f̂)·∂R⁰/∂θ /(2w³) ], ∂R⁰/∂θ = d⁰·∂f(η=0)/∂θ.
     for m in 0..n_theta {
         let mut qm = DVector::<f64>::zeros(nq);
         let mut em = DMatrix::<f64>::zeros(nq, n_eta);
@@ -1415,12 +1564,7 @@ pub fn subject_packed_gradient_foce(
         let emojt = &em * &ojt;
         let tr = (&rtilde_inv * &emojt).trace();
         let uemu = u.dot(&(&emojt * &u));
-        let mut nat = u.dot(&qm) + tr - uemu + 0.5 * dvar;
-        for c in &cens {
-            let bhat = sens.obs[c.j].df_dtheta[m];
-            let dr0 = c.d0 * sens0.obs[c.j].df_dtheta[m];
-            nat += c.sgn * c.h * (bhat / c.w + c.resid * dr0 / (2.0 * c.w * c.w * c.w));
-        }
+        let nat = u.dot(&qm) + tr - uemu + 0.5 * dvar + cg.theta[m];
         let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
             params.theta[m]
         } else {
@@ -1429,10 +1573,12 @@ pub fn subject_packed_gradient_foce(
         fixed[m] = nat * dtheta_dx;
     }
 
-    // Ω (fixed η̂, packed Cholesky-L): SB over quant rows. The censored term has no
-    // direct Ω-gradient (R⁰ and f(η̂) do not depend on Ω); it enters only via dη̂/dx.
+    // Ω (fixed η̂, packed Cholesky-L): SB over quant rows + the marginal censored
+    // variance's direct Ω-gradient — R̃ⱼⱼ = Jⱼ Ω Jⱼᵀ + R⁰ⱼ depends on Ω (#646), added
+    // via `cg.omega_entry` (was zero when the censored term used the residual R⁰).
     let l = &params.omega.chol;
     let jl = &jmat * l;
+    let cjl = cg.prep_jl(l); // (Jⱼ L) per censored row, once
     let entries: Vec<(usize, usize)> = if params.omega.diagonal {
         (0..n_eta).map(|i| (i, i)).collect()
     } else {
@@ -1451,12 +1597,12 @@ pub fn subject_packed_gradient_foce(
         let rinv_jr = &rtilde_inv * jr;
         let fixed_l = jv.dot(&rinv_jr) - jr.dot(&u) * jv.dot(&u);
         let chain = if row == col { l[(row, row)] } else { 1.0 };
-        fixed[omega_start + ko] = fixed_l * chain;
+        fixed[omega_start + ko] = (fixed_l + cg.omega_entry(row, col, &cjl)) * chain;
     }
 
-    // σ (fixed η̂): SB part over quant + censored. ∂R⁰/∂σ by central FD of the
+    // σ (fixed η̂): SB part over quant + the marginal censored σ-gradient (`cg.sigma`;
+    // only R⁰ depends on σ, so ∂R̃ⱼⱼ/∂σ = ∂R⁰/∂σ — #646). ∂R⁰/∂σ by central FD of the
     // closed-form variance at f(η=0) — works for FOCE here and FOCEI in sigma_block.
-    //   censored: h·(LLOQ−f̂)·∂R⁰/∂σ /(2w³).
     let sigma_start = omega_start + entries.len();
     for k in 0..n_sigma {
         let hsig = sigma_fd_step(sigma[k]);
@@ -1473,16 +1619,12 @@ pub fn subject_packed_gradient_foce(
                 / (2.0 * hsig);
             nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
-        for c in &cens {
-            let dr0 = (model.error_spec.variance_at(c.cmt, c.f0act, &sp)
-                - model.error_spec.variance_at(c.cmt, c.f0act, &sm))
-                / (2.0 * hsig);
-            nat += c.sgn * c.h * c.resid * dr0 / (2.0 * c.w * c.w * c.w);
-        }
+        nat += cg.sigma[k];
         fixed[sigma_start + k] = nat * sigma[k];
     }
 
-    // Coupling c = ∂F/∂η̂: SB part over quant rows + censored (∂(−logΦ)/∂η̂ = h·â/w).
+    // Coupling c = ∂F/∂η̂: SB part over quant rows + the marginal censored coupling
+    // (`cg.coupling`; the tail's η̂-response through both the marginal mean and R̃ⱼⱼ — #646).
     //   SB: u·P_k + tr(R̃⁻¹ Dk ΩJᵀ) − u·(Dk ΩJᵀ u),  P_k[i]=(Aⱼη̂)_k, Dk[i,l]=Aⱼ[k,l].
     let mut coupling = DVector::<f64>::zeros(n_eta);
     for k in 0..n_eta {
@@ -1501,10 +1643,7 @@ pub fn subject_packed_gradient_foce(
         let dkojt = &dk * &ojt;
         let tr = (&rtilde_inv * &dkojt).trace();
         let udku = u.dot(&(&dkojt * &u));
-        let mut ck = u.dot(&pk) + tr - udku;
-        for c in &cens {
-            ck += c.sgn * c.h * sens.obs[c.j].df_deta[k] / c.w;
-        }
+        let ck = u.dot(&pk) + tr - udku + cg.coupling[k];
         coupling[k] = ck;
     }
 
@@ -1757,11 +1896,13 @@ pub fn subject_eta_dx_iov(
 /// [`subject_eta_dx_iov`]. `None` outside the IOV-analytical scope.
 ///
 /// M3 BLOQ (#591): censored rows leave the augmented Sheiner–Beal marginal (R̃ and
-/// the quadratic form are built over the quantified rows only) and re-enter as
-/// `−logΦ((LLOQ−f̂)/√R⁰)` data terms with the population (η=0, κ=0) variance — the
-/// FOCE-IOV-M3 objective `foce_subject_nll_iov(interaction = false)` now builds (the
-/// stacked analogue of the non-IOV `subject_packed_gradient_foce`). `quant` maps an
-/// SB-local row to its original obs index.
+/// the quadratic form are built over the quantified rows only) and re-enter as the
+/// marginal tail `−logΦ((LLOQ−f0)/√R̃ⱼⱼ)`, R̃ⱼⱼ = Hⱼ Σ_b Hⱼᵀ + R⁰ⱼ over the stacked
+/// [η, κ] system (#646) — the FOCE-IOV-M3 objective
+/// `foce_subject_nll_iov(interaction = false)` builds (the stacked analogue of the
+/// non-IOV `subject_packed_gradient_foce`). `quant` maps an SB-local row to its
+/// original obs index. The marginal contributions are shared via
+/// [`censored_marginal_foce_grad`].
 pub fn subject_packed_gradient_foce_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -1802,10 +1943,11 @@ pub fn subject_packed_gradient_foce_iov(
     );
 
     // M3 BLOQ: the censored rows leave the augmented Sheiner–Beal marginal (R̃ and the
-    // quadratic form are built over the quantified rows only) and re-enter as `−logΦ`
-    // data terms — matching `foce_subject_nll_iov(interaction = false)`. `quant` maps an
-    // SB-local row `i` → original obs index `j`. (FOCE-IOV-M3 no longer promotes to
-    // interaction as of #591, so this is the gradient of the actual objective.)
+    // quadratic form are built over the quantified rows only) and re-enter as the marginal
+    // tail `−logΦ((LLOQ−f0)/√R̃ⱼⱼ)`, R̃ⱼⱼ = Hⱼ Σ_b Hⱼᵀ + R⁰ⱼ (#646) — matching
+    // `foce_subject_nll_iov(interaction = false)`. `quant` maps an SB-local row `i` →
+    // original obs index `j`. (FOCE-IOV-M3 no longer promotes to interaction as of #591,
+    // so this is the gradient of the actual objective.)
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3)
         && subject.cens.iter().any(|&c| c != 0);
     let quant: Vec<usize> = (0..n_obs)
@@ -1839,48 +1981,6 @@ pub fn subject_packed_gradient_foce_iov(
         d0[i] = model.error_spec.dvar_df(cmt, f0act, sigma);
     }
 
-    // Censored rows: `−logΦ(z)`, z = σ·(limit − f̂)/√R⁰ (σ = +1 below-LLOQ / lower tail,
-    // −1 above-ULOQ / upper tail). Precompute the inverse Mills ratio h at the signed
-    // tail and the population (η=0, κ=0) variance / its f-derivative per row.
-    struct Cens {
-        j: usize,
-        resid: f64, // limit − f̂
-        w: f64,     // √R⁰
-        h: f64,     // φ(z)/Φ(z) at the signed tail z = σ·resid/w
-        sgn: f64,   // tail sign σ: +1 below-LLOQ, −1 above-ULOQ
-        d0: f64,    // ∂R⁰/∂f at f(η=0, κ=0)
-        f0act: f64, // f(η=0, κ=0)
-        cmt: usize,
-    }
-    let mut cens: Vec<Cens> = Vec::new();
-    if m3 {
-        for j in 0..n_obs {
-            let cens_sign = subject.cens.get(j).copied().unwrap_or(0);
-            if cens_sign == 0 {
-                continue;
-            }
-            let cmt = subject.obs_cmts[j];
-            let f0act = sens0.obs[j].f;
-            let r0c = model.error_spec.variance_at(cmt, f0act, sigma);
-            if !(r0c.is_finite() && r0c > 0.0) {
-                return None;
-            }
-            let w = r0c.sqrt();
-            let resid = subject.observations[j] - sens.obs[j].f;
-            let sgn = if cens_sign < 0 { -1.0 } else { 1.0 };
-            cens.push(Cens {
-                j,
-                resid,
-                w,
-                h: crate::stats::special::inv_mills(sgn * resid / w),
-                sgn,
-                d0: model.error_spec.dvar_df(cmt, f0act, sigma),
-                f0act,
-                cmt,
-            });
-        }
-    }
-
     let jo = &jmat * &omega_full;
     let mut rtilde = &jo * jmat.transpose();
     for i in 0..nq {
@@ -1894,8 +1994,23 @@ pub fn subject_packed_gradient_foce_iov(
     let n_sigma = sigma.len();
     let mut fixed = vec![0.0f64; x.len()];
 
-    // θ (fixed η̂): SB part over quant rows + censored `−logΦ` θ-gradient
-    //   h·[ b̂ⱼₘ/w + (LLOQ−f̂)·∂R⁰/∂θ /(2w³) ], ∂R⁰/∂θ = d⁰·∂f(η=0,κ=0)/∂θ.
+    // Marginal-moment M3 censored contributions (#646) over the stacked [η, κ]
+    // system; shared with the non-IOV path. `omega_full` = block-diag(Ω_bsv, Ω_iov).
+    let cg = censored_marginal_foce_grad(
+        model,
+        subject,
+        &sens,
+        &sens0,
+        sigma,
+        &omega_full,
+        stacked_eta_hat,
+        n_st,
+        n_theta,
+        m3,
+    )?;
+
+    // θ (fixed η̂): SB part over quant rows + the marginal censored θ-gradient
+    // (`cg.theta`, over the stacked [η, κ] system — #646).
     for m in 0..n_theta {
         let mut qm = DVector::<f64>::zeros(nq);
         let mut em = DMatrix::<f64>::zeros(nq, n_st);
@@ -1915,12 +2030,7 @@ pub fn subject_packed_gradient_foce_iov(
         let emojt = &em * &ojt;
         let tr = (&rtilde_inv * &emojt).trace();
         let uemu = u.dot(&(&emojt * &u));
-        let mut nat = u.dot(&qm) + tr - uemu + 0.5 * dvar;
-        for c in &cens {
-            let bhat = sens.obs[c.j].df_dtheta[m];
-            let dr0 = c.d0 * sens0.obs[c.j].df_dtheta[m];
-            nat += c.sgn * c.h * (bhat / c.w + c.resid * dr0 / (2.0 * c.w * c.w * c.w));
-        }
+        let nat = u.dot(&qm) + tr - uemu + 0.5 * dvar + cg.theta[m];
         let dtheta_dx = if theta_packs_log(template.theta_lower[m]) {
             params.theta[m]
         } else {
@@ -1929,11 +2039,15 @@ pub fn subject_packed_gradient_foce_iov(
         fixed[m] = nat * dtheta_dx;
     }
 
-    // Ω (fixed η̂): per Cholesky entry of Σ_b, BSV direct + K-summed IOV.
+    // Ω (fixed η̂): per Cholesky entry of Σ_b, BSV direct + K-summed IOV. The marginal
+    // censored variance R̃ⱼⱼ = Jⱼ Σ_b Jⱼᵀ + R⁰ⱼ depends on the full block factor L_full,
+    // so `cg.omega_entry` adds the censored channel at the same (row,col) the SB
+    // `entry_grad` reads (#646).
     let l_bsv = &params.omega.chol;
     let l_iov = &omega_iov.chol;
     let l_full = block_chol_full(l_bsv, l_iov, k, n_eta_bsv, n_iov);
     let jl = &jmat * &l_full;
+    let cjl = cg.prep_jl(&l_full); // (Jⱼ L_full) per censored row, once
     let entry_grad = |row: usize, col: usize| -> f64 {
         let jr = jmat.column(row);
         let jv = jl.column(col);
@@ -1944,12 +2058,13 @@ pub fn subject_packed_gradient_foce_iov(
     let bsv_entries = lower_tri_entries(n_eta_bsv, params.omega.diagonal);
     for (e, &(row, col)) in bsv_entries.iter().enumerate() {
         let chain = if row == col { l_bsv[(row, row)] } else { 1.0 };
-        fixed[omega_start + e] = entry_grad(row, col) * chain;
+        fixed[omega_start + e] = (entry_grad(row, col) + cg.omega_entry(row, col, &cjl)) * chain;
     }
     let sigma_start = omega_start + bsv_entries.len();
 
-    // σ (fixed η̂): SB part over quant rows + censored. ∂R⁰/∂σ by central FD of the
-    // closed-form variance at f(η=0, κ=0). Censored: h·(LLOQ−f̂)·∂R⁰/∂σ /(2w³).
+    // σ (fixed η̂): SB part over quant rows + the marginal censored σ-gradient
+    // (`cg.sigma`; ∂R̃ⱼⱼ/∂σ = ∂R⁰/∂σ — #646). ∂R⁰/∂σ by central FD of the closed-form
+    // variance at f(η=0, κ=0).
     for kk in 0..n_sigma {
         let hsig = sigma_fd_step(sigma[kk]);
         let mut sp = sigma.clone();
@@ -1965,12 +2080,7 @@ pub fn subject_packed_gradient_foce_iov(
                 / (2.0 * hsig);
             nat += 0.5 * dr0 * (rtilde_inv[(i, i)] - u[i] * u[i]);
         }
-        for c in &cens {
-            let dr0 = (model.error_spec.variance_at(c.cmt, c.f0act, &sp)
-                - model.error_spec.variance_at(c.cmt, c.f0act, &sm))
-                / (2.0 * hsig);
-            nat += c.sgn * c.h * c.resid * dr0 / (2.0 * c.w * c.w * c.w);
-        }
+        nat += cg.sigma[kk];
         fixed[sigma_start + kk] = nat * sigma[kk];
     }
     let iov_start = sigma_start + n_sigma;
@@ -1978,14 +2088,17 @@ pub fn subject_packed_gradient_foce_iov(
     for (e, &(i, j)) in iov_entries.iter().enumerate() {
         let mut raw = 0.0;
         for kk in 0..k {
-            raw += entry_grad(n_eta_bsv + kk * n_iov + i, n_eta_bsv + kk * n_iov + j);
+            let row = n_eta_bsv + kk * n_iov + i;
+            let col = n_eta_bsv + kk * n_iov + j;
+            raw += entry_grad(row, col) + cg.omega_entry(row, col, &cjl);
         }
         let chain = if i == j { l_iov[(i, i)] } else { 1.0 };
         fixed[iov_start + e] = raw * chain;
     }
 
     // Coupling c = ∂F/∂η̂ over the stacked random effects: SB part over quant rows +
-    // censored ∂(−logΦ)/∂η̂_kk = h·(∂f̂/∂η̂_kk)/w.
+    // the marginal censored coupling (`cg.coupling`; the tail's [η, κ]-response through
+    // both the marginal mean and R̃ⱼⱼ — #646).
     let mut coupling = DVector::<f64>::zeros(n_st);
     for kk in 0..n_st {
         let mut pk = DVector::<f64>::zeros(nq);
@@ -2003,10 +2116,7 @@ pub fn subject_packed_gradient_foce_iov(
         let dkojt = &dk * &ojt;
         let tr = (&rtilde_inv * &dkojt).trace();
         let udku = u.dot(&(&dkojt * &u));
-        let mut ck = u.dot(&pk) + tr - udku;
-        for c in &cens {
-            ck += c.sgn * c.h * sens.obs[c.j].df_deta[kk] / c.w;
-        }
+        let ck = u.dot(&pk) + tr - udku + cg.coupling[kk];
         coupling[kk] = ck;
     }
 

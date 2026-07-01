@@ -5525,25 +5525,20 @@ mod tests {
         }
     }
 
-    /// #486 review: a custom residual-magnitude model's direct-θ channel is
-    /// FOCEI-only (`subject_packed_gradient_foce`/`_foce_iov` decline it), so
-    /// `auto` must resolve to `Bobyqa` under plain `method = foce`
-    /// (`interaction = false`) even though `analytic_outer_gradient_available`
-    /// (interaction-agnostic) reports the model in scope — and still resolve to
-    /// `NloptLbfgs` under FOCEI (`interaction = true`).
+    /// #486 σ-magnitude FOCE port: a custom residual-magnitude model is analytic on
+    /// **both** loops now (the Sheiner–Beal FOCE marginal threads `mult(θ)` through
+    /// its `R⁰`), so `auto` resolves to `NloptLbfgs` under plain `method = foce`
+    /// (`interaction = false`) as well as under FOCEI (`interaction = true`).
     #[test]
-    fn resolve_auto_respects_interaction_for_custom_magnitude() {
+    fn resolve_auto_analytic_for_custom_magnitude_both_loops() {
         let content = "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_LATE(1.5, 0.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))\n";
         let m = crate::parser::model_parser::parse_model_string(content).expect("parse");
         assert!(m.has_custom_ruv_magnitude());
-        assert!(
-            crate::sens::provider::analytic_outer_gradient_available(&m),
-            "the interaction-agnostic gate still reports this model in scope"
-        );
+        assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
         assert_eq!(
             Optimizer::Auto.resolve_auto(&m, false),
-            Optimizer::Bobyqa,
-            "plain FOCE + custom magnitude has no analytic gradient — must not pick a gradient optimizer"
+            Optimizer::NloptLbfgs,
+            "FOCE + custom magnitude now has the analytic gradient"
         );
         assert_eq!(
             Optimizer::Auto.resolve_auto(&m, true),

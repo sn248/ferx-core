@@ -11955,11 +11955,14 @@ pub struct RuvMagDerivProgram {
 }
 
 /// Axis cap for the `Dual1<M>` dispatch table in [`RuvMagDerivProgram::theta_grad`]
-/// (mirrors the `MAX_SCALE_AXES` / `MAX_ODE_AXES` convention elsewhere). A model
+/// (same const-generic-dispatch convention as `MAX_SCALE_AXES` / `MAX_ODE_AXES`,
+/// but set higher — the magnitude program's bytecode evaluator is cheap to
+/// monomorphize, and covering realistic large-θ population models keeps the
+/// magnitude direct-θ channel analytic rather than dropping to FD, #486). A model
 /// with more thetas than this falls back to FD for the magnitude's direct-θ
 /// gradient channel — `analytic_outer_gradient_available` bounds `model.n_theta`
 /// against this constant when a custom magnitude is active.
-pub(crate) const MAX_RUV_MAG_AXES: usize = 16;
+pub(crate) const MAX_RUV_MAG_AXES: usize = 32;
 
 impl RuvMagDerivProgram {
     /// `∂(magnitude)/∂θ` at `theta` (with the observation's covariates and raw
@@ -12046,6 +12049,22 @@ impl RuvMagDerivProgram {
             14 => run!(14),
             15 => run!(15),
             16 => run!(16),
+            17 => run!(17),
+            18 => run!(18),
+            19 => run!(19),
+            20 => run!(20),
+            21 => run!(21),
+            22 => run!(22),
+            23 => run!(23),
+            24 => run!(24),
+            25 => run!(25),
+            26 => run!(26),
+            27 => run!(27),
+            28 => run!(28),
+            29 => run!(29),
+            30 => run!(30),
+            31 => run!(31),
+            32 => run!(32),
             _ => return None,
         })
     }
@@ -13673,6 +13692,56 @@ fn parse_if_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #486: the residual-magnitude direct-θ program dispatches its `Dual1<M>`
+    /// evaluator for every axis count up to [`MAX_RUV_MAG_AXES`] (raised past 16),
+    /// and declines (`None`, caller → FD) only beyond it. `mult = θ_last · σ̂` (σ̂
+    /// pinned to 1.0), so `∂mult/∂θ_last = 1` and all other axes are 0 — a cheap
+    /// exact check that each newly-added dispatch arm is wired.
+    #[test]
+    fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
+        use std::collections::HashMap;
+        assert!(MAX_RUV_MAG_AXES >= 17, "cap must be raised past the old 16");
+        let cov = HashMap::new();
+        for n in [1usize, 16, 17, 24, MAX_RUV_MAG_AXES] {
+            let expr = Expression::BinOp(
+                Box::new(Expression::Theta(n - 1)),
+                BinOp::Mul,
+                Box::new(Expression::Variable("PROP".to_string())),
+            );
+            let prog = compile_ruv_mag_deriv_program(&expr, "PROP", n);
+            let theta = vec![0.5f64; n];
+            let grad = prog
+                .theta_grad(&theta, &cov, 0.0)
+                .unwrap_or_else(|| panic!("theta_grad must dispatch for n_theta = {n}"));
+            assert_eq!(grad.len(), n);
+            assert!(
+                (grad[n - 1] - 1.0).abs() < 1e-9,
+                "∂mult/∂θ_last = 1 (n={n})"
+            );
+            for (i, g) in grad.iter().enumerate() {
+                if i != n - 1 {
+                    assert!(
+                        g.abs() < 1e-9,
+                        "off-axis derivative must be 0 (n={n}, i={i})"
+                    );
+                }
+            }
+        }
+        // Beyond the cap → None, so the outer gradient falls back to FD.
+        let over = MAX_RUV_MAG_AXES + 1;
+        let expr = Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            Box::new(Expression::Variable("PROP".to_string())),
+        );
+        let prog = compile_ruv_mag_deriv_program(&expr, "PROP", over);
+        assert!(
+            prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0)
+                .is_none(),
+            "n_theta beyond MAX_RUV_MAG_AXES must decline to FD"
+        );
+    }
 
     // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 

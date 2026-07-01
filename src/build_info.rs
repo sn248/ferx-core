@@ -127,9 +127,9 @@ pub fn gradient_method_outer(
                     // Shared predicate (#490) — now IOV-aware via `iov_sens_supported`, which
                     // admits ODE IOV models too, so the reported method tracks the live outer
                     // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
-                    // Interaction-aware (#486 review) so a custom-magnitude model under plain
-                    // FOCE — where the direct-θ channel isn't assembled — reports FD even when
-                    // the user forced a concrete gradient-based `optimizer` (bypassing `resolve_auto`).
+                    // Shared with `resolve_auto` so the reported method tracks the live outer
+                    // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now
+                    // (#486 σ-magnitude FOCE port), so this no longer narrows by interaction.
                     if crate::sens::provider::analytic_outer_gradient_for_interaction(
                         model,
                         interaction,
@@ -271,35 +271,29 @@ mod tests {
         );
     }
 
-    /// #486 review: a custom residual-magnitude model's direct-θ channel is
-    /// FOCEI-only (`subject_packed_gradient_foce`/`_foce_iov` decline it), so
-    /// `gradient_method_outer` must report `FiniteDifferences` under plain
-    /// `method = foce` even though the model is otherwise in the
-    /// (interaction-agnostic) analytic-gradient scope — and `Analytic` under
-    /// `method = focei`. Regression test for the `resolve_auto`/reported-method
-    /// drift the fix closes.
+    /// #486 σ-magnitude FOCE port: a custom / time-varying residual-magnitude model
+    /// is now analytic on **both** loops (the Sheiner–Beal FOCE assembly threads
+    /// `mult(θ)` through its marginal `R⁰`), so `gradient_method_outer` reports
+    /// `Analytic` under plain `method = foce` as well as `method = focei`. Regression
+    /// test that FOCE no longer routes a magnitude model to FD.
     #[test]
-    fn outer_custom_magnitude_reports_fd_under_foce_analytic_under_focei() {
+    fn outer_custom_magnitude_reports_analytic_under_foce_and_focei() {
         let content = "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_LATE(1.5, 0.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))\n";
         let m = crate::parser::model_parser::parse_model_string(content).expect("parse");
         assert!(m.has_custom_ruv_magnitude());
-        // `Optimizer::Auto` resolves to `Bobyqa` for FOCE + magnitude (no analytic
-        // gradient to feed a gradient-based optimizer) — which reports
-        // `NotApplicable` (derivative-free), like any other out-of-scope model
-        // (`outer_bobyqa_not_applicable`), not `FiniteDifferences`.
+        // `Optimizer::Auto` now resolves to a gradient-based optimizer under FOCE too,
+        // so the reported method is `Analytic` (not the old derivative-free bobyqa).
         assert_eq!(
             gradient_method_outer(&ad_build(), EstimationMethod::Foce, Optimizer::Auto, &m),
-            GradientMethodKind::NotApplicable,
-            "plain FOCE + custom magnitude has no analytic gradient, so auto picks bobyqa"
+            GradientMethodKind::Analytic,
+            "FOCE + custom magnitude now has the analytic outer gradient"
         );
         assert_eq!(
             gradient_method_outer(&ad_build(), EstimationMethod::FoceI, Optimizer::Auto, &m),
             GradientMethodKind::Analytic,
             "FOCEI + custom magnitude has the analytic outer gradient"
         );
-        // A user-forced concrete gradient optimizer bypasses `resolve_auto`'s own
-        // Bobyqa fallback, so the reported method must still gate on interaction
-        // independently at the `analytic_outer_gradient_for_interaction` check.
+        // A user-forced concrete gradient optimizer under FOCE also reports Analytic.
         assert_eq!(
             gradient_method_outer(
                 &ad_build(),
@@ -307,8 +301,8 @@ mod tests {
                 Optimizer::NloptLbfgs,
                 &m
             ),
-            GradientMethodKind::FiniteDifferences,
-            "a forced gradient-based optimizer must not flip the reported method to Analytic"
+            GradientMethodKind::Analytic,
+            "FOCE + magnitude with a forced gradient optimizer reports the analytic method"
         );
     }
 }

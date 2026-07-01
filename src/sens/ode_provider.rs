@@ -445,7 +445,7 @@ pub(crate) fn has_rate_defined_ss_infusion_under_f(
 /// `ode_tvcov_supported` slot-presence gate and the `integrate_tvcov_readout` jet resolution
 /// can never resolve the same dose differently if a new `RateMode` / `DoseAttr` mapping lands
 /// (#530 review finding 5).
-fn modeled_slot_for(
+pub(crate) fn modeled_slot_for(
     attr_map: &crate::types::DoseAttrMap,
     d: &crate::types::DoseEvent,
 ) -> Option<(crate::types::RateMode, usize)> {
@@ -1979,8 +1979,27 @@ fn ode_iov_subject_supported(
     if !ode_iov_supported(model) {
         return None;
     }
+    // #530/#486: modeled-`RATE`/duration doses (`RATE=-1`/`-2`, `R{cmt}`/`D{cmt}`) are
+    // resolved from their **per-occasion** PK slot as a live jet inside the event walk
+    // (`inf_eff` reads `pk_at_dose[k][slot]`, seeded per occasion group by
+    // `seed_pk_dual2_iov` so a `κ`-coupled modeled window — `D1 = TVD1·exp(η + κ)` —
+    // lands its sensitivity in the correct stacked axis), so the moving infusion-end
+    // boundary is analytic via the rate-off saltation, exactly as on the non-IOV TV-cov
+    // walk (`ode_tvcov_supported`). Decline to FD when (a) the modeled dose is also
+    // **steady-state** (the dual SS equilibration reads a fixed per-cycle `t_inf` with no
+    // modeled-window jet yet), or (b) any modeled dose's `D{cmt}`/`R{cmt}` slot is absent
+    // (`check_model_data` rejects such a model, but emit FD rather than a wrong gradient if
+    // one slips past — the walk's `inf_eff` would silently fall to the unresolved fixed arm).
     if !subject.all_doses_fixed() {
-        return None;
+        let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
+        let attr_map = model.active_dose_attr_map();
+        let all_slots_present = subject.doses.iter().all(|d| {
+            matches!(d.rate_mode, crate::types::RateMode::Fixed)
+                || modeled_slot_for(attr_map, d).is_some()
+        });
+        if has_ss || !all_slots_present {
+            return None;
+        }
     }
     // IOV + `ExpressionScale` `obs_scale` is served as a post-walk quotient. The scale
     // materialisation mirrors production `predict_iov`: one scale per occasion group,

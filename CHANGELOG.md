@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
+  exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
+  (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK
+  jet, and the moving infusion-end boundary carries `∂/∂{θ,η,κ}` — including when the
+  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`). Steady-state modeled doses
+  stay on the finite-difference fallback for now.
 - A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
   **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences

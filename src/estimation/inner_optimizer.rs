@@ -196,8 +196,24 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         return "model outside IOV analytic scope";
     }
     if model.ode_spec.is_some() {
+        // Modeled-`RATE`/duration doses are analytic under IOV since #486 (the per-occasion
+        // modeled-window jet rides the rate-off saltation), EXCEPT when also steady-state
+        // (the dual SS equilibration has no modeled-window jet yet) or when a `D{cmt}`/`R{cmt}`
+        // slot is absent — mirror `ode_iov_subject_supported`'s screen so a modeled+SS subject
+        // is attributed to SS, not to the (now-analytic) modeled dose itself.
         if !subject.all_doses_fixed() {
-            return "modeled RATE/DURATION dose";
+            let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
+            if has_ss {
+                return "steady-state + modeled RATE/DURATION dose";
+            }
+            let attr_map = model.active_dose_attr_map();
+            let all_slots_present = subject.doses.iter().all(|d| {
+                matches!(d.rate_mode, crate::types::RateMode::Fixed)
+                    || crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some()
+            });
+            if !all_slots_present {
+                return "modeled RATE/DURATION dose with missing D/R slot";
+            }
         }
         // Mirror the SS gates of `ode_iov_subject_supported`, in the same order
         // (they are checked *before* the occasion/axis gates below, so omitting
@@ -3595,6 +3611,100 @@ mod iov_tests {
         assert_eq!(
             iov_fd_reason(&model, &subject),
             "steady-state dose + estimated lagtime"
+        );
+    }
+
+    /// Regression (#486): modeled-`RATE`/duration doses are analytic under IOV, except when
+    /// also steady-state. `iov_fd_reason` must attribute a modeled + SS subject to steady
+    /// state — not to the (now-analytic) modeled dose alone — mirroring the relaxed
+    /// `ode_iov_subject_supported` screen, whose `has_ss` check fires first.
+    #[test]
+    fn iov_fd_reason_attributes_modeled_dose_steady_state_bail() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVD1(5.0,0.1,24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_D1 ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  D1 = TVD1 * exp(ETA_D1)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV + modeled D1");
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                true,
+                24.0,
+                crate::types::RateMode::ModeledDuration,
+            )],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "modeled + SS subject must route to FD"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "steady-state + modeled RATE/DURATION dose"
+        );
+    }
+
+    /// Regression (#486): a modeled dose whose `D{cmt}`/`R{cmt}` slot is undeclared (normally
+    /// rejected by `check_model_data`, but defended here) routes to FD and is attributed to the
+    /// missing slot — not silently mis-resolved. The base model declares no `D1`, so the
+    /// `ModeledDuration` dose finds no duration slot.
+    #[test]
+    fn iov_fd_reason_attributes_modeled_dose_missing_slot() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV without D1");
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            )],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "modeled dose with missing slot must route to FD"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "modeled RATE/DURATION dose with missing D/R slot"
         );
     }
 

@@ -730,11 +730,22 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     if !ode.diffusion_var.is_empty() {
         return false;
     }
-    // `integrate_tvcov_g` now carries input-rate (`R_in`) forcing (#486), but that
-    // support has only been validated on the non-IOV event-driven walk; extending
-    // IOV to built-in absorption models is an unaudited scope expansion, not a
-    // technical limitation of the walk itself, so it still routes to FD here.
-    if !ode.input_rate.is_empty() {
+    // Built-in absorption input-rate forcing under IOV (#486). The shared
+    // `integrate_tvcov_g` walk delivers each forcing per-occasion — its rate/window is
+    // rebuilt from that dose's own occasion-seeded `pk_at_dose[k]` jet, so κ rides through
+    // exactly as η/θ do — so `zero_order(dur)` and `first_order` (hence a `mixed`
+    // `FR·first_order + FR·zero_order` dose) are analytic under IOV, mirroring the non-IOV
+    // TV-cov walk (#653). The other kinds (igd / transit / weibull / parallel) under IOV
+    // stay unaudited → FD; the SS × input-rate combination is declined per subject in
+    // `ode_iov_subject_supported` (the SS dual equilibration's zero-order/forcing handling
+    // is not yet validated under κ).
+    if ode.input_rate.iter().any(|f| {
+        !matches!(
+            f.kind,
+            crate::pk::absorption::InputRateKind::ZeroOrder
+                | crate::pk::absorption::InputRateKind::FirstOrder
+        )
+    }) {
         return false;
     }
     // No constant `ScalarScale`/LTBS, no per-cmt/indexed F, no seeded initial state (the
@@ -2301,6 +2312,21 @@ fn ode_iov_subject_supported(
             .as_ref()
             .and_then(|o| o.rhs_program.as_ref())
             .is_some_and(|p| p.uses_time_vars())
+    {
+        return None;
+    }
+    // #486: a steady-state dose combined with a built-in absorption input-rate forcing
+    // (`zero_order`/`first_order`, admitted under IOV by `ode_iov_supported`) is declined —
+    // the dual SS equilibration (`equilibrate_ss_state_g`) seeds a bolus/infusion trough and
+    // does not spread a periodic zero-order window (or a first-order R_in tail) over the
+    // cycle, so its κ-coupled sensitivity is not yet validated. Non-SS input-rate + IOV is
+    // the analytic scope this PR opens; SS × input-rate stays FD (as it effectively is on the
+    // non-IOV walk for the same equilibration reason).
+    if has_ss
+        && model
+            .ode_spec
+            .as_ref()
+            .is_some_and(|o| !o.input_rate.is_empty())
     {
         return None;
     }

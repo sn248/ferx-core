@@ -8493,6 +8493,227 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
     }
 
+    const ZERO_ORDER_IOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVDUR(5.0, 0.1, 24.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.04
+  omega ETA_DUR ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL + KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **ODE IOV + `zero_order(dur)` absorption** (#486). The last zero-order gap after
+    /// #653 ported the moving-boundary window to the non-IOV event-driven walk: the IOV
+    /// walk is the *same* `integrate_tvcov_g`, so once `ode_iov_supported` admits a
+    /// `ZeroOrder` forcing the κ-coupled window rides through — its rate `F·amt/dur` and
+    /// window end `t_dose + dur` are rebuilt from each dose's own per-occasion stacked PK
+    /// jet (`pk_at_dose[k]`, seeded by `seed_pk_dual2_iov`). Validated vs central FD of
+    /// `predict_iov`. `DUR ≈ 5`, so obs at 1 (inside) / 6 (after) straddle the first window
+    /// end and 25 / 30 the second, exercising the rate-off saltation per occasion.
+    #[test]
+    fn ode_iov_zero_order_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 3);
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "zero_order model must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 5.0];
+        // stacked = [η_cl, η_v, η_dur, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        let stacked = [0.12, -0.08, 0.05, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked
+            )
+            .is_some(),
+            "zero_order ODE IOV subject (no SS) must be served analytically (#486)"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **ODE IOV + κ-coupled `zero_order(dur)`** (#486 — the κ-axis-placement guard). Here
+    /// the window itself varies by occasion (`DUR = TVDUR·exp(ETA_DUR + KAPPA_DUR)`), so each
+    /// occasion's zero-order window has a different length. This pins that the `∂/∂DUR`
+    /// rate-off column lands in the correct κ-group axis of the stacked vector (central FD of
+    /// `predict_iov`, which rebuilds `DUR` from each occasion's κ, is the independent oracle).
+    #[test]
+    fn ode_iov_zero_order_kappa_coupled_matches_fd_of_predict_iov() {
+        const KCOUPLED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVDUR(5.0, 0.1, 24.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.04
+  omega ETA_DUR ~ 0.04
+  kappa KAPPA_DUR ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR * exp(ETA_DUR + KAPPA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(KCOUPLED).expect("parse κ-coupled zero_order IOV");
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, η_dur, κ_g0, κ_g1]; κ on DUR → each occasion's window differs.
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.06, -0.11],
+        );
+    }
+
+    const MIXED_IOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(5.0, 0.1, 24.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_DUR ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  FZO  = TVFZO
+  FZO1 = 1 - TVFZO
+  KA   = TVKA
+  DUR  = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **ODE IOV + `mixed` (first-order + zero-order) absorption** (#486). Exercises both
+    /// admitted forcing kinds together: the pointwise first-order `R_in` and the zero-order
+    /// window are delivered concurrently per occasion, and the `frac` (FZO / FZO1) multiplier
+    /// rides each rate. Validated vs central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_mixed_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(MIXED_IOV_ODE).expect("parse mixed IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 2);
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "mixed (first_order + zero_order) must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 0.4, 1.0, 5.0];
+        // stacked = [η_cl, η_dur, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        let stacked = [0.12, 0.05, 0.06, -0.11];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **Still-FD edge: built-in absorption + steady state under IOV** (#486). The dual SS
+    /// equilibration (`equilibrate_ss_state_g`) seeds a bolus/infusion trough and does not
+    /// spread a periodic zero-order window (or a first-order `R_in` tail) over the cycle, so
+    /// a `zero_order` + SS subject routes to FD on BOTH loops. Also pins that a non-admitted
+    /// forcing kind (`weibull`) under IOV stays FD at the model gate.
+    #[test]
+    fn ode_iov_zero_order_ss_falls_back_to_fd() {
+        let model = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        let theta = [0.2, 10.0, 5.0];
+        let stacked = [0.12, -0.08, 0.05, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked
+            )
+            .is_none(),
+            "zero_order + SS must route to FD under IOV (outer, #486)"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_subject_eta_grad_iov(&model, &subject, &theta, &stacked)
+                .is_none(),
+            "zero_order + SS must route to FD under IOV (inner, scope parity)"
+        );
+        // A non-admitted input-rate kind (weibull) stays FD at the model gate.
+        const WEIBULL_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVTD(2.0, 0.05, 24.0)
+  theta TVBETA(1.5, 0.1, 10.0)
+  omega ETA_CL   ~ 0.09
+  omega ETA_BETA ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  TD   = TVTD
+  BETA = TVBETA * exp(ETA_BETA)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let weibull = parse_model_string(WEIBULL_IOV).expect("parse weibull IOV");
+        assert!(
+            !crate::sens::ode_provider::ode_iov_supported(&weibull),
+            "weibull forcing under IOV stays FD (#486 scope)"
+        );
+    }
+
     /// Regression (#575 review): a plain `ScalingSpec::None` IOV ODE model under LTBS
     /// (`log_transform`, no `obs_scale`) must stay on FD. The #575 gate rewrite replaced
     /// the `|| model.log_transform` bail with a `match`, and the `None` arm initially

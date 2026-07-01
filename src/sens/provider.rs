@@ -744,13 +744,20 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.log_transform || model.has_lagtime() {
         return false;
     }
-    // Initial-compartment amounts (#521) ARE differentiable by the analytic kernels
-    // now (#524), but only on the dose-superposition path: the init impulse is
-    // layered per-subject in `subject_sensitivities` / `subject_eta_grad`, not in the
-    // IOV event-driven walk, which would have to re-seed the `A₀·kernel` baseline into
-    // each occasion block. Until that occasion-block seeding lands, an IOV + init
-    // model falls back to FD (see `analytical_supported` for the non-IOV exact path).
-    if !model.analytical_init.is_empty() {
+    // Initial-compartment amounts (#521) are now differentiable on the IOV event-driven walk
+    // too (#486): `run_obs_iov` / `run_obs_iov_eta` layer the `A₀·kernel(t, pk)` impulse per
+    // occasion — the amount `A₀` from the BSV-only snapshot (`bsv_amount`, κ = 0) and the decay
+    // kernel from each observation's occasion source — mirroring production's
+    // `add_analytical_init_with(..., amount_pk = BSV, Some(obs_params))` in `predict_iov`.
+    // A hand-built init with no `amount_deriv` program still routes to FD (the impulse loop
+    // would otherwise silently drop it), so require every init to carry its amount program; the
+    // stacked axis count `n_theta + n_stacked` is bounded by the walk's `1..=24` dispatch (out
+    // of range → the walk returns `None` → FD).
+    if model
+        .analytical_init
+        .iter()
+        .any(|i| i.amount_deriv.is_none())
+    {
         return false;
     }
     let n_eff = model.n_eta + model.n_kappa;
@@ -846,7 +853,7 @@ pub fn subject_sensitivities_iov(
                 $($m => run_obs_iov::<$m>(
                     model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
                     &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
-                    s.n_theta, s.scale_groups.as_deref(),
+                    s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
                 ),)+
                 _ => None,
             }
@@ -883,6 +890,13 @@ struct IovSources {
     /// are per-event — the closed-form twin of the ODE-IOV `build_all_groups` scale seed
     /// (#575/#590, ported in #486).
     scale_groups: Option<Vec<(crate::types::PkParams, CombinedDerivs)>>,
+    /// For an `[initial_conditions]` baseline under IOV (#486): the `(pk, combined-derivs)`
+    /// at the **BSV-only** snapshot (`κ = 0`, subject-static covariates, `t = 0`), driving the
+    /// baseline *amount* `A₀`. Production's `predict_iov` evaluates the amount with `eta_bsv`
+    /// (no κ) while the *decay* kernel uses each observation's occasion PK params, so the amount
+    /// carries `∂A₀/∂(θ, η_bsv)` but zero `∂A₀/∂κ`. `None` when the model has no
+    /// `[initial_conditions]`.
+    bsv_amount: Option<(crate::types::PkParams, CombinedDerivs)>,
 }
 
 fn build_iov_sources(
@@ -1089,6 +1103,19 @@ fn build_iov_sources(
         }
     }
 
+    // `[initial_conditions]` baseline amount snapshot (#486): the BSV-only effect
+    // (`combined_pk_only` = `[η_bsv, κ = 0]`) at the subject-static covariates and `t = 0`,
+    // matching production's `add_analytical_init_with(..., amount_pk = pk_param_fn(θ, eta_bsv,
+    // subject.covariates, 0), ...)`. The decay kernel uses each observation's occasion source
+    // (built above); only the amount uses this κ-less snapshot.
+    let bsv_amount = if model.analytical_init.is_empty() {
+        None
+    } else {
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
+        let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
+        Some((pk, cd))
+    };
+
     Some(IovSources {
         sources,
         dose_src,
@@ -1101,6 +1128,7 @@ fn build_iov_sources(
         n_stacked,
         n_theta,
         scale_groups,
+        bsv_amount,
     })
 }
 
@@ -1127,7 +1155,7 @@ fn subject_eta_grad_iov_analytical(
                 $($n => run_obs_iov_eta::<$n>(
                     model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
                     &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
-                    s.scale_groups.as_deref(),
+                    s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
                 ),)+
                 _ => None,
             }
@@ -1166,6 +1194,7 @@ fn run_obs_iov<const M: usize>(
     n_stacked: usize,
     n_theta: usize,
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
+    bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -1324,6 +1353,89 @@ fn run_obs_iov<const M: usize>(
         });
     }
 
+    // Analytic `[initial_conditions]` impulse under IOV (#486): layer `A₀·kernel(t, pk)` onto
+    // every pre-reset observation BEFORE scaling — the closed-form IOV twin of the non-IOV
+    // `apply_analytical_init_outer` and of production's `add_analytical_init_with(..., amount_pk
+    // = BSV snapshot, Some(obs_params))`. The amount `A₀` is built from the BSV-only snapshot
+    // (`bsv_amount`, κ = 0), so it carries `∂A₀/∂(θ, η_bsv)` but zero `∂A₀/∂κ`; the decay kernel
+    // uses each observation's occasion source (`sources[obs_src[j]]`), so it carries the
+    // occasion κ. Their `Dual2<M>` product on the stacked axes is exact.
+    if let Some((pk_bsv, cd_bsv)) = bsv_amount {
+        let first_reset = subject
+            .reset_times
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        for init in &model.analytical_init {
+            let Some(prog) = &init.amount_deriv else {
+                continue;
+            };
+            // Baseline amount `A₀` seeded on the stacked axes from the BSV snapshot (group
+            // `None` → κ axes dropped, matching production's κ-less amount). `eval_scale_dual`
+            // seeds direct θ/η references on axes `0..n_theta` / `n_theta..n_theta+n_eta` — the
+            // stacked η_bsv block — so the amount's jet lands on the correct axes.
+            let a0_var_duals: Vec<Dual2<M>> = prog
+                .var_to_pk_slot()
+                .iter()
+                .map(|&s| match slot_row[s] {
+                    Some(i) => seed(
+                        cd_bsv,
+                        None,
+                        i,
+                        pk_bsv.values.get(s).copied().unwrap_or(0.0),
+                    ),
+                    None => Dual2::<M>::constant(pk_bsv.values.get(s).copied().unwrap_or(0.0)),
+                })
+                .collect();
+            let a0 = prog.eval_scale_dual::<M>(theta, eta_bsv, cov, &a0_var_duals);
+            if !a0.value.is_finite() {
+                continue;
+            }
+            for (j, o) in obs_out.iter_mut().enumerate() {
+                let t = subject.obs_times[j];
+                if t < 0.0 || t >= first_reset {
+                    continue;
+                }
+                // Decay kernel PK duals at observation `j`'s own occasion source (κ carried).
+                let (pk_d, cd_d, group_d) = &sources[obs_src[j]];
+                let dv = |slot: usize, val: f64| -> Dual2<M> {
+                    match slot_row[slot] {
+                        Some(i) => seed(cd_d, *group_d, i, val),
+                        None => Dual2::<M>::constant(val),
+                    }
+                };
+                let c = crate::pk::analytical_init_concentration_g::<Dual2<M>>(
+                    model.pk_model,
+                    init.cmt,
+                    a0,
+                    Dual2::<M>::constant(t),
+                    dv(PK_IDX_CL, pk_d.cl()),
+                    dv(PK_IDX_V, pk_d.v()),
+                    dv(PK_IDX_Q, pk_d.q()),
+                    dv(PK_IDX_V2, pk_d.v2()),
+                    dv(PK_IDX_KA, pk_d.ka()),
+                    dv(PK_IDX_Q3, pk_d.q3()),
+                    dv(PK_IDX_V3, pk_d.v3()),
+                );
+                o.f += c.value;
+                for p in 0..n_stacked {
+                    o.df_deta[p] += c.grad[n_theta + p];
+                    for q in 0..n_stacked {
+                        o.d2f_deta2[p * n_stacked + q] += c.hess[n_theta + p][n_theta + q];
+                    }
+                    for m in 0..n_theta {
+                        o.d2f_deta_dtheta[p * n_theta + m] += c.hess[n_theta + p][m];
+                    }
+                }
+                for m in 0..n_theta {
+                    o.df_dtheta[m] += c.grad[m];
+                }
+            }
+        }
+    }
+
     // η-dependent `ExpressionScale` `obs_scale` divisor: one scale jet per occasion group
     // (the divisor depends on the group's κ through the PK params), applied as a post-walk
     // quotient over the stacked `(θ, η_bsv, κ)` axes — the closed-form twin of the ODE-IOV
@@ -1379,6 +1491,7 @@ fn run_obs_iov_eta<const N: usize>(
     n_kappa: usize,
     n_stacked: usize,
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
+    bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -1492,6 +1605,74 @@ fn run_obs_iov_eta<const N: usize>(
         });
     }
 
+    // Analytic `[initial_conditions]` impulse under IOV — η-gradient only (#486): the inner
+    // twin of the `run_obs_iov` outer impulse. Amount `A₀` from the BSV snapshot (`bsv_amount`,
+    // κ = 0) via `eval_scale_dual1` (seeds η_bsv on axes `0..n_eta`), decay kernel per obs from
+    // that observation's occasion source (κ carried); their `Dual1<N>` product's `∂/∂stacked-η`
+    // is folded onto every pre-reset observation's η-gradient, keeping the inner EBE gradient
+    // consistent with the outer walk and with production's `add_analytical_init_with`.
+    if let Some((pk_bsv, cd_bsv)) = bsv_amount {
+        let first_reset = subject
+            .reset_times
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        for init in &model.analytical_init {
+            let Some(prog) = &init.amount_deriv else {
+                continue;
+            };
+            let a0_var_duals: Vec<Dual1<N>> = prog
+                .var_to_pk_slot()
+                .iter()
+                .map(|&s| match slot_row[s] {
+                    Some(i) => seed(
+                        cd_bsv,
+                        None,
+                        i,
+                        pk_bsv.values.get(s).copied().unwrap_or(0.0),
+                    ),
+                    None => Dual1::<N>::constant(pk_bsv.values.get(s).copied().unwrap_or(0.0)),
+                })
+                .collect();
+            let a0 = prog.eval_scale_dual1::<N>(theta, eta_bsv, cov, &a0_var_duals);
+            if !a0.value.is_finite() {
+                continue;
+            }
+            for (j, o) in out.iter_mut().enumerate() {
+                let t = subject.obs_times[j];
+                if t < 0.0 || t >= first_reset {
+                    continue;
+                }
+                let (pk_d, cd_d, group_d) = &sources[obs_src[j]];
+                let dv = |slot: usize, val: f64| -> Dual1<N> {
+                    match slot_row[slot] {
+                        Some(i) => seed(cd_d, *group_d, i, val),
+                        None => Dual1::<N>::constant(val),
+                    }
+                };
+                let c = crate::pk::analytical_init_concentration_g::<Dual1<N>>(
+                    model.pk_model,
+                    init.cmt,
+                    a0,
+                    Dual1::<N>::constant(t),
+                    dv(PK_IDX_CL, pk_d.cl()),
+                    dv(PK_IDX_V, pk_d.v()),
+                    dv(PK_IDX_Q, pk_d.q()),
+                    dv(PK_IDX_V2, pk_d.v2()),
+                    dv(PK_IDX_KA, pk_d.ka()),
+                    dv(PK_IDX_Q3, pk_d.q3()),
+                    dv(PK_IDX_V3, pk_d.v3()),
+                );
+                o.f += c.value;
+                for p in 0..n_stacked {
+                    o.df_deta[p] += c.grad[p];
+                }
+            }
+        }
+    }
+
     // η-only `ExpressionScale` `obs_scale` quotient, one scale jet per occasion group —
     // the first-order counterpart of the `run_obs_iov` post-walk step (#575/#590).
     if let Some(scale_groups) = scale_groups {
@@ -1544,17 +1725,16 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     if !analytical_supported_core(model) || model.has_lagtime() || model.log_transform {
         return false;
     }
-    // The TV-cov event-driven walk does not yet layer the analytic
-    // `[initial_conditions]` impulse — #524 added exact init gradients only to the
-    // dose-superposition path (`subject_sensitivities` / `subject_eta_grad`), not to
-    // `run_obs_tvcov`. Production's `compute_predictions_with_tv`, however, always
-    // adds the `A₀·kernel` baseline. Admitting an init model here would walk a
-    // gradient that omits the init while the objective keeps it — a silent mismatch
-    // that biases the FOCE/FOCEI gradient (outer and inner). Decline init models so
-    // their TV-cov / oral-infusion subjects fall back to FD (which differentiates the
-    // true objective); their non-TV-cov subjects still take the exact init path. Lift
-    // this once the walk carries the init impulse (#524 follow-up).
-    if !model.analytical_init.is_empty() {
+    // The TV-cov event-driven walk now layers the analytic `[initial_conditions]` impulse
+    // (#486, branch H): `subject_sensitivities_tvcov` / `subject_eta_grad_tvcov` fold in
+    // `A₀·kernel(t, pk)` via `apply_tvcov_init_{outer,inner}` — the exact `(θ,η)` jet at the
+    // subject-static `t = 0` snapshot — BEFORE scaling, matching production's
+    // `add_analytical_init` on `compute_predictions_with_tv` (which uses that same snapshot for
+    // both amount and decay, so the impulse is independent of the TV-cov switching). Require
+    // `init_supported` so the `(θ,η)` axis count fits the `dispatch_init_impulse!` table (the
+    // impulse dispatch's `_` arm would otherwise silently drop it); a hand-built init with no
+    // `amount_deriv` program still routes to FD there.
+    if !init_supported(model) {
         return false;
     }
     // Bound total axes to the dual-walk dispatch cap so the outer (`m_dim`) and inner
@@ -1741,6 +1921,124 @@ fn modeled_dose_inf_duals<T: crate::sens::num::PkNum>(
 /// `compute_predictions_with_tv` does over `f64`. EVID=2 (`pk_only`) covariate
 /// breakpoints between observations are seeded and walked too. Returns `None`
 /// outside the supported scope (caller falls back to FD).
+/// Layer the analytic `[initial_conditions]` impulse onto a **TV-cov walk**'s `SubjectSens`
+/// (#486, branch H — the closed-form analogue of #649's ODE `tvcov_init_state`). Production's
+/// `add_analytical_init` (`pk/mod.rs`) adds `A₀·kernel(t, pk)` with a single subject-static
+/// `t = 0` snapshot — `pk_param_fn(θ, η, subject.covariates, 0)` — for both the baseline amount
+/// and its decay kernel, even for a TV-cov subject (the init impulse is independent of the
+/// time-varying-covariate switching). So compute that snapshot's `ParamDerivs` and fold in the
+/// impulse via the SAME [`apply_analytical_init_outer`] the dose-superposition provider uses,
+/// BEFORE scaling. Returns `Some(())` (no-op) when the model has no `[initial_conditions]`, and
+/// `None` when the exact `∂p/∂(θ,η)` can't be built (non-log-normal η with no program) so the
+/// caller falls back to FD. `tvcov_analytical_supported`'s `init_supported` clause bounds the
+/// axis count to the `dispatch_init_impulse!` table, so the `_` arm never silently drops it.
+fn apply_tvcov_init_outer(
+    sens: &mut SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    if model.analytical_init.is_empty() {
+        return Some(());
+    }
+    let n_theta = model.n_theta;
+    let n_eta = model.n_eta;
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let (pd, slots): (crate::sens::ode_provider::ParamDerivs, Vec<usize>) = match model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|prog| prog_covers_required_pk_slots(model, prog))
+        .and_then(|prog| {
+            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
+                .map(|pd| (pd, prog.pk_slots()))
+        }) {
+        Some(v) => v,
+        None => {
+            if !model
+                .eta_param_info
+                .iter()
+                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
+            {
+                return None;
+            }
+            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
+            (pd, model.pk_indices.clone())
+        }
+    };
+    dispatch_init_impulse!(
+        n_theta + n_eta,
+        apply_analytical_init_outer,
+        sens,
+        model,
+        subject,
+        &pk,
+        &pd,
+        &slots,
+        theta,
+        eta,
+        &subject.covariates,
+        n_theta,
+        n_eta
+    );
+    Some(())
+}
+
+/// Inner (`Dual1`, η-gradient only) counterpart of [`apply_tvcov_init_outer`] — layers the
+/// analytic `[initial_conditions]` impulse onto a TV-cov walk's `ObsGrad` list before scaling,
+/// via [`apply_analytical_init_inner`] on the subject-static `t = 0` snapshot's `∂p/∂η`.
+fn apply_tvcov_init_inner(
+    out: &mut [ObsGrad],
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    if model.analytical_init.is_empty() {
+        return Some(());
+    }
+    let n_eta = model.n_eta;
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let (dp_deta, slots): (Vec<Vec<f64>>, Vec<usize>) = match model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|prog| prog_covers_required_pk_slots(model, prog))
+        .and_then(|prog| {
+            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
+                .map(|pd| (pd.dp_deta, prog.pk_slots()))
+        }) {
+        Some(v) => v,
+        None => {
+            if !model
+                .eta_param_info
+                .iter()
+                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
+            {
+                return None;
+            }
+            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
+            (pd.dp_deta, model.pk_indices.clone())
+        }
+    };
+    dispatch_init_impulse!(
+        n_eta,
+        apply_analytical_init_inner,
+        out,
+        model,
+        subject,
+        &pk,
+        &dp_deta,
+        &slots,
+        theta,
+        eta,
+        &subject.covariates,
+        n_eta
+    );
+    Some(())
+}
+
 pub fn subject_sensitivities_tvcov(
     model: &CompiledModel,
     subject: &Subject,
@@ -1802,6 +2100,11 @@ pub fn subject_sensitivities_tvcov(
     let mut sens = disp!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
     )?;
+
+    // Analytic `[initial_conditions]` impulse (#486): layer `A₀·kernel(t, pk)` and its exact
+    // `(θ,η)` jet onto every pre-reset observation BEFORE scaling — the same insertion order as
+    // the f64 `pk::add_analytical_init` on the production TV-cov path (`compute_predictions_with_tv`).
+    apply_tvcov_init_outer(&mut sens, model, subject, theta, eta)?;
 
     // Constant `ScalarScale` output divisor `f_scaled = f/k`: every derivative is
     // linear in `f` and `k` is constant, so the whole jet divides by `k` — matches
@@ -2090,6 +2393,11 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     let mut out = disp!(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
     )?;
+
+    // Analytic `[initial_conditions]` impulse (#486): η-gradient only, layered BEFORE scaling —
+    // the inner twin of the outer TV-cov init impulse (keeps the inner EBE gradient consistent
+    // with the outer, and with production's `add_analytical_init`).
+    apply_tvcov_init_inner(&mut out, model, subject, theta, eta)?;
 
     // Constant `ScalarScale` divisor: `∂(f/k)/∂η = (∂f/∂η)/k` (η-independent `k`),
     // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS keeps the FD inner —
@@ -5158,27 +5466,28 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    /// #527/#524 review (finding #1): an `[initial_conditions]` model whose subject
-    /// has time-varying covariates must fall back to FD, because the TV-cov walk
-    /// never layers the init impulse. Before the fix `tvcov_analytical_supported`
-    /// returned `true` for the model and the walk silently dropped the `A₀·kernel`
-    /// baseline from the FOCE/FOCEI gradient (outer and inner) while the objective —
-    /// which uses the init-aware f64 predictor — kept it, biasing the estimates. The
-    /// non-TV-cov subjects of the same model must still take the exact init path.
+    /// **Closed-form `init(...)` on the event-driven TV-cov walk** (#486, branch H). An
+    /// `init(central) = TVC0·V` baseline under a WT covariate on CL (TV-cov). Production's
+    /// `compute_predictions_with_tv` layers `A₀·kernel(t, pk)` with the subject-static `t = 0`
+    /// snapshot; the TV-cov provider now folds in the same impulse via `apply_tvcov_init_outer` /
+    /// `apply_tvcov_init_inner`. The full provider's value / `∂η` / `∂²η` / `∂θ` / `∂²η∂θ` must
+    /// match FD of the production predictor (which keeps the init), the inner `∂f/∂η` must equal
+    /// the outer η-block, and a static-covariate subject of the same model still takes the exact
+    /// dose-superposition init path.
     #[test]
-    fn analytical_init_tvcov_subject_falls_back_to_fd() {
+    fn analytical_init_tvcov_subject_matches_fd() {
         let m = parse_model_string(ONECPT_IV_TVCOV_INIT).expect("parse");
         assert_eq!(m.analytical_init.len(), 1, "init parsed");
         assert!(
-            !tvcov_analytical_supported(&m),
-            "init model must decline TV-cov analytic support (walk omits the init)"
+            tvcov_analytical_supported(&m),
+            "init model is now analytic on the TV-cov walk (#486)"
         );
 
         let theta = vec![0.2, 10.0, 0.75, 4.0];
         let eta = vec![0.15, -0.10];
 
-        // TV-cov subject (WT changes across records): outer full provider AND inner
-        // η-gradient must decline so the caller falls back to FD.
+        // (a) TV-cov subject (WT changes across records): outer full provider matches FD of
+        // production (which includes the init), and the inner η-gradient matches the outer.
         let tv = tvcov_subject(
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             &[70.0],
@@ -5190,16 +5499,44 @@ mod tests {
         );
         assert!(tv.has_tv_covariates(), "fixture must carry TV covariates");
         assert!(
-            subject_sensitivities(&m, &tv, &theta, &eta).is_none(),
-            "TV-cov init subject must fall back to FD, not the init-less walk"
+            subject_sensitivities(&m, &tv, &theta, &eta).is_some(),
+            "TV-cov init subject now takes the analytic provider (#486)"
         );
-        assert!(
-            subject_eta_grad(&m, &tv, &theta, &eta).is_none(),
-            "inner η-gradient must fall back to FD too"
-        );
+        check_full_provider_vs_fd(&m, &tv, &theta, &eta);
+        let outer = subject_sensitivities_tvcov(&m, &tv, &theta, &eta).expect("outer tvcov init");
+        let inner = subject_eta_grad_tvcov(&m, &tv, &theta, &eta).expect("inner tvcov init");
+        assert_eq!(outer.obs.len(), inner.len());
+        for (o, i) in outer.obs.iter().zip(inner.iter()) {
+            approx::assert_relative_eq!(o.f, i.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    o.df_deta[k],
+                    i.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-10
+                );
+            }
+        }
 
-        // A static-covariate subject of the SAME model still takes the exact analytic
-        // init path (dose superposition + layered impulse).
+        // (b) TV-cov + EVID 3/4 reset: the closed-form init impulse contributes only to
+        // observations strictly before the first reset (production `add_analytical_init`), and
+        // the reset itself is carried by the TV-cov walk — the combination must still match FD.
+        let tv_reset = tvcov_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[70.0, 90.0],
+            &[2.0, 6.0, 13.0, 18.0],
+            &[70.0, 70.0, 90.0, 90.0],
+            vec![12.0],
+            Vec::new(),
+            &[],
+        );
+        check_full_provider_vs_fd(&m, &tv_reset, &theta, &eta);
+
+        // (c) A static-covariate subject of the SAME model still takes the exact analytic init
+        // path (dose superposition + layered impulse).
         let mut stat = oral_subject(&[1.0, 2.0, 4.0, 8.0]);
         stat.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         stat.covariates = wt_map(70.0);
@@ -7690,6 +8027,69 @@ mod tests {
         }
     }
 
+    // 1-cpt IV closed-form IOV with an `init(central) = TVC0·V` baseline (#486, branch
+    // G-closed-form). `CL = TVCL·exp(ETA_CL + KAPPA_CL)` carries the occasion κ, so the init
+    // *decay* kernel depends on κ (via each observation's occasion clearance) while the init
+    // *amount* `A₀ = TVC0·V` is BSV-only (no κ) — exactly production's split in `predict_iov`
+    // (`add_analytical_init_with(amount_pk = BSV, Some(obs_params))`).
+    const WARFARIN_IOV_INIT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVC0(5.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[initial_conditions]
+  init(central) = TVC0 * V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// **`init(...)` × IOV on the closed-form walk** (#486, branch G-closed-form). The IOV
+    /// provider now layers the `A₀·kernel(t, pk)` init impulse per occasion: the amount from the
+    /// BSV snapshot (κ = 0), the decay from each observation's occasion clearance (κ carried).
+    /// The full provider's value / `∂(stacked-η)` / Hessian / `∂θ` must match FD of `predict_iov`
+    /// (which includes the init), and the inner η-gradient must equal the outer η-block.
+    #[test]
+    fn iov_init_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_INIT).expect("parse warfarin IOV+init");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.analytical_init.len(), 1, "init parsed");
+        assert!(model.ode_spec.is_none(), "closed-form model");
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV + init must be analytic (#486)"
+        );
+        let subject = iov_subject();
+        // θ = [TVCL, TVV, TVC0]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn iov_init_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_INIT).expect("parse warfarin IOV+init"),
+            &iov_subject(),
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     const WARFARIN_IOV_2CPT: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -9698,6 +10098,145 @@ mod tests {
             &parse_model_string(WARFARIN_IOV_TVCOV_ODE).expect("parse ODE IOV+TV-cov"),
             &iov_tvcov_subject(true),
             &[0.2, 10.0, 0.75],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    // 1-cpt IV ODE IOV + TV-cov with a **κ-coupled `init(...)` baseline**: `init(central) =
+    // BASE` where `BASE = TVBASE·exp(ETA_V + KAPPA_CL)` carries η_v *and* the occasion κ, so the
+    // event-driven IOV walk's `tvcov_init_state` seed (built from the first-record snapshot's
+    // stacked `(θ, η_bsv, κ)` duals) must fold `∂init/∂κ` onto the correct occasion axis (#486).
+    const WARFARIN_IOV_ODE_INIT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVBASE(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BASE = TVBASE * exp(ETA_V + KAPPA_CL)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **`init(...)` × IOV on the ODE walk** (#486, branch G-ODE). A κ-coupled `init(central) =
+    /// BASE` baseline (`BASE = TVBASE·exp(ETA_V + KAPPA_CL)`) on a 1-cpt IV ODE IOV + TV-cov
+    /// subject. The IOV outer/inner run through the same `integrate_tvcov_readout` the non-IOV
+    /// walk uses, so `tvcov_init_state` already seeds `init` from the first-record snapshot's
+    /// stacked `(θ, η_bsv, κ)` duals — the Taylor deltas carry `∂init/∂κ` onto the correct
+    /// occasion axis with no IOV-specific code. Validated against FD of `predict_iov` over the
+    /// full stacked layout, plus inner/outer η-parity.
+    #[test]
+    fn ode_iov_init_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_INIT).expect("parse ODE IOV+init");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some());
+        assert!(
+            model.ode_spec.as_ref().unwrap().init_fn.is_some(),
+            "fixture must declare an init(...)"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + init must be analytic (#486)"
+        );
+        let subject = iov_tvcov_subject(false);
+        // θ = [TVCL, TVV, THETA_WT, TVBASE]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn ode_iov_init_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_ODE_INIT).expect("parse ODE IOV+init"),
+            &iov_tvcov_subject(false),
+            &[0.2, 10.0, 0.75, 40.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    // ODE IOV with a `first_order` input-rate forcing AND a κ-coupled `init(central) = BASE`
+    // baseline — the composition the #660 (`FirstOrder` under IOV) and #486 (`init` under IOV)
+    // gate relaxations jointly admit. Both ride the same `integrate_tvcov_readout` walk: the
+    // dose feeds `R_in = KA·(remaining)` and the init baseline is seeded from the first-record
+    // stacked snapshot, so the two are orthogonal. This pins that they compose correctly.
+    const WARFARIN_IOV_ODE_INIT_FO: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVBASE(40.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.01, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  KA   = TVKA
+  BASE = TVBASE * exp(ETA_V + KAPPA_CL)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central)  = first_order(ka=KA) - (CL/V) * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **`init(...)` × `first_order` input-rate forcing × IOV on the ODE walk** (#486, the
+    /// combination the #660 and #486 IOV relaxations jointly admit). Validated against FD of
+    /// `predict_iov` over the stacked layout, plus inner/outer parity.
+    #[test]
+    fn ode_iov_init_first_order_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_INIT_FO).expect("parse ODE IOV+init+FO");
+        assert!(!model.ode_spec.as_ref().unwrap().input_rate.is_empty());
+        assert!(model.ode_spec.as_ref().unwrap().init_fn.is_some());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + init + first_order must be analytic"
+        );
+        let subject = iov_tvcov_subject(false);
+        // θ = [TVCL, TVV, THETA_WT, TVBASE, TVKA]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0, 1.2],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+        check_iov_inner_matches_outer(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0, 1.2],
             &[0.12, -0.08, 0.05, -0.10],
         );
     }

@@ -129,7 +129,7 @@ simulated with a CL switch at `TIME = 45` (`IF (TIME.GT.45) CL = TVCL_LATE …`)
 
 | Parameter | ferx (analytic) | NONMEM `METHOD=1 INTER` |
 |-----------|----------------:|------------------------:|
-| OFV       | −3737.384       | −3737.394               |
+| OFV       | −3737.394       | −3737.394               |
 | `TVCL`    | 2.1029 (SE 0.0733) | 2.1029 (SE 0.0736)   |
 | `TVCL_LATE` | 1.0457 (SE 0.0381) | 1.0456 (SE 0.0383) |
 | `TVV`     | 53.107 (SE 1.364) | 53.108 (SE 1.364)     |

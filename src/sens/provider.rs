@@ -215,6 +215,24 @@ enum ExKind {
 /// express a mid-decay parameter switch. The routing (`uses_time_builtin`) is in
 /// [`subject_sensitivities_impl`] / [`subject_eta_grad_impl`] (#486 / #610).
 pub fn analytical_supported(model: &CompiledModel) -> bool {
+    // A `TIME` model does NOT use the static dose-superposition path — its subjects
+    // route through the per-event event-driven walk. So being model-level "analytic"
+    // additionally requires that walk to serve it (`tvcov_analytical_supported`);
+    // otherwise the direct `pk(...=TIME)` mapping (whose mapped slot is not desugared
+    // into the program's `pk_slots`, so `tvcov_analytical_supported` declines it) would
+    // report "analytic" through `sens_supported` / `analytic_outer_gradient_available` /
+    // `analytic_inner_grad_supported_model` while every subject actually falls back to FD
+    // — a route/report drift (#637 review #1). `tvcov_analytical_supported` calls the
+    // non-recursive [`analytical_supported_core`], so there is no cycle.
+    analytical_supported_core(model)
+        && (!crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+            || tvcov_analytical_supported(model))
+}
+
+/// The model-level closed-form scope check shared by [`analytical_supported`] and
+/// [`tvcov_analytical_supported`] — everything except the `TIME`-routing clause, so the
+/// two can compose without recursion (#637 review #1).
+fn analytical_supported_core(model: &CompiledModel) -> bool {
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -884,8 +902,7 @@ fn build_iov_sources(
     // each occasion's PK-param derivatives are evaluated at that event's TIME (#486).
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let cd_at = |time: f64, combined: &[f64], cov: &std::collections::HashMap<String, f64>| {
-        let _time_guard =
-            uses_time.then(|| crate::parser::model_parser::ModelTimeGuard::enter(time));
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         crate::sens::provider::iov_combined_derivs_dyn(
             prog, n_theta, n_eff, n_diff, cov, theta, combined,
         )
@@ -899,7 +916,12 @@ fn build_iov_sources(
     // covariates, so it must take the per-event branch (the one-source-per-group
     // fast path below would freeze every occasion at `t = 0`) — mirroring the
     // non-IOV `run_obs_tvcov` and the f64 `compute_event_pk_params_into` (#486).
-    let has_tv = subject.has_tv_covariates();
+    // `has_tv_covariates()` covers dose/obs snapshots but NOT EVID=2 pk-only snapshots,
+    // so include them explicitly — otherwise a subject whose only per-event covariates
+    // are on pk-only records would take the shared static source and evaluate those
+    // events at the wrong covariates (matches the ODE `seed_iov_events` per-event gate;
+    // #637 Copilot #1).
+    let has_tv = subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty();
     let per_event = has_tv || uses_time;
     let cov_static = &subject.covariates;
     let mut sources: Vec<(crate::types::PkParams, CombinedDerivs, Option<usize>)> = Vec::new();
@@ -1309,7 +1331,10 @@ fn run_obs_iov_eta<const N: usize>(
 /// event's* covariate snapshot via
 /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program).
 pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
-    if !analytical_supported(model) || model.has_lagtime() || model.log_transform {
+    // `analytical_supported_core` (not `analytical_supported`) so a `TIME` model doesn't
+    // recurse: `analytical_supported` calls back here for the `uses_time_builtin` case
+    // (#637 review #1).
+    if !analytical_supported_core(model) || model.has_lagtime() || model.log_transform {
         return false;
     }
     // The TV-cov event-driven walk does not yet layer the analytic
@@ -1444,34 +1469,11 @@ pub fn subject_sensitivities_tvcov(
         }
     }
     // η-dependent `ExpressionScale` divisor `s(θ, η)`: apply the subject-static quotient
-    // `scaled_f = f/s` on the walked jet — the SAME `apply_expression_scale_outer` the
-    // dose-superposition path uses (#486, closing the TV-cov + expression-scale gap).
-    // Production `pk::apply_scaling` evaluates the scale once at the subject-static
-    // covariates and `t = 0` params (`pk_param_fn(..., 0.0)`), so we mirror that: one
-    // scale jet, from `pk`/`pd` at `t = 0`, applied to every observation.
-    if let ScalingSpec::ExpressionScale {
-        deriv: Some(scale_prog),
-        ..
-    } = &model.scaling
-    {
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        let pd = crate::sens::ode_provider::param_derivatives_from_prog(
-            prog, model, subject, theta, eta,
-        )?;
-        let slots = prog.pk_slots();
-        apply_expression_scale_outer(
-            &mut sens,
-            scale_prog,
-            &pk,
-            &pd,
-            &slots,
-            theta,
-            eta,
-            &subject.covariates,
-            n_theta,
-            n_eta,
-        );
-    }
+    // `scaled_f = f/s` on the walked jet — the SAME shared quotient the dose-superposition
+    // path uses (#486, closing the TV-cov + expression-scale gap). Production
+    // `pk::apply_scaling` evaluates the scale once at the subject-static covariates and
+    // `t = 0` params, mirrored inside the helper.
+    apply_event_walk_expression_scale_outer(&mut sens, model, subject, prog, theta, eta)?;
     Some(sens)
 }
 
@@ -1508,8 +1510,7 @@ fn run_obs_tvcov<const M: usize>(
     // — are evaluated at that event's `TIME` (#486 / #610).
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let mk = |time: f64, cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
-        let _time_guard =
-            uses_time.then(|| crate::parser::model_parser::ModelTimeGuard::enter(time));
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
         let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual2<M> {
@@ -1705,32 +1706,10 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
             }
         }
     }
-    // η-dependent `ExpressionScale` divisor: the η-only quotient `∂(f/s)/∂η =
-    // (∂f/∂η)/s − f·(∂s/∂η)/s²` — the light counterpart of the outer
-    // `apply_expression_scale_outer`, matching the static inner path (#486). Subject-static
-    // scale from `pk`/`∂p/∂η` at `t = 0`, applied to every observation.
-    if let ScalingSpec::ExpressionScale {
-        deriv: Some(scale_prog),
-        ..
-    } = &model.scaling
-    {
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        let dp_deta = crate::sens::ode_provider::param_eta_derivatives_from_prog(
-            prog, model, subject, theta, eta,
-        )?;
-        let slots = prog.pk_slots();
-        apply_expression_scale_inner_dispatch(
-            &mut out,
-            scale_prog,
-            &pk,
-            &dp_deta,
-            &slots,
-            theta,
-            eta,
-            &subject.covariates,
-            n_eta,
-        );
-    }
+    // η-dependent `ExpressionScale` divisor: the η-only quotient — the light counterpart
+    // of the outer path, matching the static inner path (#486). Subject-static scale from
+    // `pk`/`∂p/∂η` at `t = 0`, applied to every observation (shared helper).
+    apply_event_walk_expression_scale_inner(&mut out, model, subject, prog, theta, eta)?;
     Some(out)
 }
 
@@ -1761,38 +1740,38 @@ fn run_obs_grad_tvcov<const N: usize>(
     // the `Dual1` η-derivative walk (gated on `uses_time`, like the f64 closure;
     // #486 / #610).
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
-    let mk =
-        |time: f64, cov: &std::collections::HashMap<String, f64>| -> Option<PkDual<Dual1<N>>> {
-            let _time_guard =
-                uses_time.then(|| crate::parser::model_parser::ModelTimeGuard::enter(time));
-            // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
-            // the inner loop falls back to FD rather than panicking (#449 review #1).
-            let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
-            let pk = (model.pk_param_fn)(theta, eta, cov, time);
-            let seed_row = |i: usize, val: f64| -> Dual1<N> {
-                let mut grad = [0.0; N];
-                for k in 0..n_eta {
-                    grad[k] = pd.dp_deta[i][k];
-                }
-                Dual1 { value: val, grad }
-            };
-            let dv = |slot: usize, val: f64| -> Dual1<N> {
-                match slot_row[slot] {
-                    Some(i) => seed_row(i, val),
-                    None => Dual1::<N>::constant(val),
-                }
-            };
-            Some(PkDual {
-                cl: dv(PK_IDX_CL, pk.cl()),
-                v: dv(PK_IDX_V, pk.v()),
-                q: dv(PK_IDX_Q, pk.q()),
-                v2: dv(PK_IDX_V2, pk.v2()),
-                ka: dv(PK_IDX_KA, pk.ka()),
-                q3: dv(PK_IDX_Q3, pk.q3()),
-                v3: dv(PK_IDX_V3, pk.v3()),
-                f: dv(PK_IDX_F, pk.f_bio()),
-            })
+    let mk = |time: f64,
+              cov: &std::collections::HashMap<String, f64>|
+     -> Option<PkDual<Dual1<N>>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
+        // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
+        // the inner loop falls back to FD rather than panicking (#449 review #1).
+        let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
+        let pk = (model.pk_param_fn)(theta, eta, cov, time);
+        let seed_row = |i: usize, val: f64| -> Dual1<N> {
+            let mut grad = [0.0; N];
+            for k in 0..n_eta {
+                grad[k] = pd.dp_deta[i][k];
+            }
+            Dual1 { value: val, grad }
         };
+        let dv = |slot: usize, val: f64| -> Dual1<N> {
+            match slot_row[slot] {
+                Some(i) => seed_row(i, val),
+                None => Dual1::<N>::constant(val),
+            }
+        };
+        Some(PkDual {
+            cl: dv(PK_IDX_CL, pk.cl()),
+            v: dv(PK_IDX_V, pk.v()),
+            q: dv(PK_IDX_Q, pk.q()),
+            v2: dv(PK_IDX_V2, pk.v2()),
+            ka: dv(PK_IDX_KA, pk.ka()),
+            q3: dv(PK_IDX_Q3, pk.q3()),
+            v3: dv(PK_IDX_V3, pk.v3()),
+            f: dv(PK_IDX_F, pk.f_bio()),
+        })
+    };
 
     let pk_at_dose: Vec<PkDual<Dual1<N>>> = (0..subject.doses.len())
         .map(|k| mk(subject.doses[k].time, subject.dose_cov(k)))
@@ -2441,6 +2420,87 @@ pub(crate) fn apply_expression_scale_outer(
         n_theta,
         n_eta
     );
+}
+
+/// Apply an η-dependent `ExpressionScale` `obs_scale` to an already-walked **outer** jet
+/// on the event-driven path (time-varying covariate / `TIME`). Builds the subject-static
+/// scale reference — `pk` (value) AND `pd` (`∂p/∂(θ,η)`) at the subject covariates and
+/// `t = 0`, both under one explicit [`ModelTimeGuard`] so a nested outer guard can never
+/// leave the value pinned at `t = 0` while the derivative reads a stale `TIME` (#637
+/// review #3) — then applies the shared quotient. A no-op unless the model carries a
+/// differentiable `ExpressionScale`; `None` if the scale program's axis count is outside
+/// the dispatch table (caller falls back to FD). One home for the `t = 0` wiring shared by
+/// the closed-form (`subject_sensitivities_tvcov`) and ODE (`run_subject_tvcov`) walks so
+/// a future change lands in one place (#637 review #6).
+pub(crate) fn apply_event_walk_expression_scale_outer(
+    sens: &mut SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    let ScalingSpec::ExpressionScale {
+        deriv: Some(scale_prog),
+        ..
+    } = &model.scaling
+    else {
+        return Some(());
+    };
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(0.0);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let pd =
+        crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)?;
+    apply_expression_scale_outer(
+        sens,
+        scale_prog,
+        &pk,
+        &pd,
+        &prog.pk_slots(),
+        theta,
+        eta,
+        &subject.covariates,
+        model.n_theta,
+        model.n_eta,
+    );
+    Some(())
+}
+
+/// Inner (`Dual1`, η-only) counterpart of [`apply_event_walk_expression_scale_outer`] —
+/// the `∂(f/s)/∂η` quotient on the light gradient, same `t = 0` guarded reference (#637
+/// review #3 / #6).
+pub(crate) fn apply_event_walk_expression_scale_inner(
+    out: &mut [ObsGrad],
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    let ScalingSpec::ExpressionScale {
+        deriv: Some(scale_prog),
+        ..
+    } = &model.scaling
+    else {
+        return Some(());
+    };
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(0.0);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let dp_deta = crate::sens::ode_provider::param_eta_derivatives_from_prog(
+        prog, model, subject, theta, eta,
+    )?;
+    apply_expression_scale_inner_dispatch(
+        out,
+        scale_prog,
+        &pk,
+        &dp_deta,
+        &prog.pk_slots(),
+        theta,
+        eta,
+        &subject.covariates,
+        model.n_eta,
+    );
+    Some(())
 }
 
 /// Build the `Dual2<M>` for PK slot `slot` in `(θ, η)`-axis layout (axes
@@ -3774,8 +3834,8 @@ mod tests {
         );
         assert!(ode_supported(&ode_n), "non-TIME ODE twin stays analytic");
 
-        // ODE **IOV** still declines TIME (its walk sources each occasion group at a
-        // single t=0 snapshot) — a follow-up. Build an ODE + kappa + TIME model.
+        // ODE **IOV** now serves TIME via the per-event stacked walk (#486). Build an
+        // ODE + kappa + TIME model to pin `ode_iov_supported == true`.
         const ODE_IOV_TIME: &str = r#"
 [parameters]
   theta TVCL(10.0, 1.0, 100.0)
@@ -3836,6 +3896,17 @@ mod tests {
         assert!(
             !tvcov_analytical_supported(&direct),
             "direct pk(...=TIME) mapping is not yet served by the analytic walk (FD follow-up)"
+        );
+        // #637 review #1: since the mapping falls back to FD on every subject, the
+        // model-level report predicates must ALSO say FD — otherwise the fit banner /
+        // `{model}-fit.yaml` would claim "analytic" for a 100%-FD fit.
+        assert!(
+            !analytical_supported(&direct),
+            "direct pk(...=TIME) must report non-analytic at the model level"
+        );
+        assert!(
+            !analytic_outer_gradient_available(&direct),
+            "direct pk(...=TIME) outer gradient route must report FD, not analytic"
         );
     }
 

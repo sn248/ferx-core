@@ -2442,27 +2442,16 @@ fn seed_pk_dual2_iov<const M: usize>(
     out
 }
 
-/// First-order, η-only counterpart of the second-order quotient row for the inner
-/// EBE gradient: `∂(f/s)/∂η_k = (∂f/∂η_k)/s − f·(∂s/∂η_k)/s²` over the stacked η axes
-/// (`s.grad[k]`, no `n_theta` offset — the inner scale jet has no θ block). The IOV
-/// analogue of the η-block of `apply_expression_scale_inner` (#575).
-fn apply_scale_quotient_grad_iov<const N: usize>(o: &mut ObsGrad, s: &Dual1<N>, n_stacked: usize) {
-    let f = o.f;
-    let inv = 1.0 / s.value;
-    let inv2 = inv * inv;
-    for k in 0..n_stacked {
-        o.df_deta[k] = o.df_deta[k] * inv - f * s.grad[k] * inv2;
-    }
-    o.f = f * inv;
-}
-
 /// Build one `ExpressionScale` `obs_scale` jet per occasion group from per-group seeded
 /// PK duals: gather the scale program's referenced PK slots (`slots`) into a scratch
 /// buffer and evaluate the scale via `eval`. Generic over the dual type so the outer
 /// (`Dual2`) and inner (`Dual1`) IOV walks share one jet-assembly loop instead of keeping
 /// two copies in lockstep (#590 review). The per-type difference (`eval_scale_dual` vs
-/// `eval_scale_dual1`) is supplied by the `eval` closure.
-fn build_iov_scale_jets<T: crate::sens::num::PkNum>(
+/// `eval_scale_dual1`) is supplied by the `eval` closure. Shared with the closed-form
+/// IOV walk (`provider::run_obs_iov` / `run_obs_iov_eta`), which builds its per-group
+/// seeded PK duals via its own `PkDual`-per-source `seed` closure and feeds them here
+/// (#486).
+pub(crate) fn build_iov_scale_jets<T: crate::sens::num::PkNum>(
     groups: &[Vec<T>],
     slots: &[usize],
     mut eval: impl FnMut(&[T]) -> T,
@@ -2955,7 +2944,11 @@ fn run_subject_iov_eta<const N: usize>(
     if let Some(group_scale) = group_scale {
         for (j, o) in out.iter_mut().enumerate() {
             let g = *occ_to_k.get(&subject.occasions.get(j).copied()?)?;
-            apply_scale_quotient_grad_iov::<N>(o, &group_scale[g], n_stacked);
+            crate::sens::provider::apply_scale_quotient_grad_iov::<N>(
+                o,
+                &group_scale[g],
+                n_stacked,
+            );
         }
     }
     Some(out)

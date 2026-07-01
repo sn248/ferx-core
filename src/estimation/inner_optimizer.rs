@@ -1332,14 +1332,14 @@ pub fn profile_report() {
 /// → `apply_expression_scale_inner`), and the ODE inner provider serves it on the static
 /// walk *and* the TV-cov event-driven walk (#534/#486 — the scale is subject-static even
 /// under time-varying covariates, so one post-walk quotient covers both), so both run
-/// analytically. Two things keep this safe rather than re-introducing an
-/// analytic-inner-vs-FD-outer split: the **IOV** inner path still declines
-/// `ExpressionScale` through its own gate (`iov_analytical_supported` requires
-/// `ScalingSpec::None`), and the **ODE** inner path does not consult this common bail at
-/// all — it has its own inline bail list in [`analytic_inner_grad_supported`] and its own
-/// per-subject scope (`ode_inner_grad_supported`, which admits exactly the static-walk and
-/// TV-cov-walk `ExpressionScale` that the ODE provider actually applies). So dropping it
-/// here affects only the non-IOV closed-form route — exactly the one that now serves it.
+/// analytically. The **IOV** inner path serves it too (#486): both the closed-form
+/// (`subject_eta_grad_iov_analytical` → `run_obs_iov_eta`) and the ODE
+/// (`ode_subject_eta_grad_iov`) IOV inner walks apply a per-occasion-group post-walk
+/// quotient, so `iov_analytical_supported` / `ode_iov_supported` now admit `ExpressionScale`
+/// and the inner and outer loops stay matched. The **ODE** inner path does not consult this
+/// common bail at all — it has its own inline bail list in [`analytic_inner_grad_supported`]
+/// and its own per-subject scope (`ode_inner_grad_supported`, which admits exactly the
+/// static-walk and TV-cov-walk `ExpressionScale` that the ODE provider actually applies).
 pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
@@ -4025,6 +4025,94 @@ mod iov_tests {
         }
     }
 
+    /// Closed-form twin of [`analytic_iov_inner_grad_matches_fd_of_nll`] with an η-dependent
+    /// `ExpressionScale` `obs_scale = V` divisor (#486): the analytic IOV inner gradient
+    /// (`analytic_eta_nll_gradient_iov`, now fed the scaled `subject_eta_grad_iov`) must match
+    /// central FD of the same objective `individual_nll_iov` (which applies `obs_scale`) over
+    /// the stacked `[η_bsv, κ]` vector — the gradient that drives `find_ebe_iov` for a scaled
+    /// closed-form IOV model.
+    #[test]
+    fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse closed-form IOV + obs_scale");
+        assert!(crate::sens::provider::iov_analytical_supported(&model));
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let params = model.default_params.clone();
+        let n_eta = model.n_eta;
+        let n_kappa = model.n_kappa;
+        let k = iov_occasion_groups(&subject).len();
+        let n_stacked = n_eta + k * n_kappa;
+        let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
+        let stacked = vec![0.10, -0.05, 0.08, -0.12];
+        assert_eq!(stacked.len(), n_stacked);
+
+        let g = analytic_eta_nll_gradient_iov(
+            &model,
+            &subject,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            n_eta,
+            n_kappa,
+            k,
+            None,
+        )
+        .expect("analytic IOV inner gradient");
+
+        let nll = |s: &[f64]| -> f64 {
+            let eta_t = &s[..n_eta];
+            let kappas: Vec<Vec<f64>> = (0..k)
+                .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
+                .collect();
+            individual_nll_iov(
+                &model,
+                &subject,
+                &params.theta,
+                eta_t,
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        for p in 0..n_stacked {
+            let h = 1e-6 * (1.0 + stacked[p].abs());
+            let mut sp = stacked.clone();
+            sp[p] += h;
+            let mut sm = stacked.clone();
+            sm[p] -= h;
+            let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
+            approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
+        }
+    }
+
     // ----- #555 shared fixtures (two_cpt_oral_cov, η+covariate `obs_scale = V1`) -----
 
     /// Analytical + ODE twin of the ferx-r `two_cpt_oral_cov` model (5 η, `obs_scale = V1`
@@ -5002,9 +5090,10 @@ mod iov_tests {
             "ODE IOV + η-dependent obs_scale is analytic via the post-walk quotient (#575/#590)"
         );
 
-        // Same for the CLOSED-FORM IOV path (`iov_analytical_supported`, provider.rs:638,
-        // which requires `ScalingSpec::None`) — the ODE case above only exercises
-        // `ode_iov_supported`. A `pk one_cpt_iv` IOV model + obs_scale must also decline.
+        // The CLOSED-FORM IOV path (`iov_analytical_supported`) now admits an η-dependent
+        // `ExpressionScale` `obs_scale` too (#486): the closed-form event-driven walk applies
+        // the same per-occasion-group post-walk quotient as the ODE path. LTBS still declines
+        // — pinned in `sens::provider::tests::iov_analytical_expr_scale_supported_and_gated`.
         let iov_scaled_cf = parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
@@ -5014,8 +5103,14 @@ mod iov_tests {
             crate::types::ScalingSpec::ExpressionScale { .. }
         ));
         assert!(
-            !crate::sens::provider::iov_sens_supported(&iov_scaled_cf),
-            "closed-form IOV + η-dependent obs_scale must route to FD (iov_analytical_supported requires ScalingSpec::None)"
+            crate::sens::provider::iov_sens_supported(&iov_scaled_cf),
+            "closed-form IOV + η-dependent obs_scale is analytic via the post-walk quotient (#486)"
+        );
+        let mut iov_scaled_cf_ltbs = iov_scaled_cf;
+        iov_scaled_cf_ltbs.log_transform = true;
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&iov_scaled_cf_ltbs),
+            "closed-form IOV + obs_scale + LTBS still routes to FD"
         );
     }
 

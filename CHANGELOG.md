@@ -52,6 +52,14 @@ section of the SDLC for the versioning policy).
   rate-off / rate-on saltations; the rate-off uses the general `g⁻ − g⁺` form so a
   covariate that varies across the window end stays exact. Only `zero_order` under IOV
   remains on finite differences.
+- **An `ExpressionScale` `obs_scale` divisor (e.g. `obs_scale = V`) combined with IOV on a
+  closed-form (analytical 1-/2-/3-cpt) model** now gets exact analytic FOCE/FOCEI
+  sensitivities on both the outer and inner loops instead of finite differences (#486). The
+  scale divisor is applied as a per-occasion-group post-walk quotient over the stacked
+  `(θ, η, κ)` axes — each occasion's divisor rides its own κ through the PK parameters —
+  porting the pattern already used on the ODE IOV path. Time-varying covariates compose
+  (the divisor stays subject-static, matching NONMEM's per-occasion `S1` scaling). LTBS and
+  constant `ScalarScale` under IOV continue to use finite differences.
 - **Custom / time-varying residual-error magnitude (`[error_model]` σ-scaling expression)
   now gets an exact analytic gradient** on both loops instead of finite differences
   (#484/#576/#486). The magnitude is η-independent, so the inner EBE gradient just

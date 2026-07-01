@@ -2922,9 +2922,10 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     dose: &crate::types::DoseEvent,
     f_bio: T,
     params: &[T],
-    is_inf: bool,
-    inf_rate: T,
-    inf_window: T,
+    // `Some((rate, window))` for an infusion (the caller's `inf_eff[idx]` jet, #530/#419);
+    // `None` for a bolus. Replacing the old `(is_inf, inf_rate, inf_window)` triple removes the
+    // meaningless `T::from_f64(0.0)` sentinels the bolus case had to pass (#642 review #5).
+    inf: Option<(T, T)>,
     opts: &crate::ode::solver::OdeSolverOptions,
     d1_vars: &mut Vec<Dual1<1>>,
     d1_stack: &mut Vec<Dual1<1>>,
@@ -2952,7 +2953,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
             &mut stack_cell.borrow_mut(),
         );
     };
-    if is_inf {
+    if let Some((inf_rate, inf_window)) = inf {
         // SS infusion: each cycle is an active-rate window `[0, t_inf]` (the wrapped RHS
         // injects the mode-aware bioavailable forcing into the dosing compartment) followed
         // by a quiet decay window `[0, II − t_inf]`. `(inf_rate, inf_window)` is the caller's
@@ -3090,19 +3091,25 @@ fn extend_flow_by_dual_duration_g<T: crate::sens::num::PkNum>(
     }
 }
 
-/// Dual counterpart of production's `ss_state_at_phase`: the SS state at `phase ∈ [0, II)`
-/// measured forward from the pulse at phase 0 (`equilibrate_ss_state_g` returns the
-/// pre-pulse trough, phase `0⁻ ≡ II`). Used for the SS+lagtime pre-arrival seed (#486):
-/// observations between an SS dose's record time and its lagged arrival read the *previous*
-/// interval's tail at `phase = II − lag`, which carries `lag`'s jet (`∂phase/∂lag = −1`).
-/// Each duration derived from `phase` is integrated to its fixed nominal (`.val()`) bound and
-/// Taylor-extended by [`extend_flow_by_dual_duration_g`] for the remaining dual part — the
-/// same technique `equilibrate_ss_state_g`'s per-cycle rate-off saltation uses, but for a
-/// continuous (non-switching) flow rather than a forcing jump; crossing the active/quiet
-/// boundary itself (when `phase > t_inf`) still uses [`inject_rate_saltation`], exactly as
-/// the main cycle loop does. Mirrors production's "phase ≥ dose.duration" scope note: assumes
-/// the lagtime doesn't leave the prior infusion still active at `phase` (the realistic
-/// regime; overlapping infusions are already rejected upstream by `equilibrate_ss_state_g`).
+/// Dual counterpart of production's `ss_state_at_phase`: advances a precomputed SS `trough`
+/// (the pre-pulse state, phase `0⁻ ≡ II`, from [`equilibrate_ss_state_g`]) forward to
+/// `phase ∈ [0, II)`, measured from the pulse at phase 0. Used for the SS+lagtime pre-arrival
+/// seed (#486): observations between an SS dose's record time and its lagged arrival read the
+/// *previous* interval's tail at `phase = II − lag`, which carries `lag`'s jet
+/// (`∂phase/∂lag = −1`). Each duration derived from `phase` is integrated to its fixed nominal
+/// (`.val()`) bound and Taylor-extended by [`extend_flow_by_dual_duration_g`] for the remaining
+/// dual part — the same technique `equilibrate_ss_state_g`'s per-cycle rate-off saltation uses,
+/// but for a continuous (non-switching) flow rather than a forcing jump; crossing the
+/// active/quiet boundary itself (when `phase > t_inf`) still uses [`inject_rate_saltation`],
+/// exactly as the main cycle loop does. Mirrors production's "phase ≥ dose.duration" scope
+/// note: assumes the lagtime doesn't leave the prior infusion still active at `phase` (the
+/// realistic regime; overlapping infusions are already rejected upstream by
+/// `equilibrate_ss_state_g`).
+///
+/// The `trough` is taken as a parameter (not recomputed) so the caller can equilibrate once and
+/// reuse it at both this pre-arrival seed and the dose's own later `K_DOSE` event, halving the
+/// up-to-50-cycle dual SS loop for a lagged SS dose (#642 review #4). `inf` is `Some((rate,
+/// window))` for an infusion, `None` for a bolus (#642 review #5).
 #[allow(clippy::too_many_arguments)]
 fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
@@ -3110,23 +3117,25 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
     dose: &crate::types::DoseEvent,
     f_bio: T,
     params: &[T],
-    is_inf: bool,
-    inf_rate: T,
-    inf_window: T,
+    inf: Option<(T, T)>,
     phase: T,
+    trough: Vec<T>,
     opts: &crate::ode::solver::OdeSolverOptions,
     d1_vars: &mut Vec<Dual1<1>>,
     d1_stack: &mut Vec<Dual1<1>>,
 ) -> Vec<T> {
-    let mut u = equilibrate_ss_state_g::<T>(
-        program, n_states, dose, f_bio, params, is_inf, inf_rate, inf_window, opts, d1_vars,
-        d1_stack,
-    );
+    let mut u = trough;
     let phase_val = phase.val();
     if phase_val <= 0.0 {
         return u;
     }
-    let cmt_idx = dose.cmt.saturating_sub(1);
+    // CMT is 1-based; a malformed `CMT=0` must no-op (return the trough unchanged), matching
+    // `equilibrate_ss_state_g`'s own `dose.cmt == 0` zero-guard. `saturating_sub(1)` would
+    // instead alias it to the valid index 0 and silently dose compartment 0 (#642 review #1).
+    if dose.cmt == 0 {
+        return u;
+    }
+    let cmt_idx = dose.cmt - 1;
     if cmt_idx >= n_states {
         return u;
     }
@@ -3145,7 +3154,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
             &mut stack_cell.borrow_mut(),
         );
     };
-    if is_inf {
+    if let Some((inf_rate, inf_window)) = inf {
         let t_inf_val = inf_window.val();
         let active_val = phase_val.min(t_inf_val);
         let rhs_active = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
@@ -3363,6 +3372,18 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // truth for the walk, mirroring `Subject::has_periodic_ss_dose`'s per-dose predicate.
     let is_ss_dose = |d: &crate::types::DoseEvent| -> bool { d.ss && d.ii > 0.0 };
 
+    // The SS-equilibration infusion jet for dose `idx`: `Some(inf_eff[idx])` for an infusion,
+    // `None` for a bolus. One shared source for both SS call sites (`K_DOSE` and `K_SS_SEED`),
+    // so their infusion-jet handling can't desync (#642 review #5). `inf_eff[idx]` is only read
+    // when `is_inf(d)` (which implies `has_any_infusion`, so `inf_eff` is populated).
+    let ss_inf = |d: &crate::types::DoseEvent, idx: usize| -> Option<(T, T)> {
+        if is_inf(d) {
+            Some(inf_eff[idx])
+        } else {
+            None
+        }
+    };
+
     // Merged timeline: (time, kind, idx), kind ∈ {Reset=0, SsSeed=1, Dose=2, PkOnly=3, Obs=4,
     // InfEnd=5} — the sort key matching production's `kind_order` (Reset before a co-timed
     // Dose so an EVID=4 reset+dose zeros the state before its own dose lands; a per-dose
@@ -3440,6 +3461,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // when `has_lagtime` is false).
     let mut d1_vars: Vec<Dual1<1>> = Vec::new();
     let mut d1_stack: Vec<Dual1<1>> = Vec::new();
+    // Per-dose SS-equilibration trough cache (#642 review #4): a lagged SS dose needs its
+    // trough at both the `K_SS_SEED` pre-arrival seed and its later `K_DOSE` event. The seed
+    // (processed first, earlier `t_event`) equilibrates once and stashes the trough here; the
+    // `K_DOSE` event reuses it instead of re-running the up-to-50-cycle dual SS loop. Entries
+    // stay `None` for non-lagged SS doses (which never hit `K_SS_SEED`).
+    let mut ss_trough_cache: Vec<Option<Vec<T>>> = vec![None; subject.doses.len()];
 
     // TAD anchor: the most recent dose at or before the current segment start. The
     // timeline is sorted and doses sort before a co-timed obs, so this only advances
@@ -3551,27 +3578,24 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // infusion under `F ≠ 1`, SS + lagtime, and SS + a non-autonomous RHS route to
             // FD upstream (#473 review #7).
             if is_ss_dose(d) {
-                // `is_inf(d)` true implies `has_any_infusion` (it's counted in
-                // `n_infusion_ends`), so `inf_eff[idx]` is always populated when read here;
-                // the placeholder is never indexed for a bolus SS dose.
-                let (ss_inf_rate, ss_inf_window) = if is_inf(d) {
-                    inf_eff[idx]
-                } else {
-                    (T::from_f64(0.0), T::from_f64(0.0))
+                // Reuse the trough already equilibrated at this dose's `K_SS_SEED` pre-arrival
+                // seed (lagged SS dose); otherwise equilibrate now (non-lagged SS dose). Both
+                // produce the identical trough for the same `pk_at_dose[idx]` — the cache just
+                // avoids the second up-to-50-cycle dual SS loop (#642 review #4).
+                u = match ss_trough_cache[idx].take() {
+                    Some(trough) => trough,
+                    None => equilibrate_ss_state_g::<T>(
+                        program,
+                        n_states,
+                        d,
+                        f_bio_at_dose[idx],
+                        &pk_at_dose[idx],
+                        ss_inf(d, idx),
+                        opts,
+                        &mut d1_vars,
+                        &mut d1_stack,
+                    ),
                 };
-                u = equilibrate_ss_state_g::<T>(
-                    program,
-                    n_states,
-                    d,
-                    f_bio_at_dose[idx],
-                    &pk_at_dose[idx],
-                    is_inf(d),
-                    ss_inf_rate,
-                    ss_inf_window,
-                    opts,
-                    &mut d1_vars,
-                    &mut d1_stack,
-                );
             }
             // CMT is 1-based; a malformed `CMT=0` must not silently dose compartment
             // 0 (the datareader rejects it upstream) (#449 review #8).
@@ -3794,22 +3818,30 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             let d = &subject.doses[idx];
             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
             let phase = T::from_f64(d.ii) - lag;
-            // `is_inf(d)` true implies `has_any_infusion`, so `inf_eff[idx]` is populated.
-            let (ss_inf_rate, ss_inf_window) = if is_inf(d) {
-                inf_eff[idx]
-            } else {
-                (T::from_f64(0.0), T::from_f64(0.0))
-            };
+            let inf = ss_inf(d, idx);
+            // Equilibrate the SS trough once here and cache it, so this lagged SS dose's later
+            // `K_DOSE` event reuses it instead of re-running the dual SS loop (#642 review #4).
+            let trough = equilibrate_ss_state_g::<T>(
+                program,
+                n_states,
+                d,
+                f_bio_at_dose[idx],
+                &pk_at_dose[idx],
+                inf,
+                opts,
+                &mut d1_vars,
+                &mut d1_stack,
+            );
+            ss_trough_cache[idx] = Some(trough.clone());
             u = ss_state_at_phase_g::<T>(
                 program,
                 n_states,
                 d,
                 f_bio_at_dose[idx],
                 &pk_at_dose[idx],
-                is_inf(d),
-                ss_inf_rate,
-                ss_inf_window,
+                inf,
                 phase,
+                trough,
                 opts,
                 &mut d1_vars,
                 &mut d1_stack,
@@ -6557,6 +6589,7 @@ mod tests {
         let eta = [0.1, 0.05];
         check_vs_production(&model, &subject, &theta, &eta);
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
     }
 
     /// **Early-stop stays gradient-faithful with the new per-cycle rate-off saltation**
@@ -6596,6 +6629,15 @@ mod tests {
                 approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
             }
             for (a, b) in e.df_dtheta.iter().zip(&f.df_dtheta) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            // The per-cycle rate-off saltation accumulates into the 2nd-order term across every
+            // cycle, so the Hessian blocks — not just the gradient — must survive early stop
+            // (this is what the docstring claims; #642 review #2).
+            for (a, b) in e.d2f_deta2.iter().zip(&f.d2f_deta2) {
+                approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
+            }
+            for (a, b) in e.d2f_deta_dtheta.iter().zip(&f.d2f_deta_dtheta) {
                 approx::assert_relative_eq!(*a, *b, max_relative = 1e-6, epsilon = 1e-9);
             }
         }
@@ -6651,6 +6693,7 @@ mod tests {
         let eta = [0.12, -0.08];
         check_vs_production(&model, &subject, &theta, &eta);
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
     }
 
     #[test]

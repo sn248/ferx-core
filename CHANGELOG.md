@@ -24,8 +24,18 @@ section of the SDLC for the versioning policy).
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK
   jet, and the moving infusion-end boundary carries `∂/∂{θ,η,κ}` — including when the
-  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`). Steady-state modeled doses
-  stay on the finite-difference fallback for now.
+  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`).
+- Three more **steady-state (`SS=1`) ODE dosing** combinations now get exact analytic
+  FOCE/FOCEI sensitivities instead of finite differences (#486): a modeled-duration/rate
+  dose (`RATE=-1`/`-2`), a rate-defined infusion under bioavailability `F ≠ 1`, and an
+  estimated lagtime. The SS dual equilibration now threads the
+  same mode-aware rate/window jet the non-SS event-driven walk uses into its per-cycle
+  active/quiet split, and a lagged SS dose's pre-arrival window `[t_dose, t_dose+lag)` is
+  seeded from the previous interval's steady-state tail (mirroring the production
+  predictor's own pre-arrival seed). Only SS combined with a non-autonomous RHS (one that
+  reads `TIME`/`TAFD`/`TAD`) stays on the FD fallback — a time-invariant pulse train has no
+  well-defined steady state under a time-dependent RHS. See
+  [Steady-state dosing](model-file/steady-state.qmd).
 - A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
   **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences

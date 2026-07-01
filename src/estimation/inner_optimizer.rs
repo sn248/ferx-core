@@ -201,14 +201,11 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         // the gate can't drift.
         let has_ss = subject.has_periodic_ss_dose();
         // Modeled-`RATE`/duration doses are analytic under IOV since #486 (the per-occasion
-        // modeled-window jet rides the rate-off saltation), EXCEPT when also steady-state
-        // (the dual SS equilibration has no modeled-window jet yet) or when a `D{cmt}`/`R{cmt}`
-        // slot is absent — mirror `ode_iov_subject_supported`'s screen so a modeled+SS subject
-        // is attributed to SS, not to the (now-analytic) modeled dose itself.
+        // modeled-window jet rides the rate-off saltation) — including combined with
+        // steady-state (#486: `equilibrate_ss_state_g` now threads the same jet into its
+        // per-cycle active/quiet split), EXCEPT when a `D{cmt}`/`R{cmt}` slot is absent —
+        // mirror `ode_iov_subject_supported`'s screen so this attribution can't drift.
         if !subject.all_doses_fixed() {
-            if has_ss {
-                return "steady-state + modeled RATE/DURATION dose";
-            }
             let attr_map = model.active_dose_attr_map();
             let all_slots_present = subject.doses.iter().all(|d| {
                 matches!(d.rate_mode, crate::types::RateMode::Fixed)
@@ -220,13 +217,9 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         }
         // Mirror the SS gates of `ode_iov_subject_supported`, in the same order
         // (they are checked *before* the occasion/axis gates below, so omitting
-        // them would misattribute an SS bail to a later reason). #590 review.
-        if crate::sens::ode_provider::has_rate_defined_ss_infusion_under_f(model, subject) {
-            return "steady-state rate-defined infusion under F";
-        }
-        if has_ss && model.has_lagtime() {
-            return "steady-state dose + estimated lagtime";
-        }
+        // them would misattribute an SS bail to a later reason). #590 review. A
+        // steady-state rate-defined infusion under `F ≠ 1`, and steady-state combined
+        // with an estimated lagtime, are both analytic now (#486).
         if has_ss
             && model
                 .ode_spec
@@ -3641,12 +3634,12 @@ mod iov_tests {
         );
     }
 
-    /// Regression (#590 review): the SS gates of `ode_iov_subject_supported` are
-    /// checked *before* the occasion/axis gates, so `iov_fd_reason` must report an
-    /// SS bail as such — not fall through to a later, wrong reason. Without the
-    /// SS branch this subject was reported as "subject outside IOV analytic scope".
+    /// Regression (#486): steady-state combined with an estimated lagtime is now analytic
+    /// under IOV (the `K_SS_SEED` pre-arrival seed, shared with the non-IOV walk). Before
+    /// #486 this subject declined via the `SS + lagtime` gate (#590 review); pins that the
+    /// inner IOV route now admits it instead.
     #[test]
-    fn iov_fd_reason_attributes_steady_state_lagtime_bail() {
+    fn iov_inner_subject_route_admits_steady_state_lagtime() {
         let model = crate::parser::model_parser::parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVLAG(0.5,0.01,5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_LAG ~ 0.09\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  LAGTIME = TVLAG * exp(ETA_LAG)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
@@ -3657,15 +3650,12 @@ mod iov_tests {
         );
         let subject = Subject {
             id: "1".into(),
-            // Steady-state bolus (ss, ii > 0) under an estimated lagtime: the IOV
-            // provider declines via the `SS + lagtime` gate.
+            // Steady-state bolus (ss, ii > 0) under an estimated lagtime.
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
             obs_times: vec![1.0, 6.0, 25.0, 30.0],
             obs_raw_times: Vec::new(),
             observations: vec![8.0, 6.0, 7.0, 5.0],
             obs_cmts: vec![1; 4],
-            // No covariates: keep `has_tv_covariates()` false so the FD cause is the
-            // SS+lagtime gate, not the earlier `ExpressionScale + tv-cov` gate.
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
@@ -3680,21 +3670,17 @@ mod iov_tests {
             obs_records: vec![],
         };
         assert!(
-            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
-            "SS + lagtime subject must route to FD"
-        );
-        assert_eq!(
-            iov_fd_reason(&model, &subject),
-            "steady-state dose + estimated lagtime"
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
+            "SS + lagtime subject must be analytic now (#486)"
         );
     }
 
-    /// Regression (#486): modeled-`RATE`/duration doses are analytic under IOV, except when
-    /// also steady-state. `iov_fd_reason` must attribute a modeled + SS subject to steady
-    /// state — not to the (now-analytic) modeled dose alone — mirroring the relaxed
-    /// `ode_iov_subject_supported` screen, whose `has_ss` check fires first.
+    /// Regression (#486): modeled-`RATE`/duration doses combined with steady-state are now
+    /// analytic under IOV too (`equilibrate_ss_state_g` threads the same per-occasion
+    /// `inf_eff` jet into its per-cycle split). Before #486 this subject declined via the
+    /// modeled+SS screen; pins that the inner IOV route now admits it instead.
     #[test]
-    fn iov_fd_reason_attributes_modeled_dose_steady_state_bail() {
+    fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
         let model = crate::parser::model_parser::parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVD1(5.0,0.1,24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_D1 ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  D1 = TVD1 * exp(ETA_D1)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
@@ -3727,12 +3713,8 @@ mod iov_tests {
             obs_records: vec![],
         };
         assert!(
-            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
-            "modeled + SS subject must route to FD"
-        );
-        assert_eq!(
-            iov_fd_reason(&model, &subject),
-            "steady-state + modeled RATE/DURATION dose"
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
+            "modeled + SS subject must be analytic now (#486)"
         );
     }
 

@@ -102,9 +102,18 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
 - The `TIME` fed to the expression is the raw data-file time (matching NONMEM's
   `$ERROR`).
 - Supported for `method = foce` and `method = focei` only. SAEM, GN, GN-hybrid,
-  and importance-sampling are rejected up front. When a custom magnitude is
-  active the analytic outer/inner gradients fall back to finite differences
-  (which are magnitude-aware), so fits are correct but slightly slower.
+  and importance-sampling are rejected up front.
+- **Analytic gradient (#576/#486).** The inner EBE η-gradient and the FOCEI
+  outer θ/σ population gradient are both analytic for a magnitude-active model
+  — the magnitude is η-independent, so the inner loop just threads its
+  per-observation multiplier into the variance/its `f`-derivative; the outer
+  loop differentiates the magnitude program itself (a new *direct*-θ term in
+  `∂R/∂θ`, since `mult(θ)` enters the residual variance independent of the
+  prediction). A few combinations still fall back to finite differences (which
+  remain magnitude-aware, so fits stay correct, just slower): `block_sigma`
+  correlated residual error, `iiv_on_ruv`, an M3-BLOQ censored row, more than 16
+  thetas, and plain `method = foce` (non-interaction) — only FOCEI has the
+  direct-θ channel so far.
 
 ## Log-transform-both-sides (LTBS)
 

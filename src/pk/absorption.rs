@@ -677,6 +677,59 @@ impl<T: PkNum> PreparedInputRate<T> {
             PreparedInputRate::FirstOrder { ka } => dose * ka * (-(ka * tad)).exp(),
         }
     }
+
+    /// The right-hand limit `lim_{tad→0⁺} R_in(tad, dose)` — the forcing's onset
+    /// value, needed by the event-driven ODE sensitivity walk to inject an exact
+    /// rate-on **saltation** when a dose's own arrival is a moving boundary (an
+    /// estimated lagtime, #486): [`Self::rate`]'s domain guard returns a flat zero
+    /// *at* `tad = 0` by convention ("not yet started"), so the jump at onset is
+    /// computed here, separately, and injected once at the dose event (see
+    /// `inject_rate_saltation` in `sens/ode_provider.rs`) — the continuous
+    /// `∂R_in/∂lag` for `tad > 0` still flows through [`Self::rate`] itself when
+    /// `tad` carries the lag sensitivity.
+    ///
+    /// `Transit` vanishes at onset for any `n > 0` (the Γ-density `n·ln(tad) → −∞`
+    /// dominates) and degenerates to `ktr·dose` at `n = 0` (pure first-order);
+    /// `InverseGaussian` vanishes at onset for *every* valid `(mat, cv2)` (the
+    /// essential singularity `−mat/(2·cv2·tad) → −∞` always dominates); `FirstOrder`
+    /// is finite (`dose·ka`) with no boundary case. `Weibull`'s onset **diverges**
+    /// for shape `β < 1` (an integrable spike, not a finite jump) — callers must
+    /// exclude that combination rather than call this (see
+    /// `ode_analytical_supported`'s lagtime gate). `ZeroOrder`'s own onset/cutoff is
+    /// handled entirely by its separate moving-window mechanism (#530), not this
+    /// path.
+    #[inline]
+    pub(crate) fn rate_at_zero(&self, dose: T) -> T {
+        if dose.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        match *self {
+            PreparedInputRate::Transit { ktr, n, .. } => {
+                if n.val() <= 0.0 {
+                    dose * ktr
+                } else {
+                    T::from_f64(0.0)
+                }
+            }
+            PreparedInputRate::InverseGaussian { .. } => T::from_f64(0.0),
+            PreparedInputRate::Weibull { beta, c0, .. } => {
+                let b = beta.val();
+                if b > 1.0 {
+                    T::from_f64(0.0)
+                } else if b == 1.0 {
+                    dose * c0.exp()
+                } else {
+                    // β < 1: the true onset is +∞ (an integrable spike). Callers
+                    // must not reach this arm (excluded upstream) — a NaN/∞ here
+                    // would poison the whole subject's prediction, not just its
+                    // gradient.
+                    T::from_f64(f64::NAN)
+                }
+            }
+            PreparedInputRate::ZeroOrder { .. } => T::from_f64(0.0),
+            PreparedInputRate::FirstOrder { ka } => dose * ka,
+        }
+    }
 }
 
 #[cfg(test)]

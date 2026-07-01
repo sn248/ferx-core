@@ -768,7 +768,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     prepared: &[PreparedInputRate<T>],
     params: &[T],
     doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
+    dose_lagtimes: &[T],
     dose_f_bio: &[T],
     reset_floor: f64,
     t: f64,
@@ -791,20 +791,27 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             if d.cmt.saturating_sub(1) != forcing.cmt {
                 continue;
             }
-            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-            let t_eff = d.time + lag;
+            // `dose_lagtimes[k]` (`T`, not `f64`) carries the exact `∂t_eff/∂lag = 1`
+            // sensitivity when the caller's lag is itself an estimated parameter (an
+            // event-driven walk with an in-scope lagtime, #486) — `T::from_f64(0.0)`
+            // (zero jet) for every other caller (production `f64`, or a dual walk with
+            // no lagtime), so `tad` below reduces to the pre-#486 constant-boundary
+            // computation there. The gating comparisons use `.val()` (the boundary
+            // itself never needs a jet — see `rate_at_zero`'s jump for that).
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(T::from_f64(0.0));
+            let t_eff = T::from_f64(d.time) + lag;
             // Doses delivered before the most recent reset are off — the reset
             // zeroed the compartments, same rule as `active_infusions`.
-            if t_eff < reset_floor - INFUSION_EPS {
+            if t_eff.val() < reset_floor - INFUSION_EPS {
                 continue;
             }
-            let tad = t - t_eff;
-            if tad <= 0.0 {
+            let tad = T::from_f64(t) - t_eff;
+            if tad.val() <= 0.0 {
                 continue;
             }
             let dose_mass =
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
-            acc = acc + prep.rate(T::from_f64(tad), dose_mass);
+            acc = acc + prep.rate(tad, dose_mass);
         }
         // Pathway fraction (#388): a `FR*fn(...)` term scales its whole `R_in` by
         // the declared fraction `FR`; `frac = 1` for an unfractioned single-pathway

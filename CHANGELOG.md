@@ -61,9 +61,10 @@ section of the SDLC for the versioning policy).
   - **Compartment-indexed bioavailability `F{cmt}` and lagtime `ALAG{cmt}` under IOV** — the
     event-driven walk already resolves each dose's own compartment slot, so these no longer
     fall back to finite differences.
-  - **A constant `ScalarScale` `obs_scale` divisor under IOV on the closed-form (analytical
-    1-/2-/3-cpt) models** — the trivial covariate-independent case of the `ExpressionScale`
-    quotient the IOV walk already applies, now divided uniformly into the jet.
+  - **A constant `ScalarScale` `obs_scale` divisor under IOV on both engines** — the trivial
+    covariate-independent case of the `ExpressionScale` quotient the IOV walk already applies:
+    on the closed-form models the final jet is divided uniformly, and on ODE models the
+    in-walk readout already divides `p/k` over the stacked dual.
 
   All validated against finite differences of the production `predict_iov` (value, gradient,
   and Hessian over the stacked `[η, κ]` vector).

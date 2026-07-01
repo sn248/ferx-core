@@ -8574,6 +8574,53 @@ mod tests {
         );
     }
 
+    /// **ODE IOV + constant `ScalarScale` `obs_scale`** (#486 IOV-scope parity — the ODE twin
+    /// of `iov_analytical_scalar_scale_matches_fd`). On the ODE path the divide is even
+    /// simpler than closed-form: `resolve_obs_readout` → `apply_output_transform` already
+    /// divides the in-walk readout `p/k` over the stacked `(θ, η, κ)` dual (the same in-walk
+    /// step the non-IOV walk uses), so admitting `ScalarScale` in the ODE-IOV gate needs no
+    /// run-loop change. Validated vs central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_scalar_scale_matches_fd_of_predict_iov() {
+        const ODE_IOV_SCALARSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V)*central
+[scaling]
+  obs_scale = 40
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(ODE_IOV_SCALARSCALE).expect("parse ODE IOV ScalarScale");
+        assert!(
+            matches!(model.scaling, ScalingSpec::ScalarScale(_)),
+            "fixture must use a constant obs_scale"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + constant ScalarScale must be on the analytic path (#486 parity)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.06, -0.11]);
+    }
+
     /// Outer packed sensitivities of a closed-form IOV + `obs_scale = V` model must match
     /// central FD of `predict_iov` (value, `∂f/∂stacked`, `∂f/∂θ`, and both Hessian blocks)
     /// over `[η_bsv, κ_g0, κ_g1]` + θ — 1-cpt and 2-cpt oral.

@@ -778,15 +778,20 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // supported (#575): like the non-IOV ODE static walk (#534) it is applied as a
     // post-walk quotient on the final `(θ, stacked-η)` jet — here per occasion group,
     // since the divisor depends on the group's κ through the PK params (see
-    // `apply_expression_scale_iov` / `run_subject_iov`). Constant `ScalarScale` and LTBS
-    // stay FD (their in-walk output transform isn't validated for the IOV path — separate
-    // gap). Allowlist, not denylist, so a future scaling variant can only narrow scope.
+    // `apply_expression_scale_iov` / `run_subject_iov`). A constant `ScalarScale k` divisor
+    // is supported too (#486 IOV-scope parity): unlike `ExpressionScale`, it is
+    // κ-independent, so `resolve_obs_readout`/`apply_output_transform` already divide the
+    // in-walk readout `p/k` over the stacked `(θ, η, κ)` dual — the exact same in-walk step
+    // the non-IOV walk uses (`ode_analytical_supported` admits it), needing no post-walk
+    // handling. LTBS still stays FD (the in-walk log can't compose with the per-group
+    // post-walk `ExpressionScale` quotient). Allowlist, not denylist, so a future scaling
+    // variant can only narrow scope.
     match &model.scaling {
-        // `None` only when NOT LTBS: the IOV walk applies the LTBS log in PK-param
-        // space *before* the η/θ/κ chain, so the production scale-then-log order
-        // can't be reproduced post-walk — LTBS (`log(DV) ~ additive`, no obs_scale)
-        // stays FD for IOV, matching the pre-#575 `|| model.log_transform` guard.
-        ScalingSpec::None if !model.log_transform => {}
+        // `None`/`ScalarScale` only when NOT LTBS: the IOV walk applies the LTBS log in
+        // PK-param space *before* the η/θ/κ chain, so the production scale-then-log order
+        // can't be reproduced post-walk — LTBS (`log(DV) ~ additive`) stays FD for IOV,
+        // matching the pre-#575 `|| model.log_transform` guard.
+        ScalingSpec::None | ScalingSpec::ScalarScale(_) if !model.log_transform => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
             if expression_scale_axes_admissible(p, model) => {}
         _ => return false,

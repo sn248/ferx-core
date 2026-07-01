@@ -7927,6 +7927,110 @@ mod tests {
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
+    /// `zero_order()` + an EVID 3/4 reset (#486 review follow-up): the kind-agnostic
+    /// gate relaxation in `ode_subject_supported` (dropped for every `InputRateKind`,
+    /// not just the "smooth density" forcings this PR's forcing loop touches) also
+    /// admits a pure `zero_order()` model. Its own moving-boundary cutoff is a
+    /// separate, pre-existing per-segment mechanism (`zero_windows`/`reset_floor`,
+    /// #530) untouched by this PR, so this closes an undocumented capability rather
+    /// than adding new machinery. The reset fires *inside* the first dose's open
+    /// window (`[0, DUR=4]` cut short at `t=2`) — the exact straddling case that
+    /// would leak pre-reset mass if `reset_floor` weren't already threaded through
+    /// `zero_windows`.
+    #[test]
+    fn ode_provider_zero_order_with_reset_matches_production() {
+        const ZERO_ORDER_ODE_RESET: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(ZERO_ORDER_ODE_RESET).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 4.0, 8.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![2.0];
+        let theta = vec![5.0, 50.0, 4.0];
+        let eta = vec![0.1, 0.05];
+        assert!(
+            ode_subject_supported(&model, &subject),
+            "zero_order() + reset is shared scope for both outer and inner (#486, kind-agnostic gate)"
+        );
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// `mixed` (zero-order + first-order) absorption + an EVID 3/4 reset (#486
+    /// review follow-up): the same kind-agnostic gate relaxation, now exercised for
+    /// the `mixed` combination — the `zero_order` term's window is what's exposed to
+    /// the reset-cutting hazard; the `first_order` term rides the general
+    /// smooth-density reset fix this PR adds.
+    #[test]
+    fn ode_provider_mixed_with_reset_matches_production() {
+        const MIXED_ODE_RESET: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(3.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FZO  = TVFZO
+  FZO1 = 1 - TVFZO
+  KA   = TVKA
+  DUR  = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(MIXED_ODE_RESET).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 2.5, 4.0, 8.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(1.5, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![1.5];
+        let theta = vec![5.0, 50.0, 0.4, 1.0, 3.0];
+        let eta = vec![0.12, -0.08];
+        assert!(
+            ode_subject_supported(&model, &subject),
+            "mixed absorption + reset is shared scope for both outer and inner (#486, kind-agnostic gate)"
+        );
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
     // WEIBULL_ODE with an allometric weight covariate on CL — exercises cell (c):
     // TV-cov + input-rate on the event-driven walk (no lagtime involved at all, so
     // the dose's arrival is a fixed, non-dual boundary; the continuous forcing's

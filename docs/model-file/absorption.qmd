@@ -481,11 +481,12 @@ stays analytic when composed with an estimated lagtime (the start *and* end
 saltations carry the combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying
 covariates, or multiple doses — only a *steady-state* modeled dose or one under IOV
 falls back to finite differences. The **`zero_order(dur)` forcing** rides the static
-walk, which has a narrower analytic scope: it stays analytic across multiple doses
-and a mixed (zero- + first-order) pathway, but reverts to **finite differences** when
-combined with an estimated lagtime, an EVID 3/4 reset, or time-varying covariates
-(its moving-boundary cutoff is a per-segment mechanism not yet ported to the
-event-driven walk that carries those features).
+walk, which has a narrower analytic scope: it stays analytic across multiple doses,
+a mixed (zero- + first-order) pathway, and an EVID 3/4 reset (#486 — the reset case
+is kind-agnostic, so `zero_order` inherits it too), but reverts to
+**finite differences** when combined with an estimated lagtime or time-varying
+covariates (its moving-boundary cutoff is a per-segment mechanism not yet ported to
+the event-driven walk that carries those two features).
 See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 
 The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
@@ -584,9 +585,10 @@ saltation at the cutoff
 diverge in scope (#486): **`parallel`** (two `first_order` terms, no `zero_order`) is
 analytic combined with an EVID 3/4 reset, time-varying covariates, *or* an estimated
 lagtime — every forcing feeding the compartment is a smooth density, so the same
-rate-on onset saltation covers it. **`mixed`** still reverts to finite differences
-combined with any of those three, exactly as for a plain `zero_order` model — its
-`zero_order` term's moving-boundary cutoff is the limiting factor.
+rate-on onset saltation covers it. **`mixed`** is analytic combined with an EVID 3/4
+reset too (kind-agnostic, exactly as for a plain `zero_order` model), but still
+reverts to finite differences combined with time-varying covariates or an estimated
+lagtime — its `zero_order` term's moving-boundary cutoff is the limiting factor there.
 
 ### Worked examples
 

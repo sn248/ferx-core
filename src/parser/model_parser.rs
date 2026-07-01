@@ -1242,7 +1242,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     let (
         pk_model,
-        pk_param_map,
+        mut pk_param_map,
         mut ode_spec,
         diffusion_theta_names,
         diffusion_theta_inits,
@@ -1352,6 +1352,46 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             Vec::new(),
         )
     };
+
+    // #486 — desugar a direct `pk(...=TIME)` structural mapping into a synthetic
+    // individual parameter (`__ferx_pktime_<pk_name> = TIME`), mirroring the Form-C
+    // readout θ/η desugaring (#631). A bare `pk(v=TIME)` binding otherwise leaves the
+    // mapped PK slot out of the individual-parameter program's `pk_slots`, so
+    // `prog_covers_required_pk_slots` declines and the whole model routes to FD (#637
+    // follow-up). Rewriting the binding to reference the synthetic parameter makes the
+    // slot ride the validated per-event `TIME` sensitivity chain (value = event time via
+    // `Op::PushTime`, ∂/∂θ = ∂/∂η = 0). Runs before `pk_indices` / `build_pk_param_fn`
+    // consume `indiv_var_names` / `indiv_stmts`.
+    {
+        let mut time_bound: Vec<String> = pk_param_map
+            .iter()
+            .filter(|(_, v)| v.as_str() == "TIME" || v.as_str() == "time")
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !time_bound.is_empty() {
+            // Reserve the `__ferx_pktime_` prefix (like `__ferx_ro_`): reject a
+            // user/generated parameter carrying it rather than silently shadowing it.
+            if let Some(bad) = all_assigned
+                .iter()
+                .chain(theta_names.iter())
+                .chain(eta_names.iter())
+                .find(|n| n.starts_with(PKTIME_SYNTH_PREFIX))
+            {
+                return Err(format!(
+                    "parameter name `{bad}` uses the reserved `{PKTIME_SYNTH_PREFIX}` prefix, \
+                     which ferx reserves for internal `pk(...=TIME)` parameters (#486). Rename it."
+                ));
+            }
+            // Sorted for deterministic slot/var order across runs.
+            time_bound.sort();
+            for pk_name in time_bound {
+                let synth = format!("{PKTIME_SYNTH_PREFIX}{}", pk_name.to_lowercase());
+                indiv_var_names.push(synth.clone());
+                indiv_stmts.push(Statement::Assign(synth.clone(), Expression::Time));
+                pk_param_map.insert(pk_name, synth);
+            }
+        }
+    }
 
     // Build the CovariateNn handles up front (before build_pk_param_fn, which
     // captures them in the pk_param_fn closure). The same vector is also
@@ -9505,11 +9545,17 @@ fn collect_theta_eta_in_stmts(
 /// suppress these internal parameters — they are not user-declared quantities.
 pub(crate) const READOUT_SYNTH_PREFIX: &str = "__ferx_ro_";
 
-/// True for an individual-parameter name synthesized by the Form-C readout θ/η
-/// desugaring (see [`READOUT_SYNTH_PREFIX`]). User-facing per-subject output skips
-/// these so the synthetic parameters never surface as sdtab / fit-output columns.
+/// Reserved prefix for the individual parameter synthesized by desugaring a direct
+/// `pk(...=TIME)` structural mapping (`__ferx_pktime_<pk_name> = TIME`, #486). Like the
+/// readout prefix, it lets EBE / diagnostic output suppress the internal parameter.
+pub(crate) const PKTIME_SYNTH_PREFIX: &str = "__ferx_pktime_";
+
+/// True for a ferx-internal synthetic individual parameter — either a Form-C readout θ/η
+/// desugaring ([`READOUT_SYNTH_PREFIX`]) or a direct `pk(...=TIME)` mapping desugaring
+/// ([`PKTIME_SYNTH_PREFIX`]). User-facing per-subject output skips these so the synthetic
+/// parameters never surface as sdtab / fit-output columns.
 pub(crate) fn is_synthetic_readout_param(name: &str) -> bool {
-    name.starts_with(READOUT_SYNTH_PREFIX)
+    name.starts_with(READOUT_SYNTH_PREFIX) || name.starts_with(PKTIME_SYNTH_PREFIX)
 }
 
 /// A θ/η reference desugared out of a Form-C readout into a synthetic individual

@@ -252,20 +252,12 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
         return false;
     }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
-    // (`ode_subject_supported` declines it so it can't take the static superposition
-    // path). So being model-level "analytic" additionally requires that walk's model-level
-    // constraints — `init(...)` and built-in absorption input-rate forcing are handled only
-    // on the static walk (`integrate_tvcov_g` seeds compartments at zero and carries no
-    // `R_in`), so a TIME + `init(...)` or TIME + input-rate model has NO analytic walk and
-    // every subject falls back to FD. Decline here so `sens_supported` /
-    // `analytic_outer_gradient_available` (which call this with no per-subject check) report
-    // FD rather than claiming "analytic" for a 100%-FD population — the ODE twin of the
-    // closed-form `analytical_supported` fix (#637 round-2 review #1).
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-        && (ode.init_fn.is_some() || !ode.input_rate.is_empty())
-    {
-        return false;
-    }
+    // (`ode_subject_supported` declines it so it can't take the static superposition path).
+    // A `TIME`-built-in model routes to the event-driven walk (`integrate_tvcov_g`), which now
+    // carries BOTH a built-in absorption input-rate forcing (`R_in`, #643) and a seeded
+    // `init(...)` state (#662) alongside the per-event `TIME` seeding (#637) — so a
+    // TIME + input-rate or TIME + `init(...)` model IS analytic on that walk (#486). (The old
+    // decline here assumed the walk carried neither, which was true before #643/#662.)
     // Readout: the state directly (`ObsCmt`), a simple Form C output program
     // (`y = <expr>` over states/indiv params, e.g. `central / V1`), or a per-CMT
     // Form C (`y[CMT=N] = <expr>`) where every endpoint carries a simple program
@@ -8347,6 +8339,105 @@ mod tests {
                 approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-9);
             }
         }
+    }
+
+    /// #486: a `TIME`-switched CL combined with a **built-in `first_order` absorption
+    /// forcing**. The event-driven walk carries both the per-event `TIME` seeding (#637) and
+    /// the `R_in` forcing (#643), so this composition is analytic — the old
+    /// `ode_analytical_supported` decline (which assumed the walk carried no `R_in`) was
+    /// stale. Value / ∂η / ∂θ + the 2nd-order blocks must match FD of production, and the
+    /// inner Dual1 must track the outer.
+    #[test]
+    fn ode_time_builtin_with_first_order_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+first_order");
+        assert!(
+            ode_analytical_supported(&model),
+            "TIME + input-rate forcing must be analytic now (#486)"
+        );
+        let subject = bolus_subject(&[1.0, 3.0, 8.0, 16.0, 30.0]); // straddle TIME = 5
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0, 1.0];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// #486: a `TIME`-switched CL combined with a non-zero **`init(...)` baseline**. The
+    /// event-driven walk seeds the `init` state (#662) and threads per-event `TIME` (#637)
+    /// together, so this composition is analytic — the old decline (assuming the walk seeded
+    /// compartments at zero) was stale. Value / ∂η / ∂θ + 2nd-order vs FD of production.
+    #[test]
+    fn ode_time_builtin_with_init_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(central) = -(CL/V)*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+init");
+        assert!(model.ode_spec.as_ref().unwrap().init_fn.is_some());
+        assert!(
+            ode_analytical_supported(&model),
+            "TIME + init(...) must be analytic now (#486)"
+        );
+        let mut subject = bolus_subject(&[1.0, 3.0, 8.0, 16.0, 30.0]); // straddle TIME = 5
+        subject.doses = vec![]; // the init baseline is the sole input
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     /// #486: an η-dependent `ExpressionScale` `obs_scale = 1000/V` on the **ODE

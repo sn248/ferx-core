@@ -4477,15 +4477,17 @@ mod tests {
     /// `ode_iov_time_expression_scale_matches_fd_of_predict_iov`). The direct
     /// `pk(...=TIME)` mapping is now desugared into a synthetic `__ferx_pktime_*`
     /// individual parameter and served analytically too (see the `ANALYTICAL_TIME_DIRECT`
-    /// block below and `time_builtin_direct_pk_mapping_matches_fd_of_production`); the only
-    /// remaining `TIME`-specific fallbacks are edge combinations the event-driven walk
-    /// itself cannot serve (an ODE `init(...)` baseline or a built-in input-rate forcing
-    /// under `TIME`, asserted below). The pre-existing scale fallbacks (LTBS +
+    /// block below and `time_builtin_direct_pk_mapping_matches_fd_of_production`). `TIME`
+    /// combined with an ODE `init(...)` baseline (#662) or a built-in input-rate forcing
+    /// (#643) is now analytic on the event-driven walk too — the old model-level declines
+    /// were stale once those features landed (validated by `ode_time_builtin_with_init_*`
+    /// and `ode_time_builtin_with_first_order_*`); this test now pins the analytic route for
+    /// `TIME + init(...)` at the model gate. The pre-existing scale fallbacks (LTBS +
     /// `ExpressionScale`; closed-form IOV + any scaling) are unchanged and independent of
     /// `TIME`. The non-`TIME` twin of each model must stay supported, proving the guards
     /// are specific (#486 / #610).
     #[test]
-    fn time_builtin_indiv_params_force_fd_fallback() {
+    fn time_builtin_indiv_params_analytic_routes() {
         // Analytical 1-cpt IV: a `$PK IF(TIME...)`-style switch on CL.
         const ANALYTICAL_TIME: &str = r#"
 [parameters]
@@ -4681,11 +4683,11 @@ mod tests {
             "ODE IOV now serves TIME via the per-event stacked walk (#486)"
         );
 
-        // #637 round-2 review #1: a TIME + `init(...)` ODE model must report FD at the
-        // model level. TIME forces the event-driven walk (`ode_subject_supported`
-        // declines it), but that walk cannot seed a non-zero `init(...)` state, so every
-        // subject falls back to FD — `ode_analytical_supported` / `analytic_outer_gradient_available`
-        // must therefore report FD, not "analytic".
+        // #486: a TIME + `init(...)` ODE model is now analytic at the model level. TIME forces
+        // the event-driven walk (`integrate_tvcov_g`), which now seeds a non-zero `init(...)`
+        // state (#662) alongside the per-event TIME seeding (#637) — so the model reports
+        // analytic, not FD. (The old #637 round-2 decline assumed the walk seeded compartments
+        // at zero, which was true before #662.)
         const ODE_TIME_INIT: &str = r#"
 [parameters]
   theta TVCL(10.0, 1.0, 100.0)
@@ -4712,12 +4714,12 @@ mod tests {
         let ode_time_init = parse_model_string(ODE_TIME_INIT).expect("parses ODE TIME init");
         assert!(uses_time(&ode_time_init) && ode_time_init.ode_spec.is_some());
         assert!(
-            !ode_supported(&ode_time_init),
-            "TIME + init(...) ODE must decline at the model level (no analytic walk)"
+            ode_supported(&ode_time_init),
+            "TIME + init(...) ODE is analytic on the event-driven walk now (#486)"
         );
         assert!(
-            !analytic_outer_gradient_available(&ode_time_init),
-            "TIME + init(...) ODE outer route must report FD, not analytic"
+            analytic_outer_gradient_available(&ode_time_init),
+            "TIME + init(...) ODE outer route is analytic now (#486)"
         );
 
         // Direct `pk(...=TIME)` mapping (not an `[individual_parameters]` statement): the

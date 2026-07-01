@@ -460,11 +460,12 @@ fn infusion_spans_segment(
 /// True when the time-varying-covariate ODE walk ([`run_subject_tvcov`] /
 /// [`run_subject_tvcov_eta`]) can serve this `(model, subject)`: an in-scope analytic
 /// ODE model whose subject carries TV covariates and uses the **bolus** dose subset.
-/// Non-IOV EVID=2 / `init(...)` route to the FD fallback — production's TV-cov walk
-/// (`ode_predictions_event_driven`) handles those via machinery this non-IOV dual walk
-/// does not yet mirror. The IOV dual walk carries EVID=2 breakpoints separately since
-/// #590. Checked by *both* the outer and inner entry points so the analytic scope stays
-/// matched (#439).
+/// Non-IOV EVID=2 covariate breakpoints (#636) are analytic; `init(...)` is analytic for the
+/// **plain-bolus** subset (seeded at the first-record snapshot, #486) and routes to FD when
+/// combined with a reset / lagtime / finite infusion / input-rate forcing / steady-state /
+/// modeled-dose (see `ode_tvcov_supported`). The IOV dual walk carries EVID=2 breakpoints
+/// separately since #590. Checked by *both* the outer and inner entry points so the analytic
+/// scope stays matched (#439).
 /// Resolve a dose's modeled `RATE` to its PK slot (#530). A `RATE=-2` (`D{cmt}`) dose reads
 /// its duration slot, a `RATE=-1` (`R{cmt}`) dose its rate slot; a `Fixed` dose — or a modeled
 /// dose whose `D{cmt}`/`R{cmt}` slot is undeclared — returns `None`. Single-sourced so the
@@ -557,9 +558,29 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // lagtime, the rate-on saltation at the moving start). `add_prepared_input_rate_forcing`
     // still skips `ZeroOrder` — the per-segment constant channel owns its delivery, exactly
     // as on the static walk — so there is no longer any dropped forcing to guard against.
-    // The bolus walk seeds compartments at zero; `init(...)` needs the seeded
-    // initial-state machinery the static path uses, so route those to FD.
-    if ode.init_fn.is_some() {
+    // `init(...)` initial conditions are seeded on the event-driven walk at the subject's
+    // first-record covariate snapshot (`tvcov_init_state`, matching production's `init_pk`),
+    // so a TV-cov + `init(...)` **bolus** subject is analytic on both loops (#486). It stays
+    // on FD when combined with a feature whose saltation / equilibration / forcing branch was
+    // written for a **zero baseline** and is not yet validated against a parameter-dependent
+    // `init` seed — the analytic scope matches what the FD-vs-production tests cover:
+    //   • an EVID 3/4 **reset** — production re-seeds `init` at the reset-event snapshot
+    //     (`last_pk`), whereas the walk carries one subject-level init jet;
+    //   • an estimated **lagtime** — the dose-arrival saltation branch assumes `x⁻ = 0`;
+    //   • a **finite infusion** — the `active_infusions` accumulation isn't checked against
+    //     a non-zero baseline;
+    //   • a built-in **input-rate forcing** (igd/transit/weibull/first_order, #643);
+    //   • **steady-state** — the dual SS equilibration seeds from zero, not `init`;
+    //   • a **modeled-duration/rate dose** (#530 moving-window saltation).
+    // Each is a genuine analytic-scope extension behind its own validation (#486 follow-up).
+    if ode.init_fn.is_some()
+        && (!subject.reset_times.is_empty()
+            || model.has_lagtime()
+            || !ode.input_rate.is_empty()
+            || subject.has_periodic_ss_dose()
+            || !subject.all_doses_fixed()
+            || subject.doses.iter().any(|d| d.is_infusion()))
+    {
         return false;
     }
     // #530: modeled-`RATE`/duration doses are resolved from their PK slot as a live jet
@@ -1137,16 +1158,80 @@ pub(crate) fn pd_from_program<const M: usize>(
     }
 }
 
+/// Central finite differences of `init_fn` over the differentiated PK slots — the shared
+/// stencil behind [`dual_init_state`], [`dual1_init_state`], and [`tvcov_init_state`], so the
+/// `he`/`h2` steps and the 2-/3-/4-point formulas live in **one** place. Returns
+/// `(base, d1, d2)` where `d1[s][i] = ∂init_s/∂p_{pk_indices[i]}` and, when `want_d2`, the
+/// symmetric `d2[s][i][j] = ∂²init_s/∂p_i∂p_j`; `d2` is empty otherwise (gradient-only
+/// callers). `init_fn` is a cheap HashMap eval, so the FD cost is negligible.
+fn init_fd_derivs(
+    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
+    pk: &[f64],
+    pk_indices: &[usize],
+    n_states: usize,
+    want_d2: bool,
+) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>) {
+    let he = 1e-6;
+    let h2 = 1e-4;
+    let np = pk_indices.len();
+    let base = init_fn(pk);
+    let mut d1 = vec![vec![0.0; np]; n_states];
+    for (i, &si) in pk_indices.iter().enumerate() {
+        let mut pp = pk.to_vec();
+        pp[si] += he;
+        let mut pm = pk.to_vec();
+        pm[si] -= he;
+        let (up, dn) = (init_fn(&pp), init_fn(&pm));
+        for s in 0..n_states {
+            d1[s][i] = (up[s] - dn[s]) / (2.0 * he);
+        }
+    }
+    let mut d2: Vec<Vec<Vec<f64>>> = Vec::new();
+    if want_d2 {
+        d2 = vec![vec![vec![0.0; np]; np]; n_states];
+        for (i, &si) in pk_indices.iter().enumerate() {
+            let mut pp = pk.to_vec();
+            pp[si] += h2;
+            let mut pm = pk.to_vec();
+            pm[si] -= h2;
+            let (up, dn) = (init_fn(&pp), init_fn(&pm));
+            for s in 0..n_states {
+                d2[s][i][i] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
+            }
+            for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
+                let mut a = pk.to_vec();
+                a[si] += h2;
+                a[sj] += h2;
+                let mut b = pk.to_vec();
+                b[si] += h2;
+                b[sj] -= h2;
+                let mut c = pk.to_vec();
+                c[si] -= h2;
+                c[sj] += h2;
+                let mut d = pk.to_vec();
+                d[si] -= h2;
+                d[sj] -= h2;
+                let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
+                for s in 0..n_states {
+                    let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
+                    d2[s][i][j] = v;
+                    d2[s][j][i] = v;
+                }
+            }
+        }
+    }
+    (base, d1, d2)
+}
+
 /// The `DualMixed<NA, N>` initial state from a model's `init(...)` directives,
-/// seeding each compartment's value **and its PK-parameter derivatives** by central
-/// FD of the f64 `init_fn` over the differentiated PK slots. `init_fn` is a cheap
-/// HashMap eval (no integration), so the FD cost is negligible.
+/// seeding each compartment's value **and its PK-parameter derivatives** (via the shared
+/// [`init_fd_derivs`] stencil) mapped onto the dual axes.
 ///
 /// Individual parameter `i` seeds dual axis `axis_of[i]` — identity (`= i`) for the
 /// full `Dual2<N>` path (`NA == N`, `axis_of == None`), or the IIV-leading
 /// permutation for the mixed path (#445). The first-order block fills the gradient
 /// at every axis; the second-order block fills only the retained Hessian rows
-/// (axis `< NA`), and skips the FD evaluations whose result would be dropped.
+/// (axis `< NA`) — the dropped rows are computed but not written (`init_fn` is cheap).
 fn dual_init_state<const NA: usize, const N: usize>(
     init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
     pk: &[f64],
@@ -1155,61 +1240,34 @@ fn dual_init_state<const NA: usize, const N: usize>(
     axis_of: Option<&[usize]>,
 ) -> Vec<DualMixed<NA, N>> {
     let ax = |i: usize| axis_of.map_or(i, |p| p[i]);
-    let base = init_fn(pk);
-    let he = 1e-6;
-    let h2 = 1e-4;
+    let (base, d1, d2) = init_fd_derivs(init_fn, pk, pk_indices, n_states, true);
+    let np = pk_indices.len();
     let mut out: Vec<DualMixed<NA, N>> = (0..n_states)
         .map(|s| DualMixed::constant(base.get(s).copied().unwrap_or(0.0)))
         .collect();
 
     // First order: gradient at every parameter's axis.
-    for (i, &si) in pk_indices.iter().enumerate() {
+    for i in 0..np {
         let ai = ax(i);
-        let mut pp = pk.to_vec();
-        pp[si] += he;
-        let mut pm = pk.to_vec();
-        pm[si] -= he;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
         for s in 0..n_states {
-            out[s].grad[ai] = (up[s] - dn[s]) / (2.0 * he);
+            out[s].grad[ai] = d1[s][i];
         }
     }
     // Second order: only the retained Hessian rows (axis < NA).
-    for (i, &si) in pk_indices.iter().enumerate() {
+    for i in 0..np {
         let ai = ax(i);
-        // Diagonal — skip the FD evaluation entirely when this axis carries no
-        // Hessian row (an IIV-free parameter in the mixed path) (#448 review #8).
         if ai < NA {
-            let mut pp = pk.to_vec();
-            pp[si] += h2;
-            let mut pm = pk.to_vec();
-            pm[si] -= h2;
-            let (up, dn) = (init_fn(&pp), init_fn(&pm));
             for s in 0..n_states {
-                out[s].hess[ai][ai] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
+                out[s].hess[ai][ai] = d2[s][i][i];
             }
         }
-        for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
+        for j in (i + 1)..np {
             let aj = ax(j);
-            // Both axes in the dropped block — no Hessian row to fill.
             if ai >= NA && aj >= NA {
                 continue;
             }
-            let mut a = pk.to_vec();
-            a[si] += h2;
-            a[sj] += h2;
-            let mut b = pk.to_vec();
-            b[si] += h2;
-            b[sj] -= h2;
-            let mut c = pk.to_vec();
-            c[si] -= h2;
-            c[sj] += h2;
-            let mut d = pk.to_vec();
-            d[si] -= h2;
-            d[sj] -= h2;
-            let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
             for s in 0..n_states {
-                let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
+                let v = d2[s][i][j];
                 if ai < NA {
                     out[s].hess[ai][aj] = v;
                 }
@@ -1224,27 +1282,131 @@ fn dual_init_state<const NA: usize, const N: usize>(
 
 /// `Dual1<N>` initial state from a model's `init(...)` directives (gradient only) —
 /// the light counterpart of [`dual_init_state`]: seeds each compartment's value and
-/// its first-order PK-parameter derivatives by central FD of the f64 `init_fn`.
+/// its first-order PK-parameter derivatives via the shared [`init_fd_derivs`] stencil
+/// (skipping the second-order block).
 fn dual1_init_state<const N: usize>(
     init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
     pk: &[f64],
     pk_indices: &[usize],
     n_states: usize,
 ) -> Vec<Dual1<N>> {
-    let base = init_fn(pk);
-    let he = 1e-6;
+    let (base, d1, _) = init_fd_derivs(init_fn, pk, pk_indices, n_states, false);
     let mut out: Vec<Dual1<N>> = (0..n_states)
         .map(|s| Dual1::constant(base.get(s).copied().unwrap_or(0.0)))
         .collect();
-    for (i, &si) in pk_indices.iter().enumerate() {
-        let mut pp = pk.to_vec();
-        pp[si] += he;
-        let mut pm = pk.to_vec();
-        pm[si] -= he;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
+    for i in 0..pk_indices.len() {
         for s in 0..n_states {
-            out[s].grad[i] = (up[s] - dn[s]) / (2.0 * he);
+            out[s].grad[i] = d1[s][i];
         }
+    }
+    out
+}
+
+/// Seed the ODE `init(...)` initial state for the **event-driven TV-cov walk**, on the
+/// walk's own dual basis (`Dual2<M>` outer / `Dual1<N>` inner — whatever `T` the caller
+/// propagates). Unlike the static walk, which seeds `init` on the PK-parameter axes
+/// ([`dual_init_state`]) and chains to (θ,η) at the readout, the TV-cov walk propagates
+/// its state on (θ,η) directly (`seed_pk_dual2`/`seed_pk_dual1`), so `init` must be
+/// seeded on that basis here — and is consumed by [`integrate_tvcov_g`] as the initial
+/// state (`ode_tvcov_supported` keeps `init(...)` + EVID 3/4 reset on FD, since a reset
+/// re-seeds production at the reset-event snapshot but the walk carries one subject jet).
+///
+/// Production seeds `init` at the subject's **first record** covariate snapshot
+/// (`init_pk`, `predictions.rs`: smallest record time across dose / obs / pk-only), so
+/// we pick that snapshot's already-seeded PK duals `p` and expand `init` as a
+/// second-order Taylor series in the PK params, evaluated with `T` arithmetic:
+///
+/// ```text
+/// init_s ≈ init_fn(p̄)_s + Σ_i (∂init_s/∂p_i)·(p_i − p̄_i)
+///                       + ½ Σ_ij (∂²init_s/∂p_i∂p_j)·(p_i − p̄_i)(p_j − p̄_j)
+/// ```
+///
+/// The `∂init/∂p` derivatives come from the shared [`init_fd_derivs`] stencil. Each delta
+/// `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η jet, so `T`'s own product rule
+/// propagates it to the walk basis exactly. A `Dual1` inner walk (`T::SECOND_ORDER == false`)
+/// **skips the second-order block and term entirely** — its ε² is zero, so the quadratic
+/// term would contribute nothing — leaving the same first-order η-gradient the `Dual2` outer
+/// walk carries. All-zero when the subject has no records (defensive).
+fn tvcov_init_state<T: crate::sens::num::PkNum>(
+    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
+    subject: &Subject,
+    pk_at_dose: &[Vec<T>],
+    pk_at_obs: &[Vec<T>],
+    pk_at_pk_only: &[Vec<T>],
+    pk_indices: &[usize],
+    n_states: usize,
+) -> Vec<T> {
+    // First-record snapshot (smallest record time), matching production's `init_pk`
+    // selection. Doses/obs/pk-only are scanned in that order, so at an exact tie the
+    // earliest-considered snapshot wins — identical to production's `consider` (`t < bt`).
+    let mut best_t = f64::INFINITY;
+    let mut best: Option<&[T]> = None;
+    for (k, d) in subject.doses.iter().enumerate() {
+        if d.time < best_t {
+            best_t = d.time;
+            best = Some(&pk_at_dose[k]);
+        }
+    }
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        if t < best_t {
+            best_t = t;
+            best = Some(&pk_at_obs[j]);
+        }
+    }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        if t < best_t {
+            best_t = t;
+            best = Some(&pk_at_pk_only[m]);
+        }
+    }
+    let snap = match best {
+        Some(p) => p,
+        None => return vec![T::from_f64(0.0); n_states],
+    };
+
+    // Central FD of `init_fn` at that snapshot via the shared stencil. The inner `Dual1`
+    // walk (`T::SECOND_ORDER == false`) discards the quadratic term, so skip the `d2` block
+    // entirely there rather than build a Hessian it drops.
+    let want_2nd = T::SECOND_ORDER;
+    let pk_vals: Vec<f64> = snap.iter().map(|x| x.val()).collect();
+    let (base, d1, d2) = init_fd_derivs(init_fn, &pk_vals, pk_indices, n_states, want_2nd);
+    let np = pk_indices.len();
+
+    // Deltas δ_i = p_i − p̄_i (value 0, carry the snapshot's θ/η jets).
+    let deltas: Vec<T> = pk_indices
+        .iter()
+        .map(|&si| snap[si] - T::from_f64(pk_vals[si]))
+        .collect();
+
+    // Taylor-compose on the walk basis via `T` arithmetic:
+    //   init_s ≈ base_s + Σ_i d1_i·δ_i + ½ Σ_i d2_ii·δ_i² + Σ_{i<j} d2_ij·δ_iδ_j
+    // The linear term contributes `Σ_i d1_i H_i` to the Hessian; the diagonal ½·δ_i² gives
+    // `d2_ii g_i⊗g_i` and each off-diagonal `δ_iδ_j` gives `g_i⊗g_j + g_j⊗g_i` — visiting
+    // `i<j` once (with the full `d2_ij` coefficient, `d2` symmetric) yields the exact
+    // `Σ_ij d2_ij g_i⊗g_j` at half the O(np²·M²) Dual2 work of the all-ordered form.
+    let mut out = Vec::with_capacity(n_states);
+    for s in 0..n_states {
+        let mut acc = T::from_f64(base.get(s).copied().unwrap_or(0.0));
+        for i in 0..np {
+            if d1[s][i] != 0.0 {
+                acc = acc + T::from_f64(d1[s][i]) * deltas[i];
+            }
+        }
+        if want_2nd {
+            for i in 0..np {
+                let cd = 0.5 * d2[s][i][i];
+                if cd != 0.0 {
+                    acc = acc + T::from_f64(cd) * deltas[i] * deltas[i];
+                }
+                for j in (i + 1)..np {
+                    let c = d2[s][i][j];
+                    if c != 0.0 {
+                        acc = acc + T::from_f64(c) * deltas[i] * deltas[j];
+                    }
+                }
+            }
+        }
+        out.push(acc);
     }
     out
 }
@@ -1831,7 +1993,22 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         .iter()
         .map(|d| d.time)
         .fold(f64::INFINITY, f64::min);
-    let init_state: Vec<T> = vec![T::from_f64(0.0); ode.n_states];
+    // Initial compartment state from `init(...)`, seeded on the walk's own dual basis at
+    // the subject's first-record covariate snapshot (matching production `init_pk`); all
+    // zeros when no `init(...)` is declared (#486). `ode_tvcov_supported` keeps `init` +
+    // EVID 3/4 reset on FD, so a single subject-level init jet is exact here.
+    let init_state: Vec<T> = match ode.init_fn.as_ref() {
+        Some(f) => tvcov_init_state::<T>(
+            f.as_ref(),
+            subject,
+            pk_at_dose,
+            pk_at_obs,
+            pk_at_pk_only,
+            &model.pk_indices,
+            ode.n_states,
+        ),
+        None => vec![T::from_f64(0.0); ode.n_states],
+    };
 
     // Per-dose lagtime slot: the bare `PK_IDX_LAGTIME`, or a compartment-indexed
     // `ALAG{cmt}` slot when declared (#369). Empty when the model has no lagtime (the
@@ -4347,10 +4524,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             }
         } else {
             // EVID 3/4 reset: zero every compartment's full jet (post-reset state is 0
-            // independent of the parameters, so its sensitivity is 0 too). The gate
-            // excludes `init(...)`, so the reset baseline is zero (matches production's
-            // `initial_state` with no init). For EVID=4 the same-time dose sorts after
-            // the reset (`K_RESET < K_DOSE`), so it lands on the zeroed state.
+            // independent of the parameters, so its sensitivity is 0 too). `ode_tvcov_supported`
+            // routes `init(...)` + reset to FD, so whenever a reset fires here `init(...)` is
+            // absent and the reset baseline is zero (matches production's `initial_state` with
+            // no init). For EVID=4 the same-time dose sorts after the reset (`K_RESET < K_DOSE`),
+            // so it lands on the zeroed state.
             for x in u.iter_mut() {
                 *x = T::from_f64(0.0);
             }
@@ -7862,6 +8040,115 @@ mod tests {
         subject.dose_covariates = vec![wt(60.0)];
         subject.obs_covariates = vec![wt(60.0), wt(70.0), wt(80.0), wt(90.0)];
         subject
+    }
+
+    // TV-cov + `init(...)` (#486): a WT covariate on CL makes it a TV-cov subject, and
+    // `init(central) = BASE / V` seeds an η-dependent (via `V`) and *nonlinear* baseline —
+    // so the event-driven walk's dual init seed carries `∂/∂(θ,η)` and a non-zero
+    // second-order block (`∂²(BASE/V)/∂V² ≠ 0`), exercising both Taylor terms of
+    // `tvcov_init_state`.
+    const TVCOV_INIT_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V    = TVV * exp(ETA_V)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = -CL/V * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// TV-cov + `init(...)` on the non-IOV ODE walk (#486): `init(central) = BASE/V` is
+    /// η-dependent (through `V`) and nonlinear, so the event-driven walk's dual init seed
+    /// must carry `∂/∂(θ,η)` and its second-order block. The analytic `SubjectSens` (value,
+    /// `∂f/∂η`, `∂f/∂θ`, + 2nd order) must match FD of the production TV-cov predictor,
+    /// which seeds `init` at the first-record covariate snapshot (`init_pk`).
+    #[test]
+    fn ode_provider_tvcov_init_matches_production() {
+        let model = parse_model_string(TVCOV_INIT_ODE).expect("parse");
+        assert_eq!(model.n_theta, 4);
+        assert_eq!(model.n_eta, 2); // M = n_theta + n_eta = 6
+        let subject = tvcov_subject();
+        assert!(subject.has_tv_covariates());
+        assert!(
+            subject.reset_times.is_empty(),
+            "fixture must have no reset — init + reset stays FD"
+        );
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "TV-cov + init(...) must be analytic on the non-IOV ODE walk (#486)"
+        );
+        let theta = vec![1.0, 20.0, 0.75, 500.0];
+        let eta = vec![0.1, -0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+    }
+
+    /// Inner/outer parity for TV-cov + `init(...)` (#486): the light `Dual1` inner
+    /// η-gradient — which seeds `init` through the SAME `tvcov_init_state` (its second-order
+    /// term vanishes at `Dual1`) — must equal the full `Dual2` outer `df_deta`. Both walks
+    /// share `ode_tvcov_supported`, so the init seed moves in lockstep or the inner EBE
+    /// gradient silently diverges.
+    #[test]
+    fn ode_provider_tvcov_init_inner_eta_grad_matches_outer() {
+        let model = parse_model_string(TVCOV_INIT_ODE).expect("parse");
+        let subject = tvcov_subject();
+        let theta = vec![1.0, 20.0, 0.75, 500.0];
+        let eta = vec![0.1, -0.05];
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// TV-cov + `init(...)` is admitted only for the validated **plain-bolus** scope (#486).
+    /// Combining `init(...)` with a feature whose saltation / equilibration / forcing branch
+    /// was written for a zero baseline — an EVID 3/4 reset, an estimated lagtime, a finite
+    /// infusion, a built-in input-rate forcing, steady-state, or a modeled-duration/rate dose
+    /// — routes to FD until each is separately validated. The two cases constructible from the
+    /// bolus fixture (reset, finite infusion) are pinned here; the rest share the same gate
+    /// clause in `ode_tvcov_supported`.
+    #[test]
+    fn ode_tvcov_init_unvalidated_compositions_route_to_fd() {
+        let model = parse_model_string(TVCOV_INIT_ODE).expect("parse");
+        // Baseline: plain-bolus TV-cov + init is analytic.
+        assert!(
+            ode_tvcov_supported(&model, &tvcov_subject()),
+            "init + bolus is analytic"
+        );
+
+        // + EVID 3/4 reset → FD (production re-seeds init at the reset-event snapshot).
+        let mut s = tvcov_subject();
+        s.reset_times = vec![4.0];
+        assert!(
+            !ode_tvcov_supported(&model, &s),
+            "init + EVID 3/4 reset must route to FD"
+        );
+
+        // + finite infusion → FD (active_infusions accumulation unvalidated vs a non-zero baseline).
+        let mut s = tvcov_subject();
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 5.0, false, 0.0)];
+        assert!(
+            s.doses[0].is_infusion(),
+            "fixture must be a finite infusion"
+        );
+        assert!(
+            !ode_tvcov_supported(&model, &s),
+            "init + finite infusion must route to FD"
+        );
     }
 
     /// **Estimated lagtime × time-varying covariates.** A 1-cpt oral ODE with a WT

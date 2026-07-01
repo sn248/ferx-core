@@ -94,9 +94,12 @@ covariate and κ both switch the individual parameters across occasions, includi
 subject-static expression `obs_scale` divisors since #590). A non-IOV **ODE** model
 with time-varying covariates now also stays analytic when combined with an
 **expression-based output scaling** (`obs_scale = <expr>`, applied as a
-subject-static post-walk quotient) or an **`EVID=2` covariate-only breakpoint**
-(both since #486). Time-varying covariates with **dose lagtime** on the closed-form
-analytical models still fall back to the finite-difference gradient. (See
+subject-static post-walk quotient), an **`EVID=2` covariate-only breakpoint**, or
+**`init(...)` initial conditions** (seeded at the subject's first-record covariate
+snapshot, all since #486). Time-varying covariates with **dose lagtime** on the
+closed-form analytical models still fall back to the finite-difference gradient, as
+does an ODE model that combines `init(...)` with an **EVID 3/4 reset** (production
+re-seeds `init` at the reset-event snapshot). (See
 [FOCE/FOCEI](../estimation/foce.qmd) for the optimizer/gradient interaction.)
 
 ## Covariate table

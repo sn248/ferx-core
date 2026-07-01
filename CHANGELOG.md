@@ -29,7 +29,19 @@ section of the SDLC for the versioning policy).
   closed-form/ODE, including the `M3 + IOV + iiv_on_ruv` triple. **M3 FOCEI OFV values shift
   accordingly** (estimates/SEs are essentially unchanged), and the OFV now matches NONMEM
   `METHOD=1 LAPLACE` M3 up to the residual FOCEI-vs-LAPLACE second-order term. FOCE
-  (Sheiner–Beal) is a distinct objective and is unchanged.
+  (Sheiner–Beal) is a distinct objective, updated separately (see the next entry).
+- **FOCE (Sheiner–Beal) M3 BLOQ now uses the linearized-marginal moments** for the
+  censored tail probability — `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)` with the marginal mean
+  `f0 = f(η̂) − Hη̂` and marginal variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰`, the same moments the
+  quantified rows use — instead of the conditional prediction and residual variance
+  (#646). This makes plain FOCE a self-consistent Sheiner–Beal objective (matching
+  Monolix's linearization likelihood and first-order/Tobit theory); the analytic FOCE
+  gradient is updated to match, including a new direct Ω-gradient channel for the censored
+  variance, on both the non-IOV and IOV paths. **FOCE M3 OFV and estimates shift** (most
+  when between-subject variance is large, where `HΩHᵀ` dominates `R⁰`). FOCEI M3 keeps the
+  conditional censored term — the treatment NONMEM's `METHOD=1 LAPLACE` M3 uses (NONMEM
+  runs M3 only under LAPLACE), which ferx's first-order FOCEI matches up to the
+  FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
 - **Zero-order absorption (`zero_order(dur)`, and the `zero_order` leg of a `mixed` model)
@@ -40,6 +52,27 @@ section of the SDLC for the versioning policy).
   rate-off / rate-on saltations; the rate-off uses the general `g⁻ − g⁺` form so a
   covariate that varies across the window end stays exact. Only `zero_order` under IOV
   remains on finite differences.
+- **Custom / time-varying residual-error magnitude (`[error_model]` σ-scaling expression)
+  now gets an exact analytic gradient** on both loops instead of finite differences
+  (#484/#576/#486). The magnitude is η-independent, so the inner EBE gradient just
+  threads the per-observation multiplier into the residual variance and its
+  `f`-derivative; the FOCEI outer θ/σ population gradient additionally
+  dual-differentiates the compiled magnitude program w.r.t. θ, adding a new
+  *direct*-θ term to `∂R/∂θ` for any theta the magnitude expression references
+  (e.g. a late-phase RUV inflation `PROP_ERR * (1 + RUV_LATE * TIME/48)`).
+  Validated against a live NONMEM FOCEI fit (OFV and every estimate, including
+  `RUV_LATE`, match to ~4-5 significant figures — see `examples/warfarin_ruv_magnitude.ferx`).
+  `block_sigma` correlated residual error, `iiv_on_ruv`, an M3-BLOQ censored row,
+  more than 16 thetas, and plain `method = foce` (non-interaction) still fall back
+  to the (magnitude-aware) finite-difference gradient.
+- **`init(...)` initial conditions with time-varying covariates** now get exact analytic
+  FOCE/FOCEI sensitivities on the ODE path instead of finite differences (#486). The
+  event-driven walk seeds the dual initial state from the subject's first-record covariate
+  snapshot (matching the production predictor's `init_pk`), so a covariate- or η-dependent
+  baseline (e.g. `init(central) = BASE / V`) carries `∂/∂(θ,η)`. Analytic for the plain-bolus
+  subset; `init(...)` combined with an EVID 3/4 reset, an estimated lagtime, a finite
+  infusion, a built-in input-rate forcing, steady-state, or a modeled-duration/rate dose
+  stays on the finite-difference fallback.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK

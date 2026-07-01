@@ -15946,6 +15946,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_fit_options_covariance_ofv_hessian_removed() {
+        // The `covariance_ofv_hessian` option was removed in #639 (the analytical-
+        // gradient covariance R stencil it selected is gone; the reconverged-OFV
+        // second difference is the sole stencil). An old model file that still sets
+        // it must now fail loudly as an unknown key, not silently be accepted.
+        let err = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap_err();
+        assert!(err.contains("unknown key"), "got: {err}");
+        assert!(err.contains("covariance_ofv_hessian"), "got: {err}");
+    }
+
+    #[test]
     fn test_parse_fit_options_malformed_numeric_errors() {
         assert!(parse_fit_options(&["n_exploration = oops".to_string()]).is_err());
     }

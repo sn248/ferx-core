@@ -71,7 +71,8 @@ fn all_ses(r: &ferx_core::FitResult) -> Vec<f64> {
 /// and returns finite positive SEs. This is the Tier-2 guard that runs in the
 /// per-PR fast job — where the NONMEM-anchored convergence tests below are
 /// `#[ignore]`d — so it exercises the score cross-product's `log|H̃|`
-/// EBE-response path (#335) and `compute_covariance`'s analytical R stencil on
+/// EBE-response path (#335) and `compute_covariance`'s reconverged-OFV
+/// second-difference R stencil on
 /// every PR. Accuracy vs NONMEM is asserted by the slow tests; this guards that
 /// the assembly runs and the EBE-response term stays finite. A modest
 /// `outer_maxiter` keeps it fast (the covariance step still runs at the final
@@ -178,11 +179,13 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
     ignore = "slow + NONMEM-anchored FOCEI s/rsr covariance SE cross-check (#266/#335): opt in with --features slow-tests"
 )]
 // Re-enabled (#335): the `s` (pure cross-product) estimator is a 10-subject
-// outer-product and is inherently noisier (20% band). The Warfarin RSR anchor is
-// intentionally kept on the analytical R path here because this fixture has no
-// residual correlations; the OFV second-difference override is validated
-// elsewhere and is too sensitive to finite-difference step/inner-loop noise at
-// the current L-BFGS solution.
+// outer-product and is inherently noisier (20% band). The RSR sandwich `R⁻¹SR⁻¹`
+// draws its `R` from the reconverged-OFV second-difference stencil (the sole R
+// path since #639). That stencil is only well-conditioned at a true stationary
+// point, so this fixture relies on the default `Auto` optimizer (→ analytic-
+// gradient NLopt L-BFGS) converging; the earlier `covariance_ofv_hessian = false`
+// override that routed this anchor onto the now-removed analytical-gradient
+// stencil is gone.
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     assert!(

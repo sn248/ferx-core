@@ -3156,8 +3156,8 @@ fn assemble_score_cross_product(
     // Unlike the FD-built R-matrix — which reconverges η̂ at every perturbed point
     // and so captures the `log|H̃|` EBE-response `½·∂log|H̃|/∂η̂·dη̂/dθ` — the raw
     // analytic gradient holds η̂ fixed and drops it. Add it back here (the #274
-    // `tᵢ` term, in −logL units; `point_grad` adds `2·tᵢ` to the −2logL gradient)
-    // so the score matches how NONMEM differences the individual objective with
+    // `tᵢ` term, in −logL units; in −2logL units this contributes `2·tᵢ` to the
+    // gradient) so the score matches how NONMEM differences the individual objective with
     // its conditional estimate responding to θ. This is what makes the FOCEI
     // S/RSR match NONMEM (warfarin RSR ≈ 1.8% with it, ≈ 5% without); the
     // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
@@ -3294,9 +3294,11 @@ pub(crate) fn compute_covariance(
     // warfarin, which previously forced eigenvalue clipping (#129) and inflated
     // the SEs.
     //
-    // This single helper is the reconvergence used by all three covariance paths
-    // — the base-OFV evaluation, the non-IOV gradient-FD `point_grad`, and the
-    // IOV scalar-FD `serial_ofv` — so they cannot drift apart (#298). It is
+    // This single helper is the reconvergence used by both covariance-OFV
+    // evaluations — the base-OFV evaluation and the second-difference stencil's
+    // `serial_ofv` (which now serves the non-IOV and IOV cases alike, since the
+    // FD-of-OFV Hessian is the sole R stencil) — so they cannot drift apart
+    // (#298). It is
     // serial (not the parallel `run_inner_loop_warm`) because the covariance step
     // parallelises over perturbed POINTS, not subjects; nested parallelism is
     // what #256 removed. `find_ebe` is deterministic per subject, so the

@@ -408,7 +408,7 @@ section of the SDLC for the versioning policy).
   perturbed point. The old analytical stencil held `a` fixed and biased the SE of
   weakly-identified structural parameters; its exact form requires third-order
   sensitivities (tracked separately). Models that set `covariance_ofv_hessian` should
-  drop the key (it is now an unknown option).
+  drop the key (it is now an unknown option) (#639).
 
 ### Fixed
 - **Gradient optimizers no longer fail on a first-step overshoot into the EBE guard**

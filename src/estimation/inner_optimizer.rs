@@ -3295,6 +3295,7 @@ mod tests {
             }),
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
 
@@ -3846,6 +3847,7 @@ mod iov_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -5531,6 +5533,7 @@ mod iov_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
         let subject = Subject {
@@ -5587,6 +5590,7 @@ mod iov_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,

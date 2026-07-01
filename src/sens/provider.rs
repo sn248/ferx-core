@@ -247,9 +247,70 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         && model.n_kappa == 0
         && scaling_supported(model)
         && init_supported(model)
+        && analytic_readout_dual_supported(model)
         // Every individual-parameter slot must be one we differentiate. A
         // LAGTIME (slot 8) routes to fall back.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+}
+
+/// Whether an analytic Form C readout (`[scaling] y = <expr>`, #650), if present,
+/// is one the Dual2 provider differentiates exactly. `true` when there is no
+/// readout (the built-in concentration output), or when the readout is:
+/// - a **uniform** `Single` readout (per-CMT `y[CMT=N]` routes to FD for now),
+/// - carrying a **dual-evaluable** program (no bare θ/η / NN output — those are
+///   left un-desugared on the analytic path, so they fall back to FD), and
+/// - not referencing the oral **depot** amount (the static superposition jet
+///   reconstructs the central amount as `conc × V` but not the depot amount),
+///   and the model has no `[initial_conditions]` baseline (the init impulse is
+///   layered onto the concentration, not the post-readout output).
+///
+/// When `false`, the model's Form C readout routes to the finite-difference
+/// gradient — which differentiates the readout-aware f64 predictor, so it is
+/// correct, just slower (a documented fallback, not silent: the parser attaches
+/// a warning). Keeping the check here means `analytical_supported` reports FD
+/// honestly rather than claiming analytic and then FD-ing every subject (#637).
+fn analytic_readout_dual_supported(model: &CompiledModel) -> bool {
+    let Some(ar) = &model.analytic_readout else {
+        return true;
+    };
+    if !model.analytical_init.is_empty() {
+        return false;
+    }
+    match (&ar.readout, &ar.program) {
+        (crate::ode::OdeReadout::Single(_), Some(prog)) => {
+            // Depot is state slot 0 only in the first-order-oral
+            // `["depot", "central"]` layout. IV models (and the transit model,
+            // whose analytic layout is central-only) have no depot slot, so their
+            // slot 0 is `central` — guard the depot check on the layout, not on
+            // `is_oral()` (which also matches transit).
+            let has_depot_slot = matches!(
+                model.pk_model,
+                PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+            );
+            prog.is_dual_evaluable() && !(has_depot_slot && prog.references_state(0))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an analytic Form C readout can be served analytically on the
+/// **tv-covariate / oral-infusion / TIME** event-walk path (#650). The walk seeds
+/// only the eight structural `PkDual` slots (`CL..V3`), so in addition to the
+/// static-path scope ([`analytic_readout_dual_supported`]) every parameter the
+/// readout references must map to a slot `<= PK_IDX_V3`. A readout referencing a
+/// higher slot (only reachable when many non-structural readout params are
+/// allocated) falls back to FD on this path — the static path still serves it.
+fn readout_tvcov_supported(model: &CompiledModel) -> bool {
+    let Some(ar) = &model.analytic_readout else {
+        return true;
+    };
+    match &ar.program {
+        Some(prog) => {
+            analytic_readout_dual_supported(model)
+                && prog.max_indiv_pk_slot().is_none_or(|s| s <= PK_IDX_V3)
+        }
+        None => false,
+    }
 }
 
 /// Whether the model's `[initial_conditions]` baseline (#521) is one the Dual2
@@ -785,6 +846,12 @@ pub fn subject_sensitivities_iov(
     if !iov_analytical_supported(model) {
         return None;
     }
+    // Analytic Form C readout (#650) under IOV: the IOV dual walk does not yet
+    // route the amount state through the readout, so fall back to FD (correct via
+    // the readout-aware f64 predictor). See `subject_sensitivities_tvcov`.
+    if model.analytic_readout.is_some() {
+        return None;
+    }
     let s = build_iov_sources(model, subject, theta, stacked_eta)?;
     // Run the walk over `Dual2<M>` (M = n_theta + n_stacked); the dual width tracks
     // the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK axes, so it stays
@@ -1016,6 +1083,12 @@ fn subject_eta_grad_iov_analytical(
     stacked_eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     if !iov_analytical_supported(model) {
+        return None;
+    }
+    // Analytic Form C readout (#650) under IOV: the IOV dual walk does not yet
+    // route the amount state through the readout, so fall back to FD (correct via
+    // the readout-aware f64 predictor). See `subject_sensitivities_tvcov`.
+    if model.analytic_readout.is_some() {
         return None;
     }
     let s = build_iov_sources(model, subject, theta, stacked_eta)?;
@@ -1403,6 +1476,14 @@ pub fn subject_sensitivities_tvcov(
     if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
+    // Analytic Form C readout (#650) on a TV-cov / oral-infusion / TIME subject:
+    // the event-driven Dual2 walk carries the compartment amount as a dual, so the
+    // readout is served analytically here — provided every parameter it references
+    // fits the eight structural `PkDual` slots (`readout_tvcov_supported`).
+    // Otherwise fall back to FD (correct via the readout-aware f64 predictor).
+    if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {
+        return None;
+    }
     // Steady-state doses equilibrate per-event in the walk (`equilibrate_ss_g`,
     // at each dose's covariate snapshot), exactly as production's event-driven
     // predictor does. A steady-state dose assumes an infinite periodic history,
@@ -1431,11 +1512,17 @@ pub fn subject_sensitivities_tvcov(
         }
     }
 
+    // Analytic Form C readout program (#650); `readout_tvcov_supported` (checked at
+    // the gate) guarantees it fits the eight structural `PkDual` slots here.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($m:literal),+) => {
             match m_dim {
                 $($m => run_obs_tvcov::<$m>(
-                    model, subject, theta, eta, prog, &slot_row, n_eta, n_theta,
+                    model, subject, theta, eta, prog, &slot_row, n_eta, n_theta, readout,
                 ),)+
                 _ => None,
             }
@@ -1481,6 +1568,7 @@ pub fn subject_sensitivities_tvcov(
 /// sensitivity walk over `Dual2<M>`, and reads `∂conc/∂(θ, η)` straight off into
 /// the standard `(n_eta, n_theta)` [`SubjectSens`].
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_obs_tvcov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
@@ -1490,6 +1578,7 @@ fn run_obs_tvcov<const M: usize>(
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
     n_theta: usize,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::pd_from_program;
@@ -1583,8 +1672,52 @@ fn run_obs_tvcov<const M: usize>(
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#650): scratch for the per-observation dual eval.
+    let mut ro_state: Vec<Dual2<M>> = Vec::new();
+    let mut ro_vars: Vec<Dual2<M>> = Vec::new();
+    let mut ro_stack: Vec<Dual2<M>> = Vec::new();
+
     let mut obs_out = Vec::with_capacity(conc.len());
-    for c in &conc {
+    for (j, c) in conc.iter().enumerate() {
+        // Analytic Form C readout: replace the central concentration jet with
+        // `y = <expr>`. The per-observation PK duals (`pk_at_obs[j]`) already carry
+        // each parameter's `∂/∂(θ,η)` in the walk basis — including a non-structural
+        // `BMAX`/`KD` seeded into its allocated structural slot — so the readout's
+        // derivatives compose directly. The central amount is `concentration × V`.
+        let c: Dual2<M> = if let Some(ro) = readout {
+            let pkd = &pk_at_obs[j];
+            // Flat PK-slot dual vector for `eval_output_g`'s `indiv_to_pk` lookups;
+            // slots 0..=7 come from the walk's `PkDual`, 8..=10 are static
+            // constants (`readout_tvcov_supported` guarantees no param maps there).
+            let params: [Dual2<M>; N_PK] = [
+                pkd.cl,
+                pkd.v,
+                pkd.q,
+                pkd.v2,
+                pkd.ka,
+                pkd.f,
+                pkd.q3,
+                pkd.v3,
+                Dual2::<M>::constant(0.0),
+                Dual2::<M>::constant(0.0),
+                Dual2::<M>::constant(0.0),
+            ];
+            let n_states = ro.n_states();
+            let central_slot = n_states.saturating_sub(1);
+            ro_state.clear();
+            ro_state.resize(n_states, Dual2::<M>::constant(0.0));
+            ro_state[central_slot] = *c * pkd.v;
+            ro.eval_output_g::<Dual2<M>>(
+                &ro_state,
+                &params,
+                subject.obs_cov(j),
+                &mut ro_vars,
+                &mut ro_stack,
+            )
+        } else {
+            *c
+        };
+        let c = &c;
         // Clamp parity with production `conc.max(0.0)`: a negative value's
         // derivatives vanish (consistency with the OFV).
         let neg = c.value < 0.0;
@@ -1647,6 +1780,11 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
+    // Analytic Form C readout (#650): served analytically on the event-walk when it
+    // fits the structural `PkDual` slots (matches the outer gate); otherwise FD.
+    if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {
+        return None;
+    }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
@@ -1671,10 +1809,14 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
         }
     }
 
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($n:literal),+) => {
             match n_eta {
-                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule),)+
+                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule, readout),)+
                 _ => None,
             }
         };
@@ -1720,6 +1862,7 @@ fn run_obs_grad_tvcov<const N: usize>(
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::param_derivatives_at_cov;
@@ -1800,8 +1943,46 @@ fn run_obs_grad_tvcov<const N: usize>(
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#650): per-observation dual eval scratch (Dual1).
+    let mut ro_state: Vec<Dual1<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
+
     let mut out = Vec::with_capacity(conc.len());
-    for c in &conc {
+    for (j, c) in conc.iter().enumerate() {
+        // Analytic Form C readout (η-gradient): mirror the outer `run_obs_tvcov`
+        // over `Dual1<N>`. Central amount = concentration × V; the readout's
+        // `∂y/∂η` composes from the per-obs PK duals and the readout expression.
+        let c: Dual1<N> = if let Some(ro) = readout {
+            let pkd = &pk_at_obs[j];
+            let params: [Dual1<N>; N_PK] = [
+                pkd.cl,
+                pkd.v,
+                pkd.q,
+                pkd.v2,
+                pkd.ka,
+                pkd.f,
+                pkd.q3,
+                pkd.v3,
+                Dual1::<N>::constant(0.0),
+                Dual1::<N>::constant(0.0),
+                Dual1::<N>::constant(0.0),
+            ];
+            let n_states = ro.n_states();
+            let central_slot = n_states.saturating_sub(1);
+            ro_state.clear();
+            ro_state.resize(n_states, Dual1::<N>::constant(0.0));
+            ro_state[central_slot] = *c * pkd.v;
+            ro.eval_output_g::<Dual1<N>>(
+                &ro_state,
+                &params,
+                subject.obs_cov(j),
+                &mut ro_vars,
+                &mut ro_stack,
+            )
+        } else {
+            *c
+        };
         let neg = c.value < 0.0;
         let mut df_deta = vec![0.0; n_eta];
         if !neg {
@@ -2034,11 +2215,18 @@ fn subject_eta_grad_impl(
         }
     }
 
+    // Analytic Form C readout program (#650); the gate guarantees it is dual-
+    // evaluable and depot-free, so the inner `run_obs_grad` serves it exactly.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($n:literal),+) => {
             match slots.len() {
                 $($n => Some(run_obs_grad::<$n>(
                     &seed_dim, &pk, oral, two_cpt, three_cpt, transit, subject, &dp_deta, n_eta,
+                    readout,
                 )),)+
                 _ => None,
             }
@@ -2141,6 +2329,7 @@ fn run_obs_grad<const N: usize>(
     subject: &Subject,
     dp_deta: &[Vec<f64>],
     n_eta: usize,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Vec<ObsGrad> {
     let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
         pk.cl(),
@@ -2174,8 +2363,22 @@ fn run_obs_grad<const N: usize>(
     let n_d = dv(PK_IDX_N, pk.n_transit());
     let mtt_d = dv(PK_IDX_MTT, pk.mtt());
 
+    // Analytic Form C readout (#650): PK-slot dual vector + scratch, built once
+    // (subject-static). Mirrors the outer `run_obs`, on `Dual1<N>` (η-grad only).
+    let ro_pk_duals: Option<[Dual1<N>; N_PK]> = readout.map(|_| {
+        std::array::from_fn(|s| {
+            let val = pk.values.get(s).copied().unwrap_or(0.0);
+            match seed_dim[s] {
+                Some(k) => Dual1::<N>::var(val, k),
+                None => Dual1::<N>::constant(val),
+            }
+        })
+    });
+    let mut ro_state: Vec<Dual1<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
     let mut out = Vec::with_capacity(subject.obs_times.len());
-    for &t_obs in subject.obs_times.iter() {
+    for (obs_i, &t_obs) in subject.obs_times.iter().enumerate() {
         let reset_floor = subject
             .reset_times
             .iter()
@@ -2215,6 +2418,31 @@ fn run_obs_grad<const N: usize>(
             (0.0, [0.0; N])
         } else {
             (fd.value, fd.grad)
+        };
+
+        // Analytic Form C readout (#650): replace the central concentration with
+        // `y = <expr>` over `Dual1<N>` (central amount = conc × V), mirroring the
+        // outer `run_obs`. Its `∂y/∂pk` then rides the `dp_deta` chain below.
+        let (fval, g) = if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals.as_ref()) {
+            let conc = Dual1::<N> {
+                value: fval,
+                grad: g,
+            };
+            let n_states = prog.n_states();
+            let central_slot = n_states.saturating_sub(1);
+            ro_state.clear();
+            ro_state.resize(n_states, Dual1::<N>::constant(0.0));
+            ro_state[central_slot] = conc * pkd[PK_IDX_V];
+            let y = prog.eval_output_g::<Dual1<N>>(
+                &ro_state,
+                pkd,
+                subject.obs_cov(obs_i),
+                &mut ro_vars,
+                &mut ro_stack,
+            );
+            (y.value, y.grad)
+        } else {
+            (fval, g)
         };
 
         let mut df_deta = vec![0.0; n_eta];
@@ -3056,13 +3284,20 @@ fn subject_sensitivities_impl(
 
     // Dispatch on the differentiated-parameter count so the dual width is
     // right-sized. `pk_indices.len()` ≤ `N_PK` (the fixed PK slot table).
+    // Analytic Form C readout program (#650), if this model has one; the
+    // `analytical_supported` gate guarantees it is `Single` + dual-evaluable and
+    // does not read the depot amount, so `run_obs` can serve it exactly.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($n:literal),+) => {
             match slots.len() {
                 $($n => Some(SubjectSens {
                     obs: run_obs::<$n>(
                         &seed_dim, &pk, oral, two_cpt, three_cpt, transit, explicit_kind, subject,
-                        &pd, n_eta, n_theta,
+                        &pd, n_eta, n_theta, readout,
                     ),
                 }),)+
                 _ => None,
@@ -3204,6 +3439,7 @@ fn run_obs<const N: usize>(
     pd: &crate::sens::ode_provider::ParamDerivs,
     n_eta: usize,
     n_theta: usize,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Vec<ObsSens> {
     let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
         pk.cl(),
@@ -3215,8 +3451,23 @@ fn run_obs<const N: usize>(
         pk.q3(),
         pk.v3(),
     );
+    // Analytic Form C readout (#650): the PK-parameter dual vector (indexed by PK
+    // slot, so `eval_output_g` can pull `V`, binding constants, … via its
+    // `indiv_to_pk` plan) and reusable scratch. Subject-static, so built once.
+    let ro_pk_duals: Option<[Dual2<N>; N_PK]> = readout.map(|_| {
+        std::array::from_fn(|s| {
+            let val = pk.values.get(s).copied().unwrap_or(0.0);
+            match seed_dim[s] {
+                Some(k) => Dual2::<N>::var(val, k),
+                None => Dual2::<N>::constant(val),
+            }
+        })
+    });
+    let mut ro_state: Vec<Dual2<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual2<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual2<N>> = Vec::new();
     let mut out = Vec::with_capacity(subject.obs_times.len());
-    for &t_obs in subject.obs_times.iter() {
+    for (obs_i, &t_obs) in subject.obs_times.iter().enumerate() {
         // Reset segment: the most recent EVID=3/4 reset at or before this
         // observation (−∞ when the subject has no resets). Doses before it were
         // zeroed out of the compartments, so they're excluded from the
@@ -3308,6 +3559,35 @@ fn run_obs<const N: usize>(
         // objective it differentiates (PR #381 review finding #5).
         let (fval, g, h) = if fval < 0.0 {
             (0.0, [0.0; N], [[0.0; N]; N])
+        } else {
+            (fval, g, h)
+        };
+
+        // Analytic Form C readout (#650): replace the central concentration jet
+        // with `y = <expr>` over `Dual2<N>`. The central compartment **amount** is
+        // `concentration × V` (so a `central / V` readout recovers the
+        // concentration and an additive term layers on); the readout's `∂y/∂pk` /
+        // `∂²y/∂pk²` then ride the same `pd` chain to `(θ, η)` below. Covariates
+        // come from the per-observation snapshot (a per-row `FREE`-style flag).
+        let (fval, g, h) = if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals.as_ref()) {
+            let conc = Dual2::<N> {
+                value: fval,
+                grad: g,
+                hess: h,
+            };
+            let n_states = prog.n_states();
+            let central_slot = n_states.saturating_sub(1);
+            ro_state.clear();
+            ro_state.resize(n_states, Dual2::<N>::constant(0.0));
+            ro_state[central_slot] = conc * pkd[PK_IDX_V];
+            let y = prog.eval_output_g::<Dual2<N>>(
+                &ro_state,
+                pkd,
+                subject.obs_cov(obs_i),
+                &mut ro_vars,
+                &mut ro_stack,
+            );
+            (y.value, y.grad, y.hess)
         } else {
             (fval, g, h)
         };
@@ -5486,6 +5766,181 @@ mod tests {
         let model = parse_model_string(WARFARIN).expect("parse");
         let subject = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
         check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+    }
+
+    // ── analytic Form C readout (#650) exact sensitivities ───────────────────
+
+    /// A nonlinear analytic Form C readout — a saturable protein-binding total
+    /// concentration `y = C + BMAX·C/(KD + C)` with `C = central/V` — must be
+    /// differentiated exactly by the provider: value, `∂/∂η`, `∂²/∂η²`, `∂/∂θ`,
+    /// and `∂²/∂η∂θ` all match central FD of the readout-aware production
+    /// predictor. The readout carries η through both `C` (via CL, V) and the
+    /// `central/V` amount→conc map, and θ through BMAX/KD/CL/V. The `.expect`
+    /// inside the harness also asserts the analytic path is taken (not FD).
+    const ONECPT_IV_BINDING_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BMAX * (central / V) / (KD + central / V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn form_c_binding_readout_provider_matches_fd() {
+        let m = parse_model_string(ONECPT_IV_BINDING_READOUT).expect("parse binding readout");
+        // Must be in the analytic Dual2 scope (not routed to FD).
+        assert!(
+            analytical_supported(&m),
+            "central-only dual-evaluable Form C readout must stay analytic"
+        );
+        let s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let eta = [0.12, -0.08];
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+        // Light inner η-gradient must agree with the full provider's η block.
+        let full = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+        // The θ-gradient for the non-structural BMAX (θ index 2) and KD (θ index 3)
+        // must be non-zero — proving they are first-class differentiable params
+        // (#650 basis extension), not aliased onto CL. Before the fix they read the
+        // CL slot, so ∂y/∂θ_BMAX / ∂y/∂θ_KD were identically zero.
+        let max_bmax = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[2].abs())
+            .fold(0.0_f64, f64::max);
+        let max_kd = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[3].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_bmax > 1e-6,
+            "∂y/∂BMAX must be non-zero (BMAX is a real readout param, not aliased to CL)"
+        );
+        assert!(
+            max_kd > 1e-6,
+            "∂y/∂KD must be non-zero (KD is a real readout param, not aliased to CL)"
+        );
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+        assert_eq!(light.len(), full.obs.len());
+        for (lo, fo) in light.iter().zip(full.obs.iter()) {
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    lo.df_deta[k],
+                    fo.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    /// The fluconazole case: a readout gated on a **per-row** covariate (`FREE`)
+    /// makes the subject a time-varying-covariate subject, so it routes to the
+    /// event-walk provider. The readout is served analytically there too (#650):
+    /// value + all η/θ first/second derivatives match FD of the (event-walk)
+    /// production predictor, and BMAX/KD (non-structural, in their allocated slots)
+    /// stay differentiable through the walk.
+    #[test]
+    fn form_c_binding_readout_tvcov_matches_fd() {
+        let m = parse_model_string(ONECPT_IV_BINDING_READOUT_FREE).expect("parse");
+        let mut s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        // Alternating per-row FREE flag → per-observation covariate snapshots, so
+        // the subject routes to the event-walk (TV-cov) provider.
+        s.obs_covariates = vec![
+            HashMap::from([("FREE".to_string(), 0.0)]),
+            HashMap::from([("FREE".to_string(), 1.0)]),
+            HashMap::from([("FREE".to_string(), 0.0)]),
+            HashMap::from([("FREE".to_string(), 1.0)]),
+        ];
+        assert!(s.has_tv_covariates(), "fixture must be a TV-cov subject");
+        assert!(
+            readout_tvcov_supported(&m),
+            "central-only binding readout fits PkDual slots"
+        );
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let eta = [0.12, -0.08];
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+    }
+
+    const ONECPT_IV_BINDING_READOUT_FREE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) else central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// An **oral** Form C readout `y = central / V` (central at state slot 1,
+    /// depot slot 0 unreferenced) must also differentiate exactly.
+    #[test]
+    fn form_c_oral_readout_provider_matches_fd() {
+        let src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V\n[error_model]",
+        );
+        let m = parse_model_string(&src).expect("parse oral readout");
+        assert!(
+            analytical_supported(&m),
+            "oral central-only readout stays analytic"
+        );
+        let s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+    }
+
+    /// A readout that references the oral **depot** amount is out of the static
+    /// jet's scope (the depot amount isn't reconstructed as a dual), so the model
+    /// routes to the FD gradient — `analytical_supported` reports that honestly.
+    #[test]
+    fn form_c_depot_readout_routes_to_fd() {
+        let src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V + depot / V\n[error_model]",
+        );
+        let m = parse_model_string(&src).expect("parse depot readout");
+        assert!(
+            !analytical_supported(&m),
+            "a depot-referencing analytic readout must fall back to FD (no dual depot amount)"
+        );
+        // The FD path still predicts correctly (readout applied in the f64 predictor).
+        let s = oral_subject(&[1.0, 4.0]);
+        let preds = compute_predictions_with_tv(&m, &s, &[0.2, 10.0, 1.5], &[0.0, 0.0, 0.0]);
+        assert!(preds.iter().all(|p| p.is_finite()));
     }
 
     /// Regression for #455/#456: an analytical model whose `[individual_parameters]`

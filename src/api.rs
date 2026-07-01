@@ -125,6 +125,9 @@ pub(crate) fn model_preds(
         );
         pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
+    // Analytic Form C readout (#650): replaces the built-in concentration. No-op
+    // for ODE models (handled inside `compute_predictions_ode`) and when unset.
+    pk::apply_analytic_readout(model, subject, theta, eta, &mut preds);
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
     pk::apply_log_transform(model, &mut preds);
     preds
@@ -6893,6 +6896,7 @@ mod iov_integration {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -8934,6 +8938,7 @@ mod simulate_with_uncertainty_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -9751,6 +9756,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
 
@@ -10082,6 +10088,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
 
@@ -10241,6 +10248,7 @@ mod tests_derived_session_clock {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -10560,6 +10568,7 @@ mod tests_derived_iov_kappa {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,

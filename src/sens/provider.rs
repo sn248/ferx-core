@@ -10176,6 +10176,71 @@ mod tests {
         );
     }
 
+    // ODE IOV with a `first_order` input-rate forcing AND a κ-coupled `init(central) = BASE`
+    // baseline — the composition the #660 (`FirstOrder` under IOV) and #486 (`init` under IOV)
+    // gate relaxations jointly admit. Both ride the same `integrate_tvcov_readout` walk: the
+    // dose feeds `R_in = KA·(remaining)` and the init baseline is seeded from the first-record
+    // stacked snapshot, so the two are orthogonal. This pins that they compose correctly.
+    const WARFARIN_IOV_ODE_INIT_FO: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVBASE(40.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.01, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  KA   = TVKA
+  BASE = TVBASE * exp(ETA_V + KAPPA_CL)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central)  = first_order(ka=KA) - (CL/V) * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **`init(...)` × `first_order` input-rate forcing × IOV on the ODE walk** (#486, the
+    /// combination the #660 and #486 IOV relaxations jointly admit). Validated against FD of
+    /// `predict_iov` over the stacked layout, plus inner/outer parity.
+    #[test]
+    fn ode_iov_init_first_order_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_INIT_FO).expect("parse ODE IOV+init+FO");
+        assert!(!model.ode_spec.as_ref().unwrap().input_rate.is_empty());
+        assert!(model.ode_spec.as_ref().unwrap().init_fn.is_some());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + init + first_order must be analytic"
+        );
+        let subject = iov_tvcov_subject(false);
+        // θ = [TVCL, TVV, THETA_WT, TVBASE, TVKA]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0, 1.2],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+        check_iov_inner_matches_outer(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0, 1.2],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     /// **Static-covariate** ODE IOV subject with an EVID=2 pk-only breakpoint. The TV-cov
     /// pk-only tests above always take `seed_iov_events`' per-event (TV) branch; a subject
     /// with no dose/obs TV covariates **and an empty `pk_only_covariates`** instead takes the

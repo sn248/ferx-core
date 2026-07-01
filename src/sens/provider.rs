@@ -848,9 +848,16 @@ fn build_iov_sources(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    // Modeled-duration doses (`RATE=-2`) are read unresolved here; route to FD
-    // (mirrors the non-IOV provider gate).
-    if !subject.all_doses_fixed() {
+    // Modeled-`RATE=-1/-2` doses are served analytically now (#486): the walk carries
+    // the dual rate + moving infusion-end boundary (`run_obs_iov` resolves each dose at
+    // its occasion's PK jet). The steady-state combination stays FD (the dual SS
+    // equilibration has no modeled-window jet — mirrors the ODE #635 decline), and a
+    // modeled dose with no backing `D{cmt}`/`R{cmt}` slot declines rather than panicking
+    // in `resolve_rate`.
+    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
+        return None;
+    }
+    if !modeled_doses_resolvable(model, subject) {
         return None;
     }
 
@@ -1063,7 +1070,7 @@ fn run_obs_iov<const M: usize>(
     n_theta: usize,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
     // Build the `Dual2<M>` for a differentiated PK row `i` of source `cd`/`group`,
     // carrying `val` and `∂/∂(θ, stacked-η)`. The combined column `c` maps to a
@@ -1155,12 +1162,36 @@ fn run_obs_iov<const M: usize>(
 
     // No lagtime in IOV scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
-    let conc = event_driven_sens_g::<Dual2<M>>(
+    // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet
+    // (`sources[dose_src[k]].0` is already `pk_param_fn` at that occasion's combined
+    // effect) for the schedule's break times, and build the per-dose duals seeded on the
+    // stacked `(η_bsv, κ)` axes (via the same `seed` used for the PkDuals). Fixed
+    // subjects borrow `subject.doses` and pass no duals.
+    let eff_doses: std::borrow::Cow<[crate::types::DoseEvent]> = if subject.all_doses_fixed() {
+        std::borrow::Cow::Borrowed(&subject.doses)
+    } else {
+        let attr_map = model.active_dose_attr_map();
+        std::borrow::Cow::Owned(
+            (0..subject.doses.len())
+                .map(|k| subject.doses[k].resolve_rate(attr_map, &sources[dose_src[k]].0.values))
+                .collect(),
+        )
+    };
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, |k, dr_slot| {
+        let (pk, cd, group) = &sources[dose_src[k]];
+        let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
+        match slot_row[dr_slot] {
+            Some(i) => seed(cd, *group, i, val),
+            None => Dual2::<M>::constant(val),
+        }
+    });
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
+    let conc = event_driven_sens_with_doses_g::<Dual2<M>>(
         model.pk_model,
         subject,
         &schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
@@ -1220,7 +1251,7 @@ fn run_obs_iov_eta<const N: usize>(
     n_stacked: usize,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
     // First-order stacked-η seed (no θ axes): η_bsv column `c` → axis `c`; κ column
     // `c` (group g) → `n_eta + g·n_kappa + (c−n_eta)`, dropped when `group` is `None`
@@ -1284,12 +1315,34 @@ fn run_obs_iov_eta<const N: usize>(
     }
 
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
-    let conc = event_driven_sens_g::<Dual1<N>>(
+    // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet and
+    // build the per-dose duals seeded on the stacked-η axes (η-only, the inner mirror of
+    // `run_obs_iov`). Fixed subjects borrow `subject.doses` and pass no duals.
+    let eff_doses: std::borrow::Cow<[crate::types::DoseEvent]> = if subject.all_doses_fixed() {
+        std::borrow::Cow::Borrowed(&subject.doses)
+    } else {
+        let attr_map = model.active_dose_attr_map();
+        std::borrow::Cow::Owned(
+            (0..subject.doses.len())
+                .map(|k| subject.doses[k].resolve_rate(attr_map, &sources[dose_src[k]].0.values))
+                .collect(),
+        )
+    };
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, |k, dr_slot| {
+        let (pk, cd, group) = &sources[dose_src[k]];
+        let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
+        match slot_row[dr_slot] {
+            Some(i) => seed(cd, *group, i, val),
+            None => Dual1::<N>::constant(val),
+        }
+    });
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
+    let conc = event_driven_sens_with_doses_g::<Dual1<N>>(
         model.pk_model,
         subject,
         &schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
@@ -1377,6 +1430,105 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     }
 }
 
+/// Clamp a **dual** modeled `D`/`R` to its domain floor, keeping the jet in the
+/// interior and dropping it at the wall — the dual mirror of
+/// [`crate::types::clamp_above_floor`] used by the f64 [`DoseEvent::resolve_rate`].
+/// A converged fit is interior, so this is the identity there; it only keeps a
+/// transient `D ≤ 0` / `R ≤ 0` from turning `amt/D` into a non-finite rate (#486).
+#[inline]
+fn clamp_dual_floor<T: crate::sens::num::PkNum>(x: T, floor: f64) -> T {
+    if x.val() > floor {
+        x
+    } else {
+        T::from_f64(floor)
+    }
+}
+
+/// True when every modeled `RATE=-1/-2` dose on `subject` has its backing
+/// `D{cmt}`/`R{cmt}` PK slot declared. A modeled dose with no slot is an invalid
+/// model (`check_model_data` rejects it upstream), but the analytic providers still
+/// guard it here so they decline to FD rather than panicking in
+/// [`DoseEvent::resolve_rate`]'s slot `.expect` (#486). Fixed subjects are trivially
+/// `true`. Mirrors the ODE `ode_tvcov_supported` slot-presence clause.
+fn modeled_doses_resolvable(model: &CompiledModel, subject: &Subject) -> bool {
+    if subject.all_doses_fixed() {
+        return true;
+    }
+    let attr_map = model.active_dose_attr_map();
+    subject
+        .doses
+        .iter()
+        .all(|d| d.is_fixed() || crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some())
+}
+
+/// Resolve each dose's modeled `RATE=-1/-2` (`R{cmt}`/`D{cmt}`) to a concrete
+/// `rate`/`duration` at that dose's covariate snapshot, for the walk's **value**
+/// path (the schedule's infusion break times + the per-sub-interval active-window
+/// checks). A fixed subject borrows `subject.doses` unchanged (#486). The matching
+/// derivative twin is [`modeled_dose_inf_duals`].
+fn resolve_modeled_eff_doses<'a>(
+    model: &CompiledModel,
+    subject: &'a Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> std::borrow::Cow<'a, [crate::types::DoseEvent]> {
+    if subject.all_doses_fixed() {
+        return std::borrow::Cow::Borrowed(&subject.doses);
+    }
+    let attr_map = model.active_dose_attr_map();
+    std::borrow::Cow::Owned(
+        (0..subject.doses.len())
+            .map(|k| {
+                let pk_k =
+                    (model.pk_param_fn)(theta, eta, subject.dose_cov(k), subject.doses[k].time);
+                subject.doses[k].resolve_rate(attr_map, &pk_k.values)
+            })
+            .collect(),
+    )
+}
+
+/// Per-dose modeled-infusion duals `(rate_bare, dur_bare)` for the event walk
+/// ([`crate::sens::propagate::event_driven_sens_with_doses_g`], #486): `None` for a
+/// fixed dose (or a fixed subject → empty), `Some` for a modeled `RATE=-1/-2` dose.
+/// `rate_bare` is the F-agnostic infusion rate (`amt/D` for `RATE=-2`, `R` for
+/// `RATE=-1`) whose PK-param jet feeds the injected rate magnitude; `dur_bare` is
+/// the window length (`D`, or `amt/R`) whose jet makes the infusion **end** a moving
+/// boundary. `slot_dual(dose_k, pk_slot)` supplies the seeded dual of the `D`/`R` PK
+/// slot at dose `k`'s snapshot (`Dual2<M>` outer, `Dual1<N>` inner). A transient
+/// non-positive `D`/`R` is clamped to its floor, mirroring the f64
+/// [`DoseEvent::resolve_rate`].
+fn modeled_dose_inf_duals<T: crate::sens::num::PkNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    slot_dual: impl Fn(usize, usize) -> T,
+) -> Vec<Option<(T, T)>> {
+    if subject.all_doses_fixed() {
+        return Vec::new();
+    }
+    let attr_map = model.active_dose_attr_map();
+    subject
+        .doses
+        .iter()
+        .enumerate()
+        .map(|(k, d)| {
+            let (mode, slot) = crate::sens::ode_provider::modeled_slot_for(attr_map, d)?;
+            let sd = slot_dual(k, slot);
+            let amt = T::from_f64(d.amt);
+            match mode {
+                crate::types::RateMode::ModeledDuration => {
+                    let dur = clamp_dual_floor(sd, crate::types::DoseEvent::DURATION_FLOOR);
+                    Some((amt / dur, dur))
+                }
+                crate::types::RateMode::ModeledRate => {
+                    let rate = clamp_dual_floor(sd, crate::types::DoseEvent::RATE_FLOOR);
+                    Some((rate, amt / rate))
+                }
+                crate::types::RateMode::Fixed => None,
+            }
+        })
+        .collect()
+}
+
 /// Exact analytic sensitivities for an analytical subject with **time-varying
 /// covariates**, over the ordinary `(η, θ)` blocks — the standard
 /// [`SubjectSens`] shape, identical to the non-TV provider, so the outer gradient
@@ -1409,6 +1561,17 @@ pub fn subject_sensitivities_tvcov(
     // which a mid-record reset contradicts, so a subject mixing SS with resets
     // falls back to FD — mirroring the non-IOV / IOV providers.
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
+    // Modeled-`RATE=-1/-2` dose × steady state stays FD: the dual SS equilibration
+    // carries no modeled-window jet (mirrors the ODE #635 decline). Plain modeled
+    // doses are served analytically below via the per-dose duals (#486).
+    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
+        return None;
+    }
+    // A modeled dose with no backing `D{cmt}`/`R{cmt}` slot is an invalid model; decline
+    // to FD rather than panic in `resolve_rate` (#486).
+    if !modeled_doses_resolvable(model, subject) {
         return None;
     }
 
@@ -1493,7 +1656,11 @@ fn run_obs_tvcov<const M: usize>(
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::pd_from_program;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
+
+    // PK slot order the program differentiates (for seeding the modeled `D`/`R`
+    // slot dual via `pk_slot_dual_outer`, #486).
+    let slots = prog.pk_slots_ref();
 
     // Build the per-event PK-param duals at a covariate snapshot: evaluate the
     // program's `∂p/∂(θ, η)` (+ 2nd order) at `cov`, then seed each differentiated
@@ -1572,12 +1739,33 @@ fn run_obs_tvcov<const M: usize>(
 
     // No lagtime in TV-cov scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
-    let conc = event_driven_sens_g::<Dual2<M>>(
+    // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
+    // schedule's break times, and build the per-dose duals so the injected rate and
+    // the moving infusion-end boundary carry their `(θ,η)` jets. Fixed subjects
+    // borrow `subject.doses` and pass no duals (identical to the pre-#486 path).
+    let eff_doses = resolve_modeled_eff_doses(model, subject, theta, eta);
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, |k, dr_slot| {
+        let cov = subject.dose_cov(k);
+        let _guard =
+            crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
+        let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
+        let pk = (model.pk_param_fn)(theta, eta, cov, subject.doses[k].time);
+        pk_slot_dual_outer::<M>(
+            dr_slot,
+            pk.values.get(dr_slot).copied().unwrap_or(0.0),
+            &pd,
+            slots,
+            n_theta,
+            n_eta,
+        )
+    });
+    let conc = event_driven_sens_with_doses_g::<Dual2<M>>(
         model.pk_model,
         subject,
         &schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
@@ -1650,7 +1838,16 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    if !subject.all_doses_fixed() {
+    // Modeled-`RATE=-1/-2` doses are served analytically by the walk now (#486): the
+    // dual rate + moving infusion-end boundary (`run_obs_grad_tvcov` builds the
+    // per-dose duals). The steady-state combination stays FD (the dual SS
+    // equilibration carries no modeled-window jet — mirrors the ODE #635 decline).
+    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
+        return None;
+    }
+    // A modeled dose with no backing `D{cmt}`/`R{cmt}` slot is an invalid model; decline
+    // to FD rather than panic in `resolve_rate` (#486).
+    if !modeled_doses_resolvable(model, subject) {
         return None;
     }
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
@@ -1723,11 +1920,14 @@ fn run_obs_grad_tvcov<const N: usize>(
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::param_derivatives_at_cov;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
     // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` clamps below are
     // no-ops — flat `0..n_eta` loops (#449 re-review #5, mirroring #15).
     debug_assert_eq!(N, n_eta);
+
+    // PK slot order the program differentiates (for the modeled `D`/`R` slot dual).
+    let slots = prog.pk_slots_ref();
 
     // Seed the model-time thread-local with the per-event time so a `TIME`-built-in
     // structural parameter resolves to that event's time in both the f64 value and
@@ -1777,24 +1977,44 @@ fn run_obs_grad_tvcov<const N: usize>(
         .map(|m| mk(subject.pk_only_times[m], subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
 
-    // The event schedule is invariant across inner BFGS steps (it depends only on the
-    // subject + doses + zero lagtimes, not on η). Reuse the schedule the inner
-    // optimizer cached once per subject when available, instead of rebuilding it every
-    // gradient step; fall back to building it locally otherwise (#449 re-review #6).
+    // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration and build
+    // the per-dose duals (dual rate + moving infusion-end boundary). A modeled dose's
+    // resolved window varies with η across inner BFGS steps, so its schedule cannot be
+    // cached — rebuild from the resolved `eff_doses` each call. Fixed subjects keep the
+    // cached (η-invariant) schedule.
+    let eff_doses = resolve_modeled_eff_doses(model, subject, theta, eta);
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, |k, dr_slot| {
+        let cov = subject.dose_cov(k);
+        let _guard =
+            crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
+        let pk = (model.pk_param_fn)(theta, eta, cov, subject.doses[k].time);
+        let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
+        match param_derivatives_at_cov(prog, model, cov, theta, eta) {
+            Some(pd) => pk_slot_dual_inner::<N>(dr_slot, val, &pd.dp_deta, slots, n_eta),
+            None => Dual1::constant(val),
+        }
+    });
+
+    // The event schedule is invariant across inner BFGS steps for a fixed subject (it
+    // depends only on the subject + doses + zero lagtimes, not on η). Reuse the schedule
+    // the inner optimizer cached once per subject when available; rebuild locally for
+    // modeled doses (window depends on η) or when no cache was passed (#449 / #486).
     let owned_schedule;
     let schedule: &EventSchedule = match cached_schedule {
-        Some(s) => s,
-        None => {
+        Some(s) if subject.all_doses_fixed() => s,
+        _ => {
             let dose_lagtimes = vec![0.0; subject.doses.len()];
             owned_schedule =
-                EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
+                EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
             &owned_schedule
         }
     };
-    let conc = event_driven_sens_g::<Dual1<N>>(
+    let conc = event_driven_sens_with_doses_g::<Dual1<N>>(
         model.pk_model,
         subject,
         schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
@@ -2892,6 +3112,13 @@ pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subj
     subject.has_tv_covariates()
         || subject_has_oral_infusion(model, subject)
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        // A modeled-`RATE=-1/-2` dose (`R{cmt}`/`D{cmt}`) resolves its rate/window
+        // from PK params, so the infusion *end* is a moving boundary — the
+        // event-driven walk carries it via the exact dual window length, which
+        // dose superposition can't (#486). This is the closed-form twin of the ODE
+        // `ode_tvcov_supported`'s `has_modeled_dose` clause. An oral modeled infusion
+        // is already covered by `subject_has_oral_infusion`; this adds the IV route.
+        || !subject.all_doses_fixed()
 }
 
 fn subject_sensitivities_impl(
@@ -2925,14 +3152,6 @@ fn subject_sensitivities_impl(
     // already applies the #419 rule. (A duration-defined `RATE=-2` infusion is
     // unaffected: `F` scales its rate, a magnitude both mechanisms handle.)
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
-        return None;
-    }
-    // Modeled-duration doses (`RATE=-2` → `D{cmt}`) resolve `rate`/`duration` from
-    // the PK params in the prediction path; the provider reads `subject.doses`
-    // directly, so the unresolved dose would be a bolus/zero-input surrogate. Route
-    // to FD (matches the early gate in `subject_eta_grad_impl`, so the inner
-    // gradient and Jacobian stay on the same scope).
-    if !subject.all_doses_fixed() {
         return None;
     }
     // Time-varying covariates make the PK parameters switch mid-decay, which dose
@@ -5072,6 +5291,219 @@ mod tests {
         );
     }
 
+    /// 1-cpt IV closed-form model with a **modeled-duration** dose (`RATE=-2` → `D1`),
+    /// `D1 = TVD1·exp(ETA_D1)`. The infusion window end `t_dose + D1` is a moving
+    /// boundary in `D1`; the event-driven walk carries it via the exact dual window
+    /// length (#486). Used by the analytic-vs-FD and routing tests below.
+    const ONECPT_IV_MODELED_DUR: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// A modeled-duration `RATE=-2` subject must now route to the event-driven walk
+    /// and be served analytically (the closed-form twin of the ODE #635 path), not
+    /// fall back to FD (#486). Both the full outer provider and the light inner
+    /// gradient must accept it.
+    #[test]
+    fn provider_modeled_duration_routes_to_event_walk() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        assert!(!subject.all_doses_fixed(), "dose must be modeled");
+        assert!(
+            subject_routes_to_event_walk(&model, &subject),
+            "a modeled-RATE subject must route to the event-driven walk (#486)"
+        );
+        assert!(
+            subject_sensitivities(&model, &subject, &[10.0, 50.0, 2.0], &[0.1, -0.05, 0.05])
+                .is_some(),
+            "modeled-duration dose must be served analytically by the walk (full provider)"
+        );
+        assert!(
+            subject_eta_grad(&model, &subject, &[10.0, 50.0, 2.0], &[0.1, -0.05, 0.05]).is_some(),
+            "modeled-duration dose must be served analytically (light inner provider)"
+        );
+    }
+
+    /// The exact outer `(η, θ)` sensitivities of a modeled-duration `RATE=-2` dose must
+    /// match central finite differences of the production predictor
+    /// (`compute_predictions_with_tv`, which resolves `D1` per evaluation). Observations
+    /// straddle the window end (`D1 ≈ 2.1`: `t = 0.5, 1.5` inside; `t = 3, 6` after), so
+    /// the moving infusion-end boundary is genuinely exercised (#486).
+    #[test]
+    fn provider_modeled_duration_iv_matches_fd_of_production() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// Modeled **rate** (`RATE=-1` → `R1`), the sign-mirror: `duration = amt/R1`, so the
+    /// window end still moves with the PK param. Analytic outer sensitivities vs FD of
+    /// production (#486).
+    #[test]
+    fn provider_modeled_rate_iv_matches_fd_of_production() {
+        const ONECPT_IV_MODELED_RATE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_R1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  R1 = TVR1 * exp(ETA_R1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(ONECPT_IV_MODELED_RATE).expect("parse");
+        // amt=1000, R1≈500 → window ≈ 2h. Obs straddle it.
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledRate,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 500.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// The light inner η-gradient (`subject_eta_grad`) for a modeled-duration dose must
+    /// match the `df_deta` block of the FD-validated full outer provider
+    /// (`subject_sensitivities`) — the inner and outer walks must agree (#486).
+    #[test]
+    fn provider_modeled_duration_inner_matches_outer() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        let theta = [10.0, 50.0, 2.0];
+        let eta = [0.12, -0.08, 0.05];
+        let outer = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer some");
+        let inner = subject_eta_grad(&model, &subject, &theta, &eta).expect("inner some");
+        assert_eq!(outer.obs.len(), inner.len());
+        for (o, i) in outer.obs.iter().zip(inner.iter()) {
+            approx::assert_relative_eq!(o.f, i.f, max_relative = 1e-9, epsilon = 1e-12);
+            for (a, b) in o.df_deta.iter().zip(i.df_deta.iter()) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// **Bit-parity cross-check vs the ODE twin.** The closed-form modeled-duration
+    /// walk and the ODE `[odes]` modeled-duration walk (already analytic + NONMEM-
+    /// anchored via #630/#635) are two independent implementations of the same
+    /// moving-boundary sensitivity. Their outer `(η, θ)` jets must agree to ODE
+    /// integration tolerance — the strongest confirmation the closed-form saltation is
+    /// right (#486).
+    #[test]
+    fn provider_modeled_duration_matches_ode_twin() {
+        const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse cf");
+        let ode = parse_model_string(ODE_TWIN).expect("parse ode twin");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        let theta = [10.0, 50.0, 2.0];
+        let eta = [0.12, -0.08, 0.05];
+        let s_cf = subject_sensitivities(&cf, &subject, &theta, &eta).expect("cf some");
+        let s_ode = subject_sensitivities(&ode, &subject, &theta, &eta).expect("ode some");
+        assert_eq!(s_cf.obs.len(), s_ode.obs.len());
+        for (a, b) in s_cf.obs.iter().zip(s_ode.obs.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-6, epsilon = 1e-8);
+            for (x, y) in a.df_deta.iter().zip(b.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
+            }
+            for (x, y) in a.df_dtheta.iter().zip(b.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
+            }
+            for (x, y) in a.d2f_deta2.iter().zip(b.d2f_deta2.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-4, epsilon = 1e-6);
+            }
+        }
+    }
+
     #[test]
     fn provider_2cpt_steady_state_matches_production() {
         // SS bolus (II=12) and SS oral (II=24) — exercises the *_ss_g branches.
@@ -6773,6 +7205,97 @@ mod tests {
             &subject,
             &[0.2, 10.0, 1.5],
             &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// Closed-form **IOV + modeled-duration** dose (`RATE=-2` → `D1`, #486). The
+    /// per-occasion `D1` sets each infusion window; the walk resolves it from the
+    /// occasion's stacked PK jet and the moving infusion-end boundary carries `∂/∂D1`
+    /// over θ, η, and κ. Doses at 0 and 24 (`D1 ≈ 5`), obs straddling each window end
+    /// (1 inside / 6 after; 25 inside / 30 after). Validated vs central FD of
+    /// `predict_iov` (which resolves `D1` per occasion) — the closed-form twin of the
+    /// ODE `ode_iov_modeled_duration_provider_matches_fd_of_predict_iov` (#635).
+    const WARFARIN_IOV_MODELED_DUR: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+    fn iov_modeled_dur_subject() -> Subject {
+        let mut s = iov_subject();
+        s.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        s
+    }
+
+    #[test]
+    fn iov_modeled_duration_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_MODELED_DUR).expect("parse modeled-dur IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 3);
+        assert!(model.ode_spec.is_none(), "must be a closed-form model");
+        let subject = iov_modeled_dur_subject();
+        assert!(!subject.all_doses_fixed(), "doses must be modeled");
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        assert!(
+            subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0, 5.0],
+                &[0.12, -0.08, 0.05, 0.05, -0.10],
+            )
+            .is_some(),
+            "modeled-duration closed-form IOV subject (no SS) must be served analytically (#486)"
+        );
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
+        );
+    }
+
+    /// Inner (`Dual1`) IOV modeled-duration walk must match the FD-validated outer.
+    #[test]
+    fn iov_modeled_duration_inner_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_MODELED_DUR).expect("parse modeled-dur IOV"),
+            &iov_modeled_dur_subject(),
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
         );
     }
 

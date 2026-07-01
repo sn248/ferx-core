@@ -89,11 +89,14 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
     }
 }
 
-/// Width of the per-model PK-slot lookup tables (`CL, V1, Q2, V2, KA, F, Q3, V3,
-/// LAGTIME`, plus the transit `N`/`MTT` slots, #386). This is the slot-space size,
-/// not the per-model dual width `M` (the compact count of *seeded* params — e.g.
-/// `Dual2<4>` for a 2-cpt IV).
-const N_PK: usize = 11;
+/// Width of the per-model PK-slot lookup tables — spans the full PK slot space
+/// (`CL, V1, Q2, V2, KA, F, Q3, V3, LAGTIME`, the transit `N`/`MTT` slots #386, and
+/// the modeled `D{cmt}`/`R{cmt}` slots the parser assigns from `PK_IDX_LAGTIME+1`
+/// upward, #486). Sized to [`crate::types::MAX_PK_PARAMS`] so a subject with three or
+/// more modeled infusions (slots ≥ 11) is indexed in-bounds rather than panicking
+/// (#486 review #1). This is the slot-space size, not the per-model dual width `M`
+/// (the compact count of *seeded* params — e.g. `Dual2<4>` for a 2-cpt IV).
+const N_PK: usize = crate::types::MAX_PK_PARAMS;
 
 /// True when the compiled `[individual_parameters]` program emits a differentiable
 /// row for every structural PK output `model` requires — the precondition for
@@ -850,14 +853,10 @@ fn build_iov_sources(
     }
     // Modeled-`RATE=-1/-2` doses are served analytically now (#486): the walk carries
     // the dual rate + moving infusion-end boundary (`run_obs_iov` resolves each dose at
-    // its occasion's PK jet). The steady-state combination stays FD (the dual SS
-    // equilibration has no modeled-window jet — mirrors the ODE #635 decline), and a
-    // modeled dose with no backing `D{cmt}`/`R{cmt}` slot declines rather than panicking
-    // in `resolve_rate`.
-    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
-        return None;
-    }
-    if !modeled_doses_resolvable(model, subject) {
+    // its occasion's PK jet). The steady-state combination (no modeled-window jet in
+    // the closed-form dual SS equilibration) and the missing-slot case decline to FD
+    // via the shared gate.
+    if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
 
@@ -1164,23 +1163,20 @@ fn run_obs_iov<const M: usize>(
     let dose_lagtimes = vec![0.0; subject.doses.len()];
     // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet
     // (`sources[dose_src[k]].0` is already `pk_param_fn` at that occasion's combined
-    // effect) for the schedule's break times, and build the per-dose duals seeded on the
-    // stacked `(η_bsv, κ)` axes (via the same `seed` used for the PkDuals). Fixed
-    // subjects borrow `subject.doses` and pass no duals.
-    let eff_doses: std::borrow::Cow<[crate::types::DoseEvent]> = if subject.all_doses_fixed() {
-        std::borrow::Cow::Borrowed(&subject.doses)
-    } else {
-        let attr_map = model.active_dose_attr_map();
-        std::borrow::Cow::Owned(
-            (0..subject.doses.len())
-                .map(|k| subject.doses[k].resolve_rate(attr_map, &sources[dose_src[k]].0.values))
-                .collect(),
-        )
-    };
+    // effect) for the schedule's break times — shared with the non-IOV walk via
+    // `resolve_eff_doses` — and build the per-dose duals seeded on the stacked
+    // `(η_bsv, κ)` axes (via the same `seed` used for the PkDuals). Fixed subjects
+    // borrow `subject.doses` and pass no duals.
+    let eff_doses = resolve_eff_doses(model, subject, |k| sources[dose_src[k]].0);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
     let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, |k, dr_slot| {
         let (pk, cd, group) = &sources[dose_src[k]];
         let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
-        match slot_row[dr_slot] {
+        match slot_row.get(dr_slot).copied().flatten() {
             Some(i) => seed(cd, *group, i, val),
             None => Dual2::<M>::constant(val),
         }
@@ -1315,23 +1311,20 @@ fn run_obs_iov_eta<const N: usize>(
     }
 
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet and
-    // build the per-dose duals seeded on the stacked-η axes (η-only, the inner mirror of
-    // `run_obs_iov`). Fixed subjects borrow `subject.doses` and pass no duals.
-    let eff_doses: std::borrow::Cow<[crate::types::DoseEvent]> = if subject.all_doses_fixed() {
-        std::borrow::Cow::Borrowed(&subject.doses)
-    } else {
-        let attr_map = model.active_dose_attr_map();
-        std::borrow::Cow::Owned(
-            (0..subject.doses.len())
-                .map(|k| subject.doses[k].resolve_rate(attr_map, &sources[dose_src[k]].0.values))
-                .collect(),
-        )
-    };
+    // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet
+    // (shared with the non-IOV walk via `resolve_eff_doses`) and build the per-dose
+    // duals seeded on the stacked-η axes (η-only, the inner mirror of `run_obs_iov`).
+    // Fixed subjects borrow `subject.doses` and pass no duals.
+    let eff_doses = resolve_eff_doses(model, subject, |k| sources[dose_src[k]].0);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
     let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, |k, dr_slot| {
         let (pk, cd, group) = &sources[dose_src[k]];
         let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
-        match slot_row[dr_slot] {
+        match slot_row.get(dr_slot).copied().flatten() {
             Some(i) => seed(cd, *group, i, val),
             None => Dual1::<N>::constant(val),
         }
@@ -1462,15 +1455,17 @@ fn modeled_doses_resolvable(model: &CompiledModel, subject: &Subject) -> bool {
 }
 
 /// Resolve each dose's modeled `RATE=-1/-2` (`R{cmt}`/`D{cmt}`) to a concrete
-/// `rate`/`duration` at that dose's covariate snapshot, for the walk's **value**
-/// path (the schedule's infusion break times + the per-sub-interval active-window
-/// checks). A fixed subject borrows `subject.doses` unchanged (#486). The matching
-/// derivative twin is [`modeled_dose_inf_duals`].
-fn resolve_modeled_eff_doses<'a>(
+/// `rate`/`duration` for the walk's **value** path (the schedule's infusion break
+/// times + the per-sub-interval active-window checks), using the caller-supplied f64
+/// PK params at each dose (`dose_pk(k)`). A fixed subject borrows `subject.doses`
+/// unchanged (#486). Single-sourced across the non-IOV and IOV walks — each supplies
+/// `dose_pk` from its own already-evaluated per-dose params (so `pk_param_fn` is not
+/// re-run here, #486 review). The matching derivative twin is
+/// [`modeled_dose_inf_duals`].
+fn resolve_eff_doses<'a>(
     model: &CompiledModel,
     subject: &'a Subject,
-    theta: &[f64],
-    eta: &[f64],
+    dose_pk: impl Fn(usize) -> crate::types::PkParams,
 ) -> std::borrow::Cow<'a, [crate::types::DoseEvent]> {
     if subject.all_doses_fixed() {
         return std::borrow::Cow::Borrowed(&subject.doses);
@@ -1478,13 +1473,59 @@ fn resolve_modeled_eff_doses<'a>(
     let attr_map = model.active_dose_attr_map();
     std::borrow::Cow::Owned(
         (0..subject.doses.len())
-            .map(|k| {
-                let pk_k =
-                    (model.pk_param_fn)(theta, eta, subject.dose_cov(k), subject.doses[k].time);
-                subject.doses[k].resolve_rate(attr_map, &pk_k.values)
-            })
+            .map(|k| subject.doses[k].resolve_rate(attr_map, &dose_pk(k).values))
             .collect(),
     )
+}
+
+/// Shared FD-fallback gate for modeled `RATE=-1/-2` doses on the analytic closed-form
+/// walk (#486, deduped from the per-provider guards). Returns `false` (⇒ decline to
+/// FD) when either:
+/// - the subject mixes a modeled dose with a steady-state dose — the closed-form dual
+///   SS equilibration (`equilibrate_ss_g`) carries no modeled-window jet, so the
+///   moving infusion-end boundary would be dropped. (Unlike the ODE provider, whose
+///   `equilibrate_ss_state_g` *does* thread that jet and serves SS+modeled
+///   analytically per #486 — this decline is closed-form-specific.); or
+/// - a modeled dose has no backing `D{cmt}`/`R{cmt}` slot — an invalid model
+///   `check_model_data` rejects upstream, guarded here so the provider declines rather
+///   than panics in [`DoseEvent::resolve_rate`].
+fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subject) -> bool {
+    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
+        return false;
+    }
+    modeled_doses_resolvable(model, subject)
+}
+
+/// True when the modeled-infusion **end** times are separable — no two modeled doses
+/// backed by *distinct* `D`/`R` PK slots resolve to the same infusion-end time. The
+/// dual-`dt` walk encodes each moving end as one break carrying that dose's window
+/// jet; two distinct-slot ends coinciding would need the single sub-interval to carry
+/// two different dual lengths (one per compartment), which it cannot — so such a
+/// (degenerate, measure-zero) subject declines to FD to stay exact (#486 review #2).
+/// Same-slot coincident ends are fine: they share the `D`/`R` value ⇒ an identical
+/// jet ⇒ they move together, and the walk's first-match `dual_pos` is exact. `eff`
+/// are the resolved doses the walk sees; the modeled-slot identity is read from the
+/// original `subject.doses` (`resolve_rate` erases `rate_mode` to `Fixed`).
+fn modeled_ends_separable(
+    model: &CompiledModel,
+    subject: &Subject,
+    eff: &[crate::types::DoseEvent],
+) -> bool {
+    let attr_map = model.active_dose_attr_map();
+    let mut ends: Vec<(f64, usize)> = Vec::new();
+    for (k, d) in subject.doses.iter().enumerate() {
+        if let Some((_mode, slot)) = crate::sens::ode_provider::modeled_slot_for(attr_map, d) {
+            let end = eff[k].time + eff[k].duration;
+            if ends
+                .iter()
+                .any(|&(e, s)| s != slot && (e - end).abs() < 1e-9)
+            {
+                return false;
+            }
+            ends.push((end, slot));
+        }
+    }
+    true
 }
 
 /// Per-dose modeled-infusion duals `(rate_bare, dur_bare)` for the event walk
@@ -1563,15 +1604,11 @@ pub fn subject_sensitivities_tvcov(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    // Modeled-`RATE=-1/-2` dose × steady state stays FD: the dual SS equilibration
-    // carries no modeled-window jet (mirrors the ODE #635 decline). Plain modeled
-    // doses are served analytically below via the per-dose duals (#486).
-    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
-        return None;
-    }
-    // A modeled dose with no backing `D{cmt}`/`R{cmt}` slot is an invalid model; decline
-    // to FD rather than panic in `resolve_rate` (#486).
-    if !modeled_doses_resolvable(model, subject) {
+    // Modeled-`RATE=-1/-2` dose × steady state (no modeled-window jet in the
+    // closed-form dual SS equilibration) and the missing-slot case decline to FD via
+    // the shared gate. Plain modeled doses are served analytically below via the
+    // per-dose duals (#486).
+    if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
 
@@ -1741,19 +1778,35 @@ fn run_obs_tvcov<const M: usize>(
     let dose_lagtimes = vec![0.0; subject.doses.len()];
     // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
     // schedule's break times, and build the per-dose duals so the injected rate and
-    // the moving infusion-end boundary carry their `(θ,η)` jets. Fixed subjects
-    // borrow `subject.doses` and pass no duals (identical to the pre-#486 path).
-    let eff_doses = resolve_modeled_eff_doses(model, subject, theta, eta);
+    // the moving infusion-end boundary carry their `(θ,η)` jets. The per-dose f64 PK
+    // params are evaluated once (`dose_pk`) and shared by the resolved window and the
+    // dual's value, rather than re-running `pk_param_fn` per dose (#486 review #4).
+    // Fixed subjects borrow `subject.doses` and pass no duals (identical to the
+    // pre-#486 path).
+    let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| {
+            let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(
+                uses_time,
+                subject.doses[k].time,
+            );
+            (model.pk_param_fn)(theta, eta, subject.dose_cov(k), subject.doses[k].time)
+        })
+        .collect();
+    let eff_doses = resolve_eff_doses(model, subject, |k| dose_pk[k]);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
     let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
     let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, |k, dr_slot| {
         let cov = subject.dose_cov(k);
         let _guard =
             crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
         let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-        let pk = (model.pk_param_fn)(theta, eta, cov, subject.doses[k].time);
         pk_slot_dual_outer::<M>(
             dr_slot,
-            pk.values.get(dr_slot).copied().unwrap_or(0.0),
+            dose_pk[k].values.get(dr_slot).copied().unwrap_or(0.0),
             &pd,
             slots,
             n_theta,
@@ -1840,14 +1893,10 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     }
     // Modeled-`RATE=-1/-2` doses are served analytically by the walk now (#486): the
     // dual rate + moving infusion-end boundary (`run_obs_grad_tvcov` builds the
-    // per-dose duals). The steady-state combination stays FD (the dual SS
-    // equilibration carries no modeled-window jet — mirrors the ODE #635 decline).
-    if !subject.all_doses_fixed() && subject.has_periodic_ss_dose() {
-        return None;
-    }
-    // A modeled dose with no backing `D{cmt}`/`R{cmt}` slot is an invalid model; decline
-    // to FD rather than panic in `resolve_rate` (#486).
-    if !modeled_doses_resolvable(model, subject) {
+    // per-dose duals). The steady-state combination (no modeled-window jet in the
+    // closed-form dual SS equilibration) and the missing-slot case decline to FD via
+    // the shared gate.
+    if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
@@ -1982,13 +2031,29 @@ fn run_obs_grad_tvcov<const N: usize>(
     // resolved window varies with η across inner BFGS steps, so its schedule cannot be
     // cached — rebuild from the resolved `eff_doses` each call. Fixed subjects keep the
     // cached (η-invariant) schedule.
-    let eff_doses = resolve_modeled_eff_doses(model, subject, theta, eta);
+    // The per-dose f64 PK params are evaluated once (`dose_pk`) and shared by the
+    // resolved window and the dual's value, rather than re-running `pk_param_fn` per
+    // dose on the inner hot path (#486 review #4).
+    let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| {
+            let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(
+                uses_time,
+                subject.doses[k].time,
+            );
+            (model.pk_param_fn)(theta, eta, subject.dose_cov(k), subject.doses[k].time)
+        })
+        .collect();
+    let eff_doses = resolve_eff_doses(model, subject, |k| dose_pk[k]);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
     let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, |k, dr_slot| {
         let cov = subject.dose_cov(k);
         let _guard =
             crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
-        let pk = (model.pk_param_fn)(theta, eta, cov, subject.doses[k].time);
-        let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
+        let val = dose_pk[k].values.get(dr_slot).copied().unwrap_or(0.0);
         match param_derivatives_at_cov(prog, model, cov, theta, eta) {
             Some(pd) => pk_slot_dual_inner::<N>(dr_slot, val, &pd.dp_deta, slots, n_eta),
             None => Dual1::constant(val),
@@ -5502,6 +5567,118 @@ mod tests {
                 approx::assert_relative_eq!(x, y, max_relative = 1e-4, epsilon = 1e-6);
             }
         }
+    }
+
+    /// **Reset regression (#486 review #3).** A modeled-duration dose that starts
+    /// *before* an EVID3/4 reset must not thread its window jet into the post-reset
+    /// sub-intervals: the walk's rate loop drops a pre-reset dose (`t_start <
+    /// reset_floor`), and `dual_pos` must drop it too — otherwise the post-reset window
+    /// length carries a spurious `∂D`. The first infusion (`t = 0`, `D1 ≈ 2.1`) ends
+    /// *after* the reset at `t = 1`, so its stale infusion-end break at `≈ 2.1` lands in
+    /// a post-reset interval that the obs at `t = 2.5` straddles; a fresh modeled dose at
+    /// the reset supplies the legitimate post-reset moving boundary. Validated against FD
+    /// of the production predictor (which cancels the pre-reset infusion at the reset).
+    #[test]
+    fn provider_modeled_duration_reset_matches_fd_of_production() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                1.0,
+                800.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        let subject = subject_with_doses_and_resets(doses, &[0.5, 1.5, 2.5, 4.0], vec![1.0]);
+        assert!(subject.has_resets(), "subject must carry a reset");
+        assert!(!subject.all_doses_fixed(), "doses must be modeled");
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// **Separability guard (#486 review #2).** Two modeled-duration doses into
+    /// *distinct* compartments (`D1` into cmt 1, `D2` into cmt 2) whose infusion ends
+    /// coincide can't be represented by the single-`dt` walk — each end wants a different
+    /// per-compartment dual window length — so the subject declines to FD
+    /// (`subject_sensitivities` → `None`). Moving `D2` so the ends separate restores the
+    /// analytic path. Same-slot coincidences (identical jet) are unaffected.
+    #[test]
+    fn provider_modeled_distinct_slot_coincident_ends_decline() {
+        const TWOCPT_IV_D1_D2: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  theta TVD2(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  D1 = TVD1
+  D2 = TVD2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(TWOCPT_IV_D1_D2).expect("parse");
+        let doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                0.0,
+                800.0,
+                2,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        // TVD1 == TVD2 == 2.0, both doses at t=0 → both infusions end at t=2 with
+        // distinct backing slots ⇒ not separable ⇒ decline to FD.
+        let coincident = subject_with_doses_and_resets(doses.clone(), &[0.5, 1.5, 3.0], Vec::new());
+        assert!(
+            subject_sensitivities(
+                &model,
+                &coincident,
+                &[10.0, 50.0, 5.0, 100.0, 2.0, 2.0],
+                &[0.1, -0.05]
+            )
+            .is_none(),
+            "distinct-slot coincident infusion ends must decline to FD (#486 review #2)"
+        );
+        // TVD2 = 3.0 → ends at t=2 (cmt1) and t=3 (cmt2), separable ⇒ analytic path.
+        assert!(
+            subject_sensitivities(
+                &model,
+                &coincident,
+                &[10.0, 50.0, 5.0, 100.0, 2.0, 3.0],
+                &[0.1, -0.05]
+            )
+            .is_some(),
+            "separable infusion ends must be served analytically"
+        );
     }
 
     #[test]

@@ -776,20 +776,38 @@ fn propagate_bounds_g<T: PkNum>(
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
 ) {
+    // Moving infusion-end boundaries, precomputed once rather than re-scanned per
+    // sub-interval (#486 review #7): each post-reset modeled dose contributes
+    // `(end_time, dual_end)` with `dual_end = t_start + D` carrying `D`'s jet. Doses
+    // starting before a reset are skipped here exactly as the rate-accumulation loop
+    // below skips them (`t_start < reset_floor`), so a modeled infusion whose end
+    // coincides with a reset break does not thread a spurious `∂D` into the
+    // post-reset window (#486 review #3). The provider declines *distinct-slot*
+    // coincident ends to FD (`modeled_ends_separable`), so at most one entry matches a
+    // given break and same-slot coincidences share an identical `dual_end` — the
+    // first match below is therefore exact (#486 review #2).
+    let modeled_ends: Vec<(f64, T)> = doses
+        .iter()
+        .enumerate()
+        .filter_map(|(k, d)| {
+            let (_, dur_bare) = dose_inf_dual.get(k).copied().flatten()?;
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+            let t_start = d.time + lag;
+            if t_start < reset_floor {
+                return None;
+            }
+            Some((t_start + d.duration, T::from_f64(t_start) + dur_bare))
+        })
+        .collect();
     // Dual clock position of a sub-interval boundary `w`. For a fixed break time it
     // is just `w`; for the moving *end* of a modeled infusion (`t_start + D`) it
     // carries `D`'s jet, so adjacent active/quiet windows get `±∂D` in their dual
     // lengths and the moving-boundary sensitivity is exact (#486). The dose *start*
     // never moves here (no lagtime in walk scope), so only the end is threaded.
     let dual_pos = |w: f64| -> T {
-        for (k, d) in doses.iter().enumerate() {
-            if let Some((_, dur_bare)) = dose_inf_dual.get(k).copied().flatten() {
-                let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-                let t_start = d.time + lag;
-                let end_val = t_start + d.duration;
-                if (w - end_val).abs() < 1e-9 {
-                    return T::from_f64(t_start) + dur_bare;
-                }
+        for &(end_val, dual_end) in &modeled_ends {
+            if (w - end_val).abs() < 1e-9 {
+                return dual_end;
             }
         }
         T::from_f64(w)

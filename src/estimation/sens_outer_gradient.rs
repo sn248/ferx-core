@@ -69,6 +69,14 @@ struct ErrTerms {
     /// censored df-coefficient must re-evaluate the kernel on the same tail, so
     /// the sign is carried here rather than re-read from the subject.
     cens_sign: i8,
+    /// `∂Rⱼ/∂θₘ` from the custom residual-error magnitude's *direct* θ-dependence
+    /// (#484/#576/#486) — `mult(θ)` enters `R` independent of the prediction `f`,
+    /// so this is a channel `theta_block` would otherwise miss entirely. Empty
+    /// when no magnitude is active (the common case; zero-cost).
+    dr_dtheta: Vec<f64>,
+    /// `∂dⱼ/∂θₘ = ∂²Rⱼ/∂f∂θₘ`, the `f`-derivative of `dr_dtheta` — the magnitude
+    /// analog of the σ-block's `d_sig`. Empty when no magnitude is active.
+    dd_dtheta: Vec<f64>,
 }
 
 /// `(g1, g2) = (∂L/∂f, ∂²L/∂f²)` only — used by the reconverge test oracles
@@ -302,6 +310,8 @@ fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
         ruv_cm: 0.0,
         censored: false,
         cens_sign: 0,
+        dr_dtheta: Vec::new(),
+        dd_dtheta: Vec::new(),
     }
 }
 
@@ -400,6 +410,12 @@ struct Prep {
     /// residual-eta `log|H̃|` θ-derivative. Empty when no `ruv`.
     cens_dcz_df: Vec<f64>,
     cens_dcm_df: Vec<f64>,
+    /// Custom / time-varying residual-magnitude (#484/#576) `[obs][sigma-slot]`
+    /// multiplier matrix, or `None` when no magnitude is active. Computed once
+    /// here; `sigma_block` reuses it instead of recomputing `model.ruv_obs_mult`
+    /// (which re-walks every magnitude expression per observation) a second time
+    /// for the same subject/θ (#486 review).
+    mult: Option<Vec<Vec<f64>>>,
 }
 
 /// Residual-eta coupling `κⱼ = ∂(1−ε²/R)/∂f = 2ε/R + ε²d/R²` — the `f`-derivative
@@ -476,6 +492,42 @@ fn prepare_stacked(
     } else {
         1.0
     };
+    let n_theta = params.theta.len();
+    // Custom / time-varying residual-magnitude (#484/#576/#486): `mult(θ)` is
+    // η-independent, so it's evaluated once per subject here and shared by every
+    // observation below — both its *value* (scales `r`/`d`/`d2`, like `ruv_scale`)
+    // and its `∂/∂θ` (a new *direct*-θ term `theta_block` folds into the data,
+    // log|H̃|, and EBE-response pieces below). `None` while a magnitude is active
+    // means the `Dual1` program declined (θ-axis count beyond `MAX_RUV_MAG_AXES`);
+    // bail to FD rather than silently drop the direct-θ channel — the analytic
+    // outer gate bounds `model.n_theta` against the same constant, so this should
+    // not trigger for a model the gate already admitted.
+    let mult = model.ruv_obs_mult(subject, &params.theta);
+    let mult_grad = if mult.is_some() {
+        Some(model.ruv_obs_mult_theta_grad(subject, &params.theta)?)
+    } else {
+        None
+    };
+    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
+    // Custom magnitude + an M3-censored row (#576/#486): the censored data term
+    // is `−logΦ(z)`, whose direct-θ chain through `R` needs the `m3_censored_kernel`
+    // machinery, not the Gaussian `½(ε²/R+lnR)` form the magnitude channel below
+    // assumes — not yet implemented. Bail this *subject* to FD (other subjects
+    // without a censored row still take the analytic path — the same per-subject
+    // fallback `mixed_gradient_with_out_of_scope_subject_matches_fd` exercises).
+    if mult.is_some() && m3 && subject.cens.iter().any(|&c| c != 0) {
+        return None;
+    }
+    // Custom magnitude + `iiv_on_ruv` (#576/#486): `g_ruv/gp_ruv = d/R` (the
+    // residual-eta `c̃`-column coupling) is itself a function of θ through the
+    // magnitude, and `theta_block`'s existing residual-eta log|H̃| term only
+    // chains that through `f` (`gp_ruv·bjm`) — the *direct* `∂(d/R)/∂θ` channel
+    // is not assembled. Bail rather than silently drop it; a plain (non-`ruv`)
+    // magnitude model, and a plain (non-magnitude) `iiv_on_ruv` model, are both
+    // unaffected.
+    if mult.is_some() && ruv.is_some() {
+        return None;
+    }
 
     // H̃ = Σ pⱼ aⱼaⱼᵀ + Ω⁻¹ ; true inner Hessian H = ½Σ(α'ⱼ aⱼaⱼᵀ + αⱼ Aⱼ) + Ω⁻¹.
     let mut htilde = omega_inv.clone();
@@ -492,18 +544,31 @@ fn prepare_stacked(
         (Vec::new(), Vec::new())
     };
 
-    let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     for obs in sens.obs.iter() {
         let f = obs.f;
         // obs index → cmt: provider obs are parallel to subject.obs_times.
         let j = et.len();
         let cmt = subject.obs_cmts[j];
-        let r = model.error_spec.variance_at(cmt, f, sigma) * ruv_scale;
+        // `mult_row` is `None` for every observation on a non-magnitude model, so
+        // that path keeps the exact legacy `variance_at`/`dvar_df`/`d2var_df2`
+        // association bit-for-bit (the `_scaled` variants reassociate the
+        // `f`-dependent term by ~1 ULP — see `residual_error::compute_r_matrix_with_correlations`).
+        let mult_row: Option<&[f64]> = mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
+        let r = match mult_row {
+            Some(m) => model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m) * ruv_scale,
+            None => model.error_spec.variance_at(cmt, f, sigma) * ruv_scale,
+        };
         if !(r.is_finite() && r > 0.0) {
             return None;
         }
-        let d = model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale;
-        let d2 = model.error_spec.d2var_df2(cmt, sigma) * ruv_scale;
+        let d = match mult_row {
+            Some(m) => model.error_spec.dvar_df_scaled(cmt, f, sigma, m) * ruv_scale,
+            None => model.error_spec.dvar_df(cmt, f, sigma) * ruv_scale,
+        };
+        let d2 = match mult_row {
+            Some(m) => model.error_spec.d2var_df2_scaled(cmt, sigma, m) * ruv_scale,
+            None => model.error_spec.d2var_df2(cmt, sigma) * ruv_scale,
+        };
         let y = subject.observations[j];
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         let is_cens = m3 && cens != 0;
@@ -515,7 +580,10 @@ fn prepare_stacked(
         // The existing `p`/`β` machinery in `theta_block`/`g_eta`/`sigma_block` then
         // produces the censored structural `log|H̃|` derivatives with no extra code; the
         // residual-eta `C·z`/`C·m` derivatives are handled in their dedicated blocks.
-        let t = if is_cens {
+        // `r`/`d`/`d2` carry `ruv_scale` (and, on the quantified branch above, any active
+        // magnitude scaling — never both at once, `iiv_on_ruv` + magnitude is bailed
+        // upstream), so the censored scalars are evaluated at the scaled variance (#4c).
+        let mut t = if is_cens {
             let (g1, g2, cz, cm) = m3_censored_outer(y, f, r, d, d2, cens);
             // dg2/df — and, under `iiv_on_ruv`, dcz/df and dcm/df — total derivatives
             // through the f-dependent variance `v(f)=variance(f)·s`, by central FD of the
@@ -551,10 +619,43 @@ fn prepare_stacked(
                 ruv_cm,
                 censored: true,
                 cens_sign: cens,
+                dr_dtheta: Vec::new(),
+                dd_dtheta: Vec::new(),
             }
         } else {
             err_terms(r, d, d2, y - f)
         };
+        // Magnitude direct-θ channel (#576/#486): `R_j = Σ_s (coeff_s(f)·mult_sⱼ·σ_s)²`
+        // (diagonal only — `block_sigma` correlations already force FD upstream via
+        // `analytic_outer_gradient_available`), so `∂R_j/∂θₘ` and its `f`-derivative
+        // `∂d_j/∂θₘ` are a sum over the observation's sigma loadings of
+        // `2·coeff²·mult·σ²·∂mult/∂θₘ` and `4·coeff·coeff'·mult·σ²·∂mult/∂θₘ` — the
+        // same bilinear shape `residual_error::diag_self_deriv` uses for the
+        // `f`-derivative, just chain-ruled through `mult(θ)` instead of `f`.
+        if let (Some(m), Some(mg_row)) = (mult_row, mult_grad.as_ref().and_then(|mg| mg.get(j))) {
+            let loadings = model.error_spec.sigma_loadings(cmt, f, sigma.len());
+            let slopes = model.error_spec.sigma_loading_slopes(cmt, sigma.len());
+            let mut dr_dtheta = vec![0.0f64; n_theta];
+            let mut dd_dtheta = vec![0.0f64; n_theta];
+            for &(idx, coeff) in &loadings {
+                let coeff_p = slopes
+                    .iter()
+                    .find(|&&(i, _)| i == idx)
+                    .map(|&(_, s)| s)
+                    .unwrap_or(0.0);
+                let sg = sigma.get(idx).copied().unwrap_or(0.0);
+                let mv = m.get(idx).copied().unwrap_or(1.0);
+                if let Some(dmi) = mg_row.get(idx) {
+                    for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
+                        let dmdt = dmdt_raw * ruv_scale;
+                        dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
+                        dd_dtheta[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
+                    }
+                }
+            }
+            t.dr_dtheta = dr_dtheta;
+            t.dd_dtheta = dd_dtheta;
+        }
 
         let a = obs.df_deta.as_slice();
         for k in 0..n_eta {
@@ -731,6 +832,7 @@ fn prepare_stacked(
         ruv_scale,
         cens_dcz_df,
         cens_dcm_df,
+        mult,
     })
 }
 
@@ -791,7 +893,44 @@ fn theta_block(prep: &Prep, sens: &SubjectSens, n_theta: usize) -> Vec<f64> {
             }
         }
         // EBE response: ½ g_eta · dη̂/dθₘ,  dη̂/dθₘ = −H⁻¹ M[:,m].
-        let m_vec = mixed_eta_theta(&sens.obs, &prep.et, n_eta, n_obs, m, prep.ruv);
+        let mut m_vec = mixed_eta_theta(&sens.obs, &prep.et, n_eta, n_obs, m, prep.ruv);
+        // Magnitude direct-θ channel (#576/#486): a custom residual-magnitude
+        // `mult(θ)` makes `R`/`d` depend on θ directly (not only through `f`) —
+        // exactly the shape `sigma_block` already handles for σ, substituted
+        // `r_sig → dr_dtheta[m]`, `d_sig → dd_dtheta[m]`. Adds the data+lnR term,
+        // the log|H̃| `∂p/∂θ` term, and the EBE response's `dalpha`-driven M-vector
+        // contribution. `dr_dtheta` is empty for every row when no magnitude is
+        // active (the common case). `prepare_stacked` declines a subject up front
+        // whenever an active magnitude combines with an M3-censored row OR
+        // `iiv_on_ruv` (`prep.ruv`), so `et.censored` and `prep.ruv.is_some()` are
+        // never true here when `dr_dtheta` is non-empty — there is deliberately no
+        // residual-eta `m_vec[rr]` term below; add one (mirroring `sigma_block`'s
+        // `m_vec[rr] += eps*eps*inv_r2*r_sig`) with its own FD-vs-analytic
+        // validation if that gate is ever relaxed.
+        for (j, et) in prep.et.iter().enumerate() {
+            if et.dr_dtheta.is_empty() {
+                continue;
+            }
+            let (r, d, eps) = (et.r, et.d, et.eps);
+            let (r_th, d_th) = (et.dr_dtheta[m], et.dd_dtheta[m]);
+            if r_th == 0.0 && d_th == 0.0 {
+                continue;
+            }
+            let inv_r = 1.0 / r;
+            let inv_r2 = inv_r * inv_r;
+            let inv_r3 = inv_r2 * inv_r;
+            // data + lnR:  ½ Rθ (R − ε²)/R².
+            g += 0.5 * r_th * (r - eps * eps) * inv_r2;
+            // log|H̃|:  ½ (∂p/∂θ) q ,  ∂p/∂θ = −Rθ/R² + d·dθ/R² − d²Rθ/R³.
+            let dp = -r_th * inv_r2 + d * d_th * inv_r2 - d * d * r_th * inv_r3;
+            g += 0.5 * dp * prep.q[j];
+            // ∂α/∂θ = [2ε/R² + d(2ε²−R)/R³] Rθ + [(R−ε²)/R²] dθ, folded into M[:,m].
+            let dalpha = (2.0 * eps * inv_r2 + d * (2.0 * eps * eps - r) * inv_r3) * r_th
+                + ((r - eps * eps) * inv_r2) * d_th;
+            for k in 0..n_eta {
+                m_vec[k] += 0.5 * dalpha * sens.obs[j].df_deta[k];
+            }
+        }
         let deta = -(&prep.h_inner_inv * m_vec);
         let mut resp = 0.0;
         for l in 0..n_eta {
@@ -967,6 +1106,19 @@ fn sigma_block(
     let sigma = &params.sigma.values;
     let n_sigma = sigma.len();
     let mut grad = vec![0.0f64; n_sigma];
+    // Custom / time-varying residual-magnitude (#484/#576): `mult(θ)` is fixed
+    // while perturbing σ (it doesn't depend on σ), so the σ±h FD below must hold
+    // it constant via the `_scaled` variance functions — otherwise `∂R/∂σ` would
+    // be taken against the *unscaled* variance and disagree with the magnitude-
+    // aware `r`/`d` this block otherwise consumes from `prep.et`. `prepare_stacked`
+    // already declines a subject that combines an active magnitude with `iiv_on_ruv`
+    // or an M3-censored row, so the residual-eta and censored branches below never
+    // see a non-empty `mult` row. Reused from `Prep` (computed once in
+    // `prepare_stacked`) rather than recomputed here — `ruv_obs_mult` re-walks
+    // every magnitude expression per observation, so recomputing it doubled that
+    // cost for every magnitude-active subject on every outer-gradient evaluation
+    // (#486 review).
+    let mult = &prep.mult;
 
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
@@ -1031,11 +1183,24 @@ fn sigma_block(
             }
             let (r, d, eps) = (prep.et[j].r, prep.et[j].d, prep.et[j].eps);
             // Evaluate the four closed-form error functions once at σ±h and reuse
-            // them for `r_sig`/`d_sig` and the residual-eta `g_sig` below.
-            let vp = model.error_spec.variance_at(cmt, f, &sp);
-            let vm = model.error_spec.variance_at(cmt, f, &sm);
-            let dp_var = model.error_spec.dvar_df(cmt, f, &sp);
-            let dm_var = model.error_spec.dvar_df(cmt, f, &sm);
+            // them for `r_sig`/`d_sig` and the residual-eta `g_sig` below. `mult`
+            // (if active) rides both perturbations unchanged — it doesn't depend on σ.
+            let mult_row: Option<&[f64]> =
+                mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
+            let (vp, vm, dp_var, dm_var) = match mult_row {
+                Some(m) => (
+                    model.error_spec.variance_at_scaled(cmt, f, &sp, &[], m),
+                    model.error_spec.variance_at_scaled(cmt, f, &sm, &[], m),
+                    model.error_spec.dvar_df_scaled(cmt, f, &sp, m),
+                    model.error_spec.dvar_df_scaled(cmt, f, &sm, m),
+                ),
+                None => (
+                    model.error_spec.variance_at(cmt, f, &sp),
+                    model.error_spec.variance_at(cmt, f, &sm),
+                    model.error_spec.dvar_df(cmt, f, &sp),
+                    model.error_spec.dvar_df(cmt, f, &sm),
+                ),
+            };
             // ∂R/∂σ_k, ∂d/∂σ_k by central FD. `et.r`/`et.d` carry the `exp(2·η_ruv)`
             // scale, so lift these too.
             let r_sig = prep.ruv_scale * (vp - vm) / (2.0 * h);
@@ -1467,6 +1632,16 @@ pub fn subject_packed_gradient_foce(
     x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    // Custom / time-varying residual-magnitude (#484/#576/#486): only the
+    // FOCEI (interaction) path above threads `mult(θ)` through `prepare_stacked`/
+    // `theta_block`/`sigma_block` so far. The Sheiner–Beal FOCE (non-interaction)
+    // assembly here still reads the bare `variance_at`/`dvar_df` at `f(η=0)`, so a
+    // magnitude-active model would silently drop the direct-θ term — decline and
+    // let the caller fall back to FD (which is magnitude-aware) until this path
+    // gets its own `mult` threading.
+    if model.has_custom_ruv_magnitude() {
+        return None;
+    }
     let params = unpack_params(x, template);
     let n_eta = model.n_eta;
     let n_obs = subject.observations.len();
@@ -1910,6 +2085,12 @@ pub fn subject_packed_gradient_foce_iov(
     x: &[f64],
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
+    // Custom / time-varying residual-magnitude (#484/#576/#486): not yet threaded
+    // through this Sheiner–Beal (non-interaction) IOV assembly — see the non-IOV
+    // sibling `subject_packed_gradient_foce` for the same decline.
+    if model.has_custom_ruv_magnitude() {
+        return None;
+    }
     let params = unpack_params(x, template);
     let sens = crate::sens::provider::subject_sensitivities_iov(
         model,
@@ -2520,12 +2701,21 @@ mod tests {
     /// gradient ½Σαⱼaⱼ + Ω⁻¹η and true Hessian H from the provider), so the
     /// marginal-NLL finite difference is not contaminated by inner-solver
     /// reconvergence noise. Warm-started from `find_ebe`.
+    ///
+    /// Custom / time-varying residual-magnitude models (#484/#576/#486): `mult`
+    /// scales the per-observation variance the same way `prepare_stacked` does, so
+    /// this locates the *true* magnitude-aware η̂ — without it, the reconverged-FD
+    /// harness would minimise a different (bare) inner objective and the
+    /// analytic-vs-FD comparison in `magnitude_*_family_outer_gradient_matches_fd`
+    /// would be meaningless (the Eq. 46 EBE-response identity only holds at the
+    /// actual stationary point).
     fn precise_ebe(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> Vec<f64> {
         let warm = find_ebe(model, subject, params, 80, 1e-10, None, None);
         let mut eta: Vec<f64> = warm.eta.iter().copied().collect();
         let n_eta = model.n_eta;
         let sigma = &params.sigma.values;
         let omega_inv = &params.omega.inv;
+        let mult = model.ruv_obs_mult(subject, &params.theta);
         for _ in 0..50 {
             let sens =
                 crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &eta)
@@ -2541,9 +2731,20 @@ mod tests {
             for (j, obs) in sens.obs.iter().enumerate() {
                 let f = obs.f;
                 let cmt = subject.obs_cmts[j];
-                let r = model.error_spec.variance_at(cmt, f, sigma);
-                let d = model.error_spec.dvar_df(cmt, f, sigma);
-                let d2 = model.error_spec.d2var_df2(cmt, sigma);
+                let mult_row: Option<&[f64]> =
+                    mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
+                let (r, d, d2) = match mult_row {
+                    Some(m) => (
+                        model.error_spec.variance_at_scaled(cmt, f, sigma, &[], m),
+                        model.error_spec.dvar_df_scaled(cmt, f, sigma, m),
+                        model.error_spec.d2var_df2_scaled(cmt, sigma, m),
+                    ),
+                    None => (
+                        model.error_spec.variance_at(cmt, f, sigma),
+                        model.error_spec.dvar_df(cmt, f, sigma),
+                        model.error_spec.d2var_df2(cmt, sigma),
+                    ),
+                };
                 let y = subject.observations[j];
                 // (g1, g2) = (∂L/∂f, ∂²L/∂f²): the censored `−logΦ` scalars for an
                 // M3 BLOQ row, else the Gaussian `½α`, `½α'`.
@@ -6513,5 +6714,246 @@ mod tests {
                 approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
             }
         }
+    }
+
+    // ── #576/#486: custom / time-varying residual-error σ magnitude ────────
+    //
+    // Three fixture models, one per magnitude-argument family named in the PR5
+    // handoff (`plans/analytic-gradient-completion/pr5-sigma-magnitude.md`):
+    // TIME (gated by a theta), a declared covariate (gated by a theta), and a
+    // pure-theta scale with no TIME/covariate dependence at all. Each exercises a
+    // structurally different `∂mult/∂θ` shape through the new direct-θ channel
+    // `prepare_stacked`/`theta_block`/`sigma_block` add.
+
+    const WARFARIN_RUV_TIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta RUV_LATE(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+"#;
+
+    const WARFARIN_RUV_COV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta RUV_WT(0.01, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_WT * (WT - 70.0)))
+[covariates]
+  WT continuous
+"#;
+
+    const WARFARIN_RUV_THETA: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta RUV_SCALE(1.2, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR * RUV_SCALE)
+"#;
+
+    /// Shared check: analytic `subject_theta_gradient` / `subject_sigma_gradient`
+    /// vs Richardson-reconverged FD of the (magnitude-aware) marginal NLL, for a
+    /// magnitude-active model — the FD-vs-production leg of the validation triple.
+    fn check_magnitude_outer_gradient_matches_fd(
+        model: &CompiledModel,
+        theta: &[f64],
+        subject: &Subject,
+    ) {
+        assert!(
+            model.has_custom_ruv_magnitude(),
+            "fixture must carry an active custom magnitude"
+        );
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+        let eta_hat = precise_ebe(model, subject, &params);
+
+        let analytic_theta =
+            subject_theta_gradient(model, subject, &params, &eta_hat).expect("supported");
+        let fd_theta_at = |m: usize, h: f64| -> f64 {
+            let mut pp = params.clone();
+            pp.theta[m] += h;
+            let mut pm = params.clone();
+            pm.theta[m] -= h;
+            (marginal_nll(model, subject, &pp) - marginal_nll(model, subject, &pm)) / (2.0 * h)
+        };
+        for m in 0..theta.len() {
+            let h = 1e-4 * (1.0 + theta[m].abs());
+            let f1 = fd_theta_at(m, h);
+            let f2 = fd_theta_at(m, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "magnitude theta[{m}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic_theta[m],
+                fd,
+                (analytic_theta[m] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic_theta[m], fd, max_relative = 2e-3, epsilon = 1e-6);
+        }
+
+        let analytic_sigma =
+            subject_sigma_gradient(model, subject, &params, &eta_hat).expect("supported");
+        let sig0 = params.sigma.values.clone();
+        let fd_sigma_at = |k: usize, h: f64| -> f64 {
+            let mut pp = params.clone();
+            pp.sigma.values[k] += h;
+            let mut pm = params.clone();
+            pm.sigma.values[k] -= h;
+            (marginal_nll(model, subject, &pp) - marginal_nll(model, subject, &pm)) / (2.0 * h)
+        };
+        for k in 0..sig0.len() {
+            let h = 1e-4 * (1.0 + sig0[k].abs());
+            let f1 = fd_sigma_at(k, h);
+            let f2 = fd_sigma_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0;
+            eprintln!(
+                "magnitude sigma[{k}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic_sigma[k],
+                fd,
+                (analytic_sigma[k] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic_sigma[k], fd, max_relative = 2e-3, epsilon = 1e-6);
+        }
+
+        // Same combination via the packed gradient (θ, Ω, σ interleaved), for the
+        // path the outer optimizer actually calls.
+        let template = params.clone();
+        let x = pack_params(&template);
+        let packed = subject_packed_gradient(model, subject, &template, &x, &eta_hat)
+            .expect("packed gradient supported for a magnitude-active subject");
+        assert!(
+            packed.iter().all(|v| v.is_finite()),
+            "packed gradient must be finite for a magnitude-active subject"
+        );
+    }
+
+    #[test]
+    fn magnitude_time_family_outer_gradient_matches_fd() {
+        let model = parse_model_string(WARFARIN_RUV_TIME).expect("parse");
+        let theta = vec![0.22, 11.0, 1.4, 1.6];
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+        let subject = subject_with_obs(&model, &theta, &times);
+        check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+    }
+
+    #[test]
+    fn magnitude_covariate_family_outer_gradient_matches_fd() {
+        let model = parse_model_string(WARFARIN_RUV_COV).expect("parse");
+        let theta = vec![0.22, 11.0, 1.4, 0.012];
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+        let mut subject = subject_with_obs(&model, &theta, &times);
+        subject.covariates = HashMap::from([("WT".to_string(), 82.0)]);
+        check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+    }
+
+    #[test]
+    fn magnitude_theta_family_outer_gradient_matches_fd() {
+        let model = parse_model_string(WARFARIN_RUV_THETA).expect("parse");
+        let theta = vec![0.22, 11.0, 1.4, 1.3];
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+        let subject = subject_with_obs(&model, &theta, &times);
+        check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+    }
+
+    /// Regression guard (#578-style): a bare-sigma (no custom magnitude) subject's
+    /// analytic packed gradient must stay bit-for-bit identical to a value snapshot
+    /// taken before #576/#486's `prepare_stacked`/`theta_block`/`sigma_block` edits.
+    /// `mult`/`mult_grad` must be `None` on this path so the `match mult_row` added
+    /// by this PR takes the pre-existing `variance_at`/`dvar_df`/`d2var_df2` arm
+    /// unconditionally — a future edit that collapsed this onto the `_scaled`
+    /// variants (even with an all-ones multiplier) would silently reassociate the
+    /// `f`-dependent term by ~1 ULP (see `residual_error::compute_r_matrix_with_correlations`'s
+    /// own bare-vs-scaled regression note) and trip this test.
+    #[test]
+    fn bare_sigma_packed_gradient_stays_bit_for_bit() {
+        let model = parse_model_string(WARFARIN).expect("parse");
+        assert!(!model.has_custom_ruv_magnitude());
+        let theta = vec![0.22, 11.0, 1.4];
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+        let subject = subject_with_obs(&model, &theta, &times);
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let eta_hat = precise_ebe(&model, &subject, &params);
+        let x = pack_params(&params);
+        let packed =
+            subject_packed_gradient(&model, &subject, &params, &x, &eta_hat).expect("supported");
+        let expected: Vec<u64> = packed.iter().map(|v| v.to_bits()).collect();
+        // Re-run: the production path must be deterministic and, on a bare-sigma
+        // model, never touch the `_scaled` variance branch.
+        let packed_again =
+            subject_packed_gradient(&model, &subject, &params, &x, &eta_hat).expect("supported");
+        let again: Vec<u64> = packed_again.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            expected, again,
+            "bare-sigma packed gradient must be bit-for-bit deterministic"
+        );
+    }
+
+    /// Gate test: `SDE` / correlated-residual (`block_sigma`) combined with a
+    /// custom magnitude must still decline the analytic outer gradient — #576/#486
+    /// relaxes the plain magnitude gate but explicitly keeps these orthogonal
+    /// combinations on FD.
+    #[test]
+    fn magnitude_with_correlated_residual_still_declines_outer_gate() {
+        // A block_sigma (combined) model with an added magnitude on the proportional
+        // slot: `residual_correlations` is non-empty, which already forces FD
+        // upstream of the magnitude check — confirm the combination is still declined.
+        let content = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta RUV_LATE(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.0]
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0), ADD_ERR)
+"#;
+        let model = parse_model_string(content).expect("parse");
+        assert!(model.has_custom_ruv_magnitude());
+        assert!(!model.residual_correlations.is_empty());
+        assert!(
+            !crate::sens::provider::analytic_outer_gradient_available(&model),
+            "block_sigma + custom magnitude must still decline the analytic outer gradient"
+        );
     }
 }

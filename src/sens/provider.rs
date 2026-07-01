@@ -7241,8 +7241,13 @@ mod tests {
     /// The dual SS equilibration reads a fixed per-cycle `t_inf` with no modeled-window jet,
     /// so a modeled + SS subject must route to FD on BOTH the outer sensitivity walk and the
     /// inner η-gradient (scope parity). Pins the `has_ss` arm of the relaxed IOV gate.
+    /// **ODE IOV + modeled-duration dose × steady-state is now analytic (#486, PR3
+    /// sub-case (d)).** `equilibrate_ss_state_g` threads the per-occasion `inf_eff` jet
+    /// (`D1` seeded per occasion group, same as the non-SS modeled-duration IOV test) into
+    /// its per-cycle active/quiet split. Validated vs central FD of `predict_iov` (both
+    /// outer and inner, scope parity).
     #[test]
-    fn ode_iov_modeled_duration_ss_falls_back_to_fd() {
+    fn ode_iov_modeled_duration_ss_matches_fd_of_predict_iov() {
         let model =
             parse_model_string(WARFARIN_IOV_ODE_MODELED_DUR).expect("parse modeled-dur IOV");
         let mut subject = iov_subject();
@@ -7270,14 +7275,16 @@ mod tests {
             crate::sens::ode_provider::ode_subject_sensitivities_iov(
                 &model, &subject, &theta, &stacked
             )
-            .is_none(),
-            "modeled-duration + SS must fall back to FD (outer)"
+            .is_some(),
+            "modeled-duration + SS must be analytic now (outer, #486)"
         );
         assert!(
             crate::sens::ode_provider::ode_subject_eta_grad_iov(&model, &subject, &theta, &stacked)
-                .is_none(),
-            "modeled-duration + SS must fall back to FD (inner, scope parity)"
+                .is_some(),
+            "modeled-duration + SS must be analytic now (inner, scope parity)"
         );
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
     }
 
     /// Regression (#575 review): a plain `ScalingSpec::None` IOV ODE model under LTBS
@@ -7607,6 +7614,93 @@ mod tests {
             &[0.2, 10.0, 0.5],
             &[0.12, -0.08, 0.05, -0.10],
         );
+    }
+
+    /// **IOV × steady-state × estimated lagtime is now analytic (#486, PR3 sub-case (a)).**
+    /// Each occasion's SS dose gets its own `K_SS_SEED` pre-arrival seed (phase `II − lag`,
+    /// `ss_state_at_phase_g` seeded with that occasion's κ) — validated against the dense
+    /// (non-event-driven) predictor for this exact combination in
+    /// `ode_provider_ss_lagtime_matches_production`/`..._infusion_...` (including an
+    /// observation strictly inside the pre-arrival window). `predict_iov`, this test's
+    /// oracle, has no such seed of its own (a pre-existing, orthogonal gap — it would read
+    /// zero for a pre-arrival observation regardless of gate/gradient correctness), so this
+    /// test uses the default `iov_subject()` times (post-arrival only) to isolate the SS
+    /// dose's own event-time saltation under IOV.
+    #[test]
+    fn ode_iov_ss_lagtime_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_LAG_ODE).expect("parse ODE IOV+lag");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + bare lagtime must be supported"
+        );
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+        let theta = [0.2, 10.0, 0.5];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked,
+            )
+            .is_some(),
+            "SS + lagtime IOV subject must be analytic now (#486)"
+        );
+        // stacked = [η_cl, η_v, κ_g0, κ_g1]; θ = [TVCL, TVV, TVLAG].
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **IOV × rate-defined SS infusion under bioavailability `F ≠ 1` is now analytic**
+    /// (#486, PR3 sub-case (b)). `equilibrate_ss_state_g` reads the per-occasion `inf_eff`
+    /// jet (window `F·duration`, rate held) instead of the fixed raw duration.
+    #[test]
+    fn ode_iov_ss_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
+        const WARFARIN_IOV_SS_F_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.13, 0.01, 1.0)
+  theta TVV(8.0, 1.0, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  iov_column OCC
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV * exp(ETA_V)
+  F  = TVF
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(WARFARIN_IOV_SS_F_ODE).expect("parse IOV+SS+F ODE");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 50.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 50.0, true, 12.0),
+        ];
+        assert!(subject.doses[0].ss && subject.has_rate_defined_infusion());
+        let theta = [0.13, 8.0, 0.7];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked,
+            )
+            .is_some(),
+            "rate-defined SS infusion under F IOV subject must be analytic now (#486)"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
     }
 
     /// **IOV × lagtime × infusion × reset** — the combined path through `integrate_tvcov_g`

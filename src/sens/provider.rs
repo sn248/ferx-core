@@ -691,7 +691,22 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     ) {
         return false;
     }
-    if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
+    // Output scaling: `None` (raw jet) or a differentiable `ExpressionScale` `obs_scale`
+    // divisor whose (θ, η) axis counts match the model and fit the scale dispatch table.
+    // The `ExpressionScale` quotient is a per-occasion-group post-walk step in
+    // `run_obs_iov` / `run_obs_iov_eta` (the closed-form twin of the ODE-IOV path,
+    // #575/#590). `ScalarScale` still declines (the IOV walk has no constant-divisor step)
+    // and LTBS declines below (the in-walk log can't compose with the post-walk quotient),
+    // matching the ODE-IOV gate `expression_scale_axes_admissible` (#486).
+    match &model.scaling {
+        ScalingSpec::None => {}
+        ScalingSpec::ExpressionScale { deriv: Some(p), .. }
+            if p.n_theta_axis() == model.n_theta
+                && p.n_eta_axis() == model.n_eta
+                && (1..=MAX_SCALE_AXES).contains(&p.n_axes()) => {}
+        _ => return false,
+    }
+    if model.log_transform || model.has_lagtime() {
         return false;
     }
     // Initial-compartment amounts (#521) ARE differentiable by the analytic kernels
@@ -794,8 +809,9 @@ pub fn subject_sensitivities_iov(
         ($($m:literal),+) => {
             match m_dim {
                 $($m => run_obs_iov::<$m>(
-                    model, subject, &s.sources, &s.dose_src, &s.obs_src, &s.pkonly_src,
-                    &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked, s.n_theta,
+                    model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
+                    &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
+                    s.n_theta, s.scale_groups.as_deref(),
                 ),)+
                 _ => None,
             }
@@ -823,6 +839,15 @@ struct IovSources {
     n_eff: usize,
     n_stacked: usize,
     n_theta: usize,
+    /// For an `ExpressionScale` `obs_scale` divisor: one `(pk, combined-derivs)` per
+    /// occasion group, evaluated at the **subject-static covariate snapshot** (`t = 0`),
+    /// so the walk can build a per-group scale jet. `None` when the model carries no
+    /// differentiable `ExpressionScale`. The scale divisor is subject-static under IOV
+    /// (production `predict_iov` calls `apply_scaling` at `t = 0` inside each occasion),
+    /// so it is built at static cov even for a TV-covariate subject whose event sources
+    /// are per-event — the closed-form twin of the ODE-IOV `build_all_groups` scale seed
+    /// (#575/#590, ported in #486).
+    scale_groups: Option<Vec<(crate::types::PkParams, CombinedDerivs)>>,
 }
 
 fn build_iov_sources(
@@ -989,6 +1014,25 @@ fn build_iov_sources(
         }
     }
 
+    // `ExpressionScale` `obs_scale`: one `(pk, cd)` reference per occasion group at the
+    // subject-static covariate snapshot (`t = 0`) — the divisor depends on the group's κ
+    // through the PK params, but not on the per-event covariate/time, matching production
+    // `predict_iov`'s subject-static `apply_scaling` inside each occasion. Built here (with
+    // `theta`/`combined_for`/`cd_at` in scope) and consumed dual-typed in the walk fns.
+    let scale_groups = match &model.scaling {
+        ScalingSpec::ExpressionScale { deriv: Some(_), .. } => {
+            let mut groups = Vec::with_capacity(k_groups);
+            for g in 0..k_groups {
+                let combined = combined_for(g);
+                let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
+                let cd = cd_at(0.0, &combined, cov_static)?;
+                groups.push((pk, cd));
+            }
+            Some(groups)
+        }
+        _ => None,
+    };
+
     Some(IovSources {
         sources,
         dose_src,
@@ -1000,6 +1044,7 @@ fn build_iov_sources(
         n_eff,
         n_stacked,
         n_theta,
+        scale_groups,
     })
 }
 
@@ -1024,8 +1069,9 @@ fn subject_eta_grad_iov_analytical(
         ($($n:literal),+) => {
             match n_dim {
                 $($n => run_obs_iov_eta::<$n>(
-                    model, subject, &s.sources, &s.dose_src, &s.obs_src, &s.pkonly_src,
-                    &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
+                    model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
+                    &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
+                    s.scale_groups.as_deref(),
                 ),)+
                 _ => None,
             }
@@ -1051,6 +1097,8 @@ fn subject_eta_grad_iov_analytical(
 fn run_obs_iov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
     sources: &[(crate::types::PkParams, CombinedDerivs, Option<usize>)],
     dose_src: &[usize],
     obs_src: &[usize],
@@ -1061,6 +1109,7 @@ fn run_obs_iov<const M: usize>(
     n_eff: usize,
     n_stacked: usize,
     n_theta: usize,
+    scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_g, PkDual};
@@ -1197,6 +1246,50 @@ fn run_obs_iov<const M: usize>(
             d2f_deta_dtheta,
         });
     }
+
+    // η-dependent `ExpressionScale` `obs_scale` divisor: one scale jet per occasion group
+    // (the divisor depends on the group's κ through the PK params), applied as a post-walk
+    // quotient over the stacked `(θ, η_bsv, κ)` axes — the closed-form twin of the ODE-IOV
+    // per-group quotient (#575/#590). The scale reference `(pk, cd)` is at the subject-static
+    // covariate snapshot (`t = 0`), matching production `predict_iov`'s `apply_scaling`.
+    if let Some(scale_groups) = scale_groups {
+        let ScalingSpec::ExpressionScale {
+            deriv: Some(sprog), ..
+        } = &model.scaling
+        else {
+            return None; // gate guarantees this arm; defensive
+        };
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        // Seed each group's stacked-axis PK duals (constants elsewhere), mirroring
+        // `seed_pk_dual2_iov`: the differentiated slots carry the `(θ, η_bsv, κ_g)` jet.
+        let groups: Vec<Vec<Dual2<M>>> = scale_groups
+            .iter()
+            .enumerate()
+            .map(|(g, (pk, cd))| {
+                let mut seeded: Vec<Dual2<M>> =
+                    pk.values.iter().map(|&v| Dual2::<M>::constant(v)).collect();
+                for slot in 0..N_PK {
+                    if let Some(i) = slot_row[slot] {
+                        seeded[slot] = seed(cd, Some(g), i, pk.values[slot]);
+                    }
+                }
+                seeded
+            })
+            .collect();
+        let group_scale = crate::sens::ode_provider::build_iov_scale_jets::<Dual2<M>>(
+            &groups,
+            sprog.var_to_pk_slot(),
+            |var_duals| sprog.eval_scale_dual::<M>(theta, eta_bsv, cov, var_duals),
+        );
+        let mut fk: Vec<f64> = Vec::with_capacity(n_stacked);
+        let mut fm: Vec<f64> = Vec::with_capacity(n_theta);
+        for (j, o) in obs_out.iter_mut().enumerate() {
+            let g = sources[obs_src[j]].2?;
+            apply_scale_quotient_row::<M>(o, &group_scale[g], n_theta, n_stacked, &mut fk, &mut fm);
+        }
+    }
+
     Some(SubjectSens { obs: obs_out })
 }
 
@@ -1210,6 +1303,8 @@ fn run_obs_iov<const M: usize>(
 fn run_obs_iov_eta<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
     sources: &[(crate::types::PkParams, CombinedDerivs, Option<usize>)],
     dose_src: &[usize],
     obs_src: &[usize],
@@ -1218,6 +1313,7 @@ fn run_obs_iov_eta<const N: usize>(
     n_eta: usize,
     n_kappa: usize,
     n_stacked: usize,
+    scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_g, PkDual};
@@ -1311,6 +1407,43 @@ fn run_obs_iov_eta<const N: usize>(
             df_deta,
         });
     }
+
+    // η-only `ExpressionScale` `obs_scale` quotient, one scale jet per occasion group —
+    // the first-order counterpart of the `run_obs_iov` post-walk step (#575/#590).
+    if let Some(scale_groups) = scale_groups {
+        let ScalingSpec::ExpressionScale {
+            deriv: Some(sprog), ..
+        } = &model.scaling
+        else {
+            return None; // gate guarantees this arm; defensive
+        };
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        let groups: Vec<Vec<Dual1<N>>> = scale_groups
+            .iter()
+            .enumerate()
+            .map(|(g, (pk, cd))| {
+                let mut seeded: Vec<Dual1<N>> =
+                    pk.values.iter().map(|&v| Dual1::<N>::constant(v)).collect();
+                for slot in 0..N_PK {
+                    if let Some(i) = slot_row[slot] {
+                        seeded[slot] = seed(cd, Some(g), i, pk.values[slot]);
+                    }
+                }
+                seeded
+            })
+            .collect();
+        let group_scale = crate::sens::ode_provider::build_iov_scale_jets::<Dual1<N>>(
+            &groups,
+            sprog.var_to_pk_slot(),
+            |var_duals| sprog.eval_scale_dual1::<N>(theta, eta_bsv, cov, var_duals),
+        );
+        for (j, o) in out.iter_mut().enumerate() {
+            let g = sources[obs_src[j]].2?;
+            apply_scale_quotient_grad_iov::<N>(o, &group_scale[g], n_stacked);
+        }
+    }
+
     Some(out)
 }
 
@@ -2368,6 +2501,26 @@ pub(crate) fn apply_scale_quotient_row<const M: usize>(
     }
     for m in 0..n_theta {
         o.df_dtheta[m] = fm[m] * inv - f * s.grad[m] * inv2;
+    }
+    o.f = f * inv;
+}
+
+/// First-order, η-only counterpart of [`apply_scale_quotient_row`] for the inner EBE
+/// gradient: `∂(f/s)/∂η_k = (∂f/∂η_k)/s − f·(∂s/∂η_k)/s²` over the stacked η axes
+/// (`s.grad[k]`, no `n_theta` offset — the inner scale jet has no θ block). Shared by the
+/// closed-form IOV inner ([`run_obs_iov_eta`]) and the ODE IOV inner
+/// ([`crate::sens::ode_provider::run_subject_iov_eta`]) — the IOV analogue of the η-block
+/// of `apply_expression_scale_inner` (#575/#590).
+pub(crate) fn apply_scale_quotient_grad_iov<const N: usize>(
+    o: &mut ObsGrad,
+    s: &Dual1<N>,
+    n_stacked: usize,
+) {
+    let f = o.f;
+    let inv = 1.0 / s.value;
+    let inv2 = inv * inv;
+    for k in 0..n_stacked {
+        o.df_deta[k] = o.df_deta[k] * inv - f * s.grad[k] * inv2;
     }
     o.f = f * inv;
 }
@@ -6806,7 +6959,297 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------------------
+    // Closed-form IOV + `ExpressionScale` `obs_scale` (#486): the closed-form twin of the
+    // ODE-IOV path (#575/#590). The scale divisor is a per-occasion-group post-walk quotient
+    // on the stacked `(θ, η_bsv, κ)` axes; each group's divisor rides its κ through the PK
+    // params. Validated against central FD of `predict_iov` (the independent production f64
+    // path), inner-vs-outer parity, and bit-parity with the ODE-IOV twin.
+    // ------------------------------------------------------------------------------------
+
+    /// 1-cpt oral closed-form IOV (κ on CL) with an η-dependent `obs_scale = V` divisor.
+    const WARFARIN_IOV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// 2-cpt oral closed-form IOV (κ on CL) with an `obs_scale = V` divisor — exercises the
+    /// per-group quotient over the wider PK-param chain.
+    const WARFARIN_IOV_EXPRSCALE_2CPT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// 1-cpt oral closed-form IOV + **WT-on-CL time-varying covariate** + `obs_scale = CL`.
+    /// The scale references a covariate-carrying PK param, but the divisor is still built at
+    /// the subject-static covariate snapshot (`t = 0`) — matching production `predict_iov`.
+    const WARFARIN_IOV_TVCOV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = CL
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// 1-cpt IV closed-form IOV (κ on CL) with `obs_scale = V` — the closed-form half of the
+    /// bit-parity twin with the ODE-IOV path. Closed-form `one_cpt_iv` yields `A/V`
+    /// (concentration), so `obs_scale = V` gives `A/V²`.
+    const WARFARIN_IOV_IV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// The gate admits a closed-form IOV model carrying a differentiable `ExpressionScale`
+    /// `obs_scale`, but keeps declining LTBS, `ScalarScale`, and lagtime (out of scope for
+    /// the post-walk quotient) — the closed-form mirror of `ode_iov_expr_scale_supported_and_gated`.
+    #[test]
+    fn iov_analytical_expr_scale_supported_and_gated() {
+        let model = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse expr-scale IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert!(
+            matches!(model.scaling, ScalingSpec::ExpressionScale { .. }),
+            "fixture must use an expression obs_scale"
+        );
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV + ExpressionScale obs_scale must be on the analytic path (#486)"
+        );
+        assert!(analytic_outer_gradient_available(&model));
+        // + LTBS still routes to FD (the in-walk log is not composed with the post-walk
+        // quotient on the IOV path).
+        let mut ltbs = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse");
+        ltbs.log_transform = true;
+        assert!(
+            !iov_analytical_supported(&ltbs),
+            "ExpressionScale + LTBS under closed-form IOV must fall back to FD"
+        );
+        // A constant `ScalarScale` under IOV still declines (the IOV walk has no
+        // constant-divisor step; that combination stays FD as before).
+        let mut scalar = parse_model_string(WARFARIN_IOV).expect("parse");
+        scalar.scaling = ScalingSpec::ScalarScale(2.0);
+        assert!(
+            !iov_analytical_supported(&scalar),
+            "ScalarScale under closed-form IOV stays FD"
+        );
+    }
+
+    /// Outer packed sensitivities of a closed-form IOV + `obs_scale = V` model must match
+    /// central FD of `predict_iov` (value, `∂f/∂stacked`, `∂f/∂θ`, and both Hessian blocks)
+    /// over `[η_bsv, κ_g0, κ_g1]` + θ — 1-cpt and 2-cpt oral.
+    #[test]
+    fn iov_analytical_expr_scale_outer_matches_fd() {
+        check_iov_provider_vs_fd(
+            &parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse 1cpt expr-scale IOV"),
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+        check_iov_provider_vs_fd(
+            &parse_model_string(WARFARIN_IOV_EXPRSCALE_2CPT).expect("parse 2cpt expr-scale IOV"),
+            &iov_subject(),
+            &[0.2, 10.0, 0.5, 20.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// Closed-form IOV + **TV covariate** + `obs_scale = CL`: the scale divisor stays
+    /// subject-static (built at `t = 0`) even though the walk seeds each event per-covariate.
+    /// Value/grad/Hessian over `[η_bsv, κ_g0, κ_g1]` + θ (incl. `THETA_WT`) vs FD of `predict_iov`.
+    #[test]
+    fn iov_analytical_tvcov_expr_scale_outer_matches_fd() {
+        let model =
+            parse_model_string(WARFARIN_IOV_TVCOV_EXPRSCALE).expect("parse TV-cov expr-scale IOV");
+        let subject = iov_tvcov_subject(false);
+        assert!(subject.has_tv_covariates(), "fixture must carry TV cov");
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// The closed-form IOV **inner** η-gradient (`Dual1`) with an `obs_scale` divisor must
+    /// track the FD-validated **outer** walk's first-order block — plain and TV-cov.
+    #[test]
+    fn iov_analytical_expr_scale_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse expr-scale IOV"),
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_TVCOV_EXPRSCALE).expect("parse TV-cov expr-scale IOV"),
+            &iov_tvcov_subject(false),
+            &[0.2, 10.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// **Bit-parity with the ODE-IOV twin (#575/#590).** Closed-form `one_cpt_iv` + `obs_scale
+    /// = V` computes `A/V²`; the same physical model as a user `[odes]` model reaches `A/V²`
+    /// two independent, already-analytic ways: an `obs_scale = V*V` divisor (the ODE half of
+    /// the very quotient this PR ports) and a Form-C readout `y = central/(V*V)` (the in-walk
+    /// division). Per-observation value and `∂f/∂stacked` must agree across all three paths —
+    /// confirming the closed-form quotient reproduces the NONMEM-validated ODE result.
+    #[test]
+    fn iov_analytical_expr_scale_equals_ode_twin() {
+        const ODE_OBS_SCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V * V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        const ODE_FORMC: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / (V * V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(WARFARIN_IOV_IV_EXPRSCALE).expect("parse closed-form IV");
+        let ode_scale = parse_model_string(ODE_OBS_SCALE).expect("parse ODE obs_scale twin");
+        let ode_formc = parse_model_string(ODE_FORMC).expect("parse ODE Form-C twin");
+        assert!(iov_analytical_supported(&cf));
+        assert!(crate::sens::ode_provider::ode_iov_supported(&ode_scale));
+        assert!(crate::sens::ode_provider::ode_iov_supported(&ode_formc));
+        let subject = iov_subject();
+        let theta = [0.2, 10.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        let a = subject_sensitivities_iov(&cf, &subject, &theta, &stacked).expect("closed-form");
+        for twin in [&ode_scale, &ode_formc] {
+            let b = subject_sensitivities_iov(twin, &subject, &theta, &stacked).expect("ODE twin");
+            assert_eq!(a.obs.len(), b.obs.len());
+            for (oa, ob) in a.obs.iter().zip(b.obs.iter()) {
+                approx::assert_relative_eq!(oa.f, ob.f, max_relative = 1e-6, epsilon = 1e-9);
+                for (x, y) in oa.df_deta.iter().zip(ob.df_deta.iter()) {
+                    approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+                }
+            }
+        }
+    }
+
     /// 1-cpt IV IOV written as a user `[odes]` model (κ on CL, Form-C readout
+    /// `y = central/V`). Routes through `subject_sensitivities_iov` → the ODE IOV
     /// `y = central/V`). Routes through `subject_sensitivities_iov` → the ODE IOV
     /// provider, validated against central FD of the production `predict_iov` (which
     /// integrates the same ODE via `ode_predictions_event_driven`). This is the ODE

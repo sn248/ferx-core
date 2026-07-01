@@ -32,6 +32,14 @@ section of the SDLC for the versioning policy).
   (Sheiner–Beal) is a distinct objective and is unchanged.
 
 ### Added
+- **An `ExpressionScale` `obs_scale` divisor (e.g. `obs_scale = V`) combined with IOV on a
+  closed-form (analytical 1-/2-/3-cpt) model** now gets exact analytic FOCE/FOCEI
+  sensitivities on both the outer and inner loops instead of finite differences (#486). The
+  scale divisor is applied as a per-occasion-group post-walk quotient over the stacked
+  `(θ, η, κ)` axes — each occasion's divisor rides its own κ through the PK parameters —
+  porting the pattern already used on the ODE IOV path. Time-varying covariates compose
+  (the divisor stays subject-static, matching NONMEM's per-occasion `S1` scaling). LTBS and
+  constant `ScalarScale` under IOV continue to use finite differences.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK

@@ -6404,4 +6404,82 @@ mod tests {
             }
         }
     }
+
+    /// Closed-form IOV + η-dependent `ExpressionScale` `obs_scale = V` (#486): the full
+    /// analytic packed gradient — FOCEI **and** FOCE — must match the Richardson reconverged
+    /// FD of the production IOV marginal over every packed coordinate (θ, Ω_bsv, σ, Ω_iov).
+    /// The end-to-end population-level confirmation that the new per-occasion post-walk scale
+    /// quotient rides the block-Ω `prepare_stacked` assembly on both objectives.
+    #[test]
+    fn iov_expression_scale_packed_gradient_matches_reconverged_fd() {
+        const WARFARIN_IOV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let model = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse IOV + obs_scale");
+        assert!(
+            matches!(
+                model.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ),
+            "fixture must carry an expression obs_scale"
+        );
+        assert!(crate::sens::provider::iov_analytical_supported(&model));
+        let theta = vec![0.22, 11.0, 1.4];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_subject_outer(&model, &theta);
+        let template = params.clone();
+        let x = crate::estimation::parameterization::pack_params(&params);
+
+        let (stacked, _eta, _kappas, _hm) = precise_ebe_iov(&model, &subject, &params);
+
+        for interaction in [true, false] {
+            let analytic = if interaction {
+                subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            } else {
+                subject_packed_gradient_foce_iov(&model, &subject, &template, &x, &stacked)
+            }
+            .expect("IOV + obs_scale packed gradient supported");
+
+            let f = |xx: &[f64]| -> f64 {
+                let p = unpack_params(xx, &template);
+                marginal_nll_iov_inter(&model, &subject, &p, interaction)
+            };
+            for i in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[i].abs());
+                let fd_at = |hh: f64| -> f64 {
+                    let mut xp = x.clone();
+                    xp[i] += hh;
+                    let mut xm = x.clone();
+                    xm[i] -= hh;
+                    (f(&xp) - f(&xm)) / (2.0 * hh)
+                };
+                let f1 = fd_at(h);
+                let f2 = fd_at(h / 2.0);
+                let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+                approx::assert_relative_eq!(analytic[i], fd, max_relative = 2e-3, epsilon = 2e-5);
+            }
+        }
+    }
 }

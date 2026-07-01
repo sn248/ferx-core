@@ -560,11 +560,27 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     }
     // `init(...)` initial conditions are seeded on the event-driven walk at the subject's
     // first-record covariate snapshot (`tvcov_init_state`, matching production's `init_pk`),
-    // so a TV-cov + `init(...)` subject is analytic on both loops (#486). An EVID 3/4 reset
-    // re-seeds production at the *reset-event* snapshot (`last_pk`), whereas the walk carries
-    // one subject-level init jet and re-seeds every reset to it — so `init(...)` combined with
-    // a reset still routes to FD.
-    if ode.init_fn.is_some() && !subject.reset_times.is_empty() {
+    // so a TV-cov + `init(...)` **bolus** subject is analytic on both loops (#486). It stays
+    // on FD when combined with a feature whose saltation / equilibration / forcing branch was
+    // written for a **zero baseline** and is not yet validated against a parameter-dependent
+    // `init` seed — the analytic scope matches what the FD-vs-production tests cover:
+    //   • an EVID 3/4 **reset** — production re-seeds `init` at the reset-event snapshot
+    //     (`last_pk`), whereas the walk carries one subject-level init jet;
+    //   • an estimated **lagtime** — the dose-arrival saltation branch assumes `x⁻ = 0`;
+    //   • a **finite infusion** — the `active_infusions` accumulation isn't checked against
+    //     a non-zero baseline;
+    //   • a built-in **input-rate forcing** (igd/transit/weibull/first_order, #643);
+    //   • **steady-state** — the dual SS equilibration seeds from zero, not `init`;
+    //   • a **modeled-duration/rate dose** (#530 moving-window saltation).
+    // Each is a genuine analytic-scope extension behind its own validation (#486 follow-up).
+    if ode.init_fn.is_some()
+        && (!subject.reset_times.is_empty()
+            || model.has_lagtime()
+            || !ode.input_rate.is_empty()
+            || subject.has_periodic_ss_dose()
+            || !subject.all_doses_fixed()
+            || subject.doses.iter().any(|d| d.is_infusion()))
+    {
         return false;
     }
     // #530: modeled-`RATE`/duration doses are resolved from their PK slot as a live jet
@@ -1142,16 +1158,80 @@ pub(crate) fn pd_from_program<const M: usize>(
     }
 }
 
+/// Central finite differences of `init_fn` over the differentiated PK slots — the shared
+/// stencil behind [`dual_init_state`], [`dual1_init_state`], and [`tvcov_init_state`], so the
+/// `he`/`h2` steps and the 2-/3-/4-point formulas live in **one** place. Returns
+/// `(base, d1, d2)` where `d1[s][i] = ∂init_s/∂p_{pk_indices[i]}` and, when `want_d2`, the
+/// symmetric `d2[s][i][j] = ∂²init_s/∂p_i∂p_j`; `d2` is empty otherwise (gradient-only
+/// callers). `init_fn` is a cheap HashMap eval, so the FD cost is negligible.
+fn init_fd_derivs(
+    init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
+    pk: &[f64],
+    pk_indices: &[usize],
+    n_states: usize,
+    want_d2: bool,
+) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>) {
+    let he = 1e-6;
+    let h2 = 1e-4;
+    let np = pk_indices.len();
+    let base = init_fn(pk);
+    let mut d1 = vec![vec![0.0; np]; n_states];
+    for (i, &si) in pk_indices.iter().enumerate() {
+        let mut pp = pk.to_vec();
+        pp[si] += he;
+        let mut pm = pk.to_vec();
+        pm[si] -= he;
+        let (up, dn) = (init_fn(&pp), init_fn(&pm));
+        for s in 0..n_states {
+            d1[s][i] = (up[s] - dn[s]) / (2.0 * he);
+        }
+    }
+    let mut d2: Vec<Vec<Vec<f64>>> = Vec::new();
+    if want_d2 {
+        d2 = vec![vec![vec![0.0; np]; np]; n_states];
+        for (i, &si) in pk_indices.iter().enumerate() {
+            let mut pp = pk.to_vec();
+            pp[si] += h2;
+            let mut pm = pk.to_vec();
+            pm[si] -= h2;
+            let (up, dn) = (init_fn(&pp), init_fn(&pm));
+            for s in 0..n_states {
+                d2[s][i][i] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
+            }
+            for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
+                let mut a = pk.to_vec();
+                a[si] += h2;
+                a[sj] += h2;
+                let mut b = pk.to_vec();
+                b[si] += h2;
+                b[sj] -= h2;
+                let mut c = pk.to_vec();
+                c[si] -= h2;
+                c[sj] += h2;
+                let mut d = pk.to_vec();
+                d[si] -= h2;
+                d[sj] -= h2;
+                let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
+                for s in 0..n_states {
+                    let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
+                    d2[s][i][j] = v;
+                    d2[s][j][i] = v;
+                }
+            }
+        }
+    }
+    (base, d1, d2)
+}
+
 /// The `DualMixed<NA, N>` initial state from a model's `init(...)` directives,
-/// seeding each compartment's value **and its PK-parameter derivatives** by central
-/// FD of the f64 `init_fn` over the differentiated PK slots. `init_fn` is a cheap
-/// HashMap eval (no integration), so the FD cost is negligible.
+/// seeding each compartment's value **and its PK-parameter derivatives** (via the shared
+/// [`init_fd_derivs`] stencil) mapped onto the dual axes.
 ///
 /// Individual parameter `i` seeds dual axis `axis_of[i]` — identity (`= i`) for the
 /// full `Dual2<N>` path (`NA == N`, `axis_of == None`), or the IIV-leading
 /// permutation for the mixed path (#445). The first-order block fills the gradient
 /// at every axis; the second-order block fills only the retained Hessian rows
-/// (axis `< NA`), and skips the FD evaluations whose result would be dropped.
+/// (axis `< NA`) — the dropped rows are computed but not written (`init_fn` is cheap).
 fn dual_init_state<const NA: usize, const N: usize>(
     init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
     pk: &[f64],
@@ -1160,61 +1240,34 @@ fn dual_init_state<const NA: usize, const N: usize>(
     axis_of: Option<&[usize]>,
 ) -> Vec<DualMixed<NA, N>> {
     let ax = |i: usize| axis_of.map_or(i, |p| p[i]);
-    let base = init_fn(pk);
-    let he = 1e-6;
-    let h2 = 1e-4;
+    let (base, d1, d2) = init_fd_derivs(init_fn, pk, pk_indices, n_states, true);
+    let np = pk_indices.len();
     let mut out: Vec<DualMixed<NA, N>> = (0..n_states)
         .map(|s| DualMixed::constant(base.get(s).copied().unwrap_or(0.0)))
         .collect();
 
     // First order: gradient at every parameter's axis.
-    for (i, &si) in pk_indices.iter().enumerate() {
+    for i in 0..np {
         let ai = ax(i);
-        let mut pp = pk.to_vec();
-        pp[si] += he;
-        let mut pm = pk.to_vec();
-        pm[si] -= he;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
         for s in 0..n_states {
-            out[s].grad[ai] = (up[s] - dn[s]) / (2.0 * he);
+            out[s].grad[ai] = d1[s][i];
         }
     }
     // Second order: only the retained Hessian rows (axis < NA).
-    for (i, &si) in pk_indices.iter().enumerate() {
+    for i in 0..np {
         let ai = ax(i);
-        // Diagonal — skip the FD evaluation entirely when this axis carries no
-        // Hessian row (an IIV-free parameter in the mixed path) (#448 review #8).
         if ai < NA {
-            let mut pp = pk.to_vec();
-            pp[si] += h2;
-            let mut pm = pk.to_vec();
-            pm[si] -= h2;
-            let (up, dn) = (init_fn(&pp), init_fn(&pm));
             for s in 0..n_states {
-                out[s].hess[ai][ai] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
+                out[s].hess[ai][ai] = d2[s][i][i];
             }
         }
-        for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
+        for j in (i + 1)..np {
             let aj = ax(j);
-            // Both axes in the dropped block — no Hessian row to fill.
             if ai >= NA && aj >= NA {
                 continue;
             }
-            let mut a = pk.to_vec();
-            a[si] += h2;
-            a[sj] += h2;
-            let mut b = pk.to_vec();
-            b[si] += h2;
-            b[sj] -= h2;
-            let mut c = pk.to_vec();
-            c[si] -= h2;
-            c[sj] += h2;
-            let mut d = pk.to_vec();
-            d[si] -= h2;
-            d[sj] -= h2;
-            let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
             for s in 0..n_states {
-                let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
+                let v = d2[s][i][j];
                 if ai < NA {
                     out[s].hess[ai][aj] = v;
                 }
@@ -1229,26 +1282,21 @@ fn dual_init_state<const NA: usize, const N: usize>(
 
 /// `Dual1<N>` initial state from a model's `init(...)` directives (gradient only) —
 /// the light counterpart of [`dual_init_state`]: seeds each compartment's value and
-/// its first-order PK-parameter derivatives by central FD of the f64 `init_fn`.
+/// its first-order PK-parameter derivatives via the shared [`init_fd_derivs`] stencil
+/// (skipping the second-order block).
 fn dual1_init_state<const N: usize>(
     init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
     pk: &[f64],
     pk_indices: &[usize],
     n_states: usize,
 ) -> Vec<Dual1<N>> {
-    let base = init_fn(pk);
-    let he = 1e-6;
+    let (base, d1, _) = init_fd_derivs(init_fn, pk, pk_indices, n_states, false);
     let mut out: Vec<Dual1<N>> = (0..n_states)
         .map(|s| Dual1::constant(base.get(s).copied().unwrap_or(0.0)))
         .collect();
-    for (i, &si) in pk_indices.iter().enumerate() {
-        let mut pp = pk.to_vec();
-        pp[si] += he;
-        let mut pm = pk.to_vec();
-        pm[si] -= he;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
+    for i in 0..pk_indices.len() {
         for s in 0..n_states {
-            out[s].grad[i] = (up[s] - dn[s]) / (2.0 * he);
+            out[s].grad[i] = d1[s][i];
         }
     }
     out
@@ -1273,13 +1321,12 @@ fn dual1_init_state<const N: usize>(
 ///                       + ½ Σ_ij (∂²init_s/∂p_i∂p_j)·(p_i − p̄_i)(p_j − p̄_j)
 /// ```
 ///
-/// The `∂init/∂p` derivatives are central finite differences over the differentiated
-/// slots (`pk_indices`, mirroring [`dual_init_state`]; `init_fn` is a cheap HashMap
-/// eval). Each delta `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η jet, so
-/// `T`'s own product rule propagates it to the walk basis exactly — a `Dual1` inner walk
-/// drops the second-order term automatically (its ε² is zero, so the two loops give the
-/// same first-order η-gradient the `Dual2` outer walk does). All-zero when the subject
-/// has no records (defensive).
+/// The `∂init/∂p` derivatives come from the shared [`init_fd_derivs`] stencil. Each delta
+/// `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η jet, so `T`'s own product rule
+/// propagates it to the walk basis exactly. A `Dual1` inner walk (`T::SECOND_ORDER == false`)
+/// **skips the second-order block and term entirely** — its ε² is zero, so the quadratic
+/// term would contribute nothing — leaving the same first-order η-gradient the `Dual2` outer
+/// walk carries. All-zero when the subject has no records (defensive).
 fn tvcov_init_state<T: crate::sens::num::PkNum>(
     init_fn: &(dyn Fn(&[f64]) -> Vec<f64> + Send + Sync),
     subject: &Subject,
@@ -1317,56 +1364,13 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
         None => return vec![T::from_f64(0.0); n_states],
     };
 
-    // f64 PK values at that snapshot + the base init amounts.
+    // Central FD of `init_fn` at that snapshot via the shared stencil. The inner `Dual1`
+    // walk (`T::SECOND_ORDER == false`) discards the quadratic term, so skip the `d2` block
+    // entirely there rather than build a Hessian it drops.
+    let want_2nd = T::SECOND_ORDER;
     let pk_vals: Vec<f64> = snap.iter().map(|x| x.val()).collect();
-    let base = init_fn(&pk_vals);
+    let (base, d1, d2) = init_fd_derivs(init_fn, &pk_vals, pk_indices, n_states, want_2nd);
     let np = pk_indices.len();
-
-    // Central FD of `init_fn` over the differentiated slots (steps mirror `dual_init_state`).
-    let he = 1e-6;
-    let h2 = 1e-4;
-    let mut d1: Vec<Vec<f64>> = vec![vec![0.0; np]; n_states]; // ∂init_s/∂p_i
-    for (i, &si) in pk_indices.iter().enumerate() {
-        let mut pp = pk_vals.clone();
-        pp[si] += he;
-        let mut pm = pk_vals.clone();
-        pm[si] -= he;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
-        for s in 0..n_states {
-            d1[s][i] = (up[s] - dn[s]) / (2.0 * he);
-        }
-    }
-    let mut d2: Vec<Vec<Vec<f64>>> = vec![vec![vec![0.0; np]; np]; n_states]; // ∂²init_s/∂p_i∂p_j
-    for (i, &si) in pk_indices.iter().enumerate() {
-        let mut pp = pk_vals.clone();
-        pp[si] += h2;
-        let mut pm = pk_vals.clone();
-        pm[si] -= h2;
-        let (up, dn) = (init_fn(&pp), init_fn(&pm));
-        for s in 0..n_states {
-            d2[s][i][i] = (up[s] - 2.0 * base[s] + dn[s]) / (h2 * h2);
-        }
-        for (j, &sj) in pk_indices.iter().enumerate().skip(i + 1) {
-            let mut a = pk_vals.clone();
-            a[si] += h2;
-            a[sj] += h2;
-            let mut b = pk_vals.clone();
-            b[si] += h2;
-            b[sj] -= h2;
-            let mut c = pk_vals.clone();
-            c[si] -= h2;
-            c[sj] += h2;
-            let mut d = pk_vals.clone();
-            d[si] -= h2;
-            d[sj] -= h2;
-            let (va, vb, vc, vd) = (init_fn(&a), init_fn(&b), init_fn(&c), init_fn(&d));
-            for s in 0..n_states {
-                let v = (va[s] - vb[s] - vc[s] + vd[s]) / (4.0 * h2 * h2);
-                d2[s][i][j] = v;
-                d2[s][j][i] = v;
-            }
-        }
-    }
 
     // Deltas δ_i = p_i − p̄_i (value 0, carry the snapshot's θ/η jets).
     let deltas: Vec<T> = pk_indices
@@ -1374,9 +1378,12 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
         .map(|&si| snap[si] - T::from_f64(pk_vals[si]))
         .collect();
 
-    // Taylor-compose on the walk basis via `T` arithmetic. Summing over all ordered
-    // `(i, j)` with the ½ factor yields exactly `Σ_ij d2_ij g_i⊗g_j` in the Hessian
-    // (`δ_iδ_j` contributes `g_i⊗g_j + g_j⊗g_i`), plus `Σ_i d1_i H_i` from the linear term.
+    // Taylor-compose on the walk basis via `T` arithmetic:
+    //   init_s ≈ base_s + Σ_i d1_i·δ_i + ½ Σ_i d2_ii·δ_i² + Σ_{i<j} d2_ij·δ_iδ_j
+    // The linear term contributes `Σ_i d1_i H_i` to the Hessian; the diagonal ½·δ_i² gives
+    // `d2_ii g_i⊗g_i` and each off-diagonal `δ_iδ_j` gives `g_i⊗g_j + g_j⊗g_i` — visiting
+    // `i<j` once (with the full `d2_ij` coefficient, `d2` symmetric) yields the exact
+    // `Σ_ij d2_ij g_i⊗g_j` at half the O(np²·M²) Dual2 work of the all-ordered form.
     let mut out = Vec::with_capacity(n_states);
     for s in 0..n_states {
         let mut acc = T::from_f64(base.get(s).copied().unwrap_or(0.0));
@@ -1385,11 +1392,17 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
                 acc = acc + T::from_f64(d1[s][i]) * deltas[i];
             }
         }
-        for i in 0..np {
-            for j in 0..np {
-                let c = 0.5 * d2[s][i][j];
-                if c != 0.0 {
-                    acc = acc + T::from_f64(c) * deltas[i] * deltas[j];
+        if want_2nd {
+            for i in 0..np {
+                let cd = 0.5 * d2[s][i][i];
+                if cd != 0.0 {
+                    acc = acc + T::from_f64(cd) * deltas[i] * deltas[i];
+                }
+                for j in (i + 1)..np {
+                    let c = d2[s][i][j];
+                    if c != 0.0 {
+                        acc = acc + T::from_f64(c) * deltas[i] * deltas[j];
+                    }
                 }
             }
         }
@@ -7869,22 +7882,40 @@ mod tests {
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
-    /// TV-cov + `init(...)` + EVID 3/4 reset stays on FD (#486): production re-seeds `init`
-    /// at the *reset-event* covariate snapshot (`last_pk`), whereas the event-driven walk
-    /// carries one subject-level init jet and re-seeds every reset to it — so the gate
-    /// declines this combination (the walk covers `init` *without* a reset only).
+    /// TV-cov + `init(...)` is admitted only for the validated **plain-bolus** scope (#486).
+    /// Combining `init(...)` with a feature whose saltation / equilibration / forcing branch
+    /// was written for a zero baseline — an EVID 3/4 reset, an estimated lagtime, a finite
+    /// infusion, a built-in input-rate forcing, steady-state, or a modeled-duration/rate dose
+    /// — routes to FD until each is separately validated. The two cases constructible from the
+    /// bolus fixture (reset, finite infusion) are pinned here; the rest share the same gate
+    /// clause in `ode_tvcov_supported`.
     #[test]
-    fn ode_tvcov_init_reset_routes_to_fd() {
+    fn ode_tvcov_init_unvalidated_compositions_route_to_fd() {
         let model = parse_model_string(TVCOV_INIT_ODE).expect("parse");
-        let mut subject = tvcov_subject();
+        // Baseline: plain-bolus TV-cov + init is analytic.
         assert!(
-            ode_tvcov_supported(&model, &subject),
-            "init without a reset is analytic"
+            ode_tvcov_supported(&model, &tvcov_subject()),
+            "init + bolus is analytic"
         );
-        subject.reset_times = vec![4.0];
+
+        // + EVID 3/4 reset → FD (production re-seeds init at the reset-event snapshot).
+        let mut s = tvcov_subject();
+        s.reset_times = vec![4.0];
         assert!(
-            !ode_tvcov_supported(&model, &subject),
+            !ode_tvcov_supported(&model, &s),
             "init + EVID 3/4 reset must route to FD"
+        );
+
+        // + finite infusion → FD (active_infusions accumulation unvalidated vs a non-zero baseline).
+        let mut s = tvcov_subject();
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 5.0, false, 0.0)];
+        assert!(
+            s.doses[0].is_infusion(),
+            "fixture must be a finite infusion"
+        );
+        assert!(
+            !ode_tvcov_supported(&model, &s),
+            "init + finite infusion must route to FD"
         );
     }
 

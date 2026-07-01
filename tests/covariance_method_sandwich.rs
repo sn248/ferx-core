@@ -54,12 +54,6 @@ fn warfarin_focei_opts(method: CovarianceMethod) -> FitOptions {
     opts.outer_maxiter = 300;
     opts.run_covariance_step = true;
     opts.covariance_method = method;
-    // This plain proportional Warfarin fixture is the historical diagonal-RUV
-    // NONMEM anchor. Keep it on the analytical R path: the OFV second-difference
-    // override is useful for some weakly identified surfaces, but after the
-    // block_sigma work it is noisier at the current L-BFGS solution and can make
-    // the RSR anchor look like a residual-correlation regression.
-    opts.covariance_ofv_hessian = false;
     opts.verbose = false;
     opts
 }

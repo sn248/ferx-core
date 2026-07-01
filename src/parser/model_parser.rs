@@ -4563,9 +4563,6 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.fd_hessian_step = v;
         }
-        "covariance_ofv_hessian" => {
-            opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
-        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -15768,7 +15765,6 @@ mod tests {
                 // are method-specific, so none must warn under any method.
                 "covariance_method = s".to_string(),
                 "covariance_fallback = sir".to_string(),
-                "covariance_ofv_hessian = true".to_string(),
                 "verbose = false".to_string(),
                 "sir = true".to_string(),
                 "bloq_method = m3".to_string(),
@@ -16160,12 +16156,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_parameter_scaling_and_ofv_hessian() {
+    fn test_parse_parameter_scaling() {
         use crate::types::ParameterScaling;
-        // Defaults: parameter_scaling = Auto, covariance_ofv_hessian = true.
+        // Default: parameter_scaling = Auto.
         let def = parse_fit_options(&[]).unwrap();
         assert_eq!(def.parameter_scaling, ParameterScaling::Auto);
-        assert!(def.covariance_ofv_hessian);
         // parameter_scaling keywords, case-insensitive.
         for (input, expected) in [
             ("auto", ParameterScaling::Auto),
@@ -16177,9 +16172,6 @@ mod tests {
             assert_eq!(opts.parameter_scaling, expected, "input `{input}`");
         }
         assert!(parse_fit_options(&["parameter_scaling = bogus".to_string()]).is_err());
-        // covariance_ofv_hessian bool.
-        let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
-        assert!(!off.covariance_ofv_hessian);
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────

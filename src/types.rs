@@ -3987,22 +3987,6 @@ pub struct FitOptions {
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
     /// score cross-product `S`; currently supported for FOCEI and IOV fits.
     pub covariance_method: CovarianceMethod,
-    /// Build the covariance R-matrix (Hessian) from second differences of the
-    /// reconverged marginal OFV, rather than from a central difference of the
-    /// analytical population gradient. **Default `true`.** The analytical stencil
-    /// holds the H-matrix `a = ∂f/∂η` fixed in the `log|H̃|` θ-gradient (it omits
-    /// `∂a/∂θ = ∂²f/∂η∂θ`), which biases the SE of *weakly-identified* structural
-    /// parameters — e.g. TVKA on warfarin reads ~9% high versus a Richardson
-    /// FD-of-OFV ground truth. The OFV-Hessian stencil recomputes `a` (and
-    /// everything else) at every perturbed point, so it captures that curvature
-    /// exactly (up to the FD step) and matches the ground truth to <1%; it is the
-    /// same stencil used for IOV and f-dependent FOCE. It costs O(n²) reconverged
-    /// OFV evaluations versus O(n) gradient evaluations, but both stencils
-    /// parallelise over perturbation points so the wall-clock cost is ≈ equal in
-    /// practice. Set `false` to force the faster analytical-gradient stencil
-    /// (e.g. on very high-dimensional models where the O(n²) point count
-    /// dominates).
-    pub covariance_ofv_hessian: bool,
     pub interaction: bool,
     pub verbose: bool,
     /// Outer-loop (population parameter) optimizer. Defaults to
@@ -4444,7 +4428,6 @@ impl Default for FitOptions {
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
-            covariance_ofv_hessian: true,
             interaction: true,
             verbose: true,
             // `Auto` resolves per model (see `Optimizer::resolve_auto`): the
@@ -4867,7 +4850,6 @@ pub fn framework_keys() -> &'static [&'static str] {
         "covariance",
         "covariance_method",
         "covariance_fallback",
-        "covariance_ofv_hessian",
         "fd_hessian_step",
         "verbose",
         "sir",

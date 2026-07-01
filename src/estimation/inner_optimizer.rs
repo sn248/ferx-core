@@ -1453,9 +1453,13 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // out-of-scope cases (it matches the outer TV-cov scope). Other subjects keep the
     // static superposition inner. (The survival guard is hoisted to the top of this
     // function, so it covers this path too.)
-    if subject.has_tv_covariates()
-        || crate::sens::provider::subject_has_oral_infusion(model, subject)
-    {
+    //
+    // A `TIME`-built-in structural parameter routes through the same per-event walk
+    // (#486), so it must consult `tvcov_analytical_supported` too — otherwise a TIME
+    // model that the walk declines (e.g. TIME + `[initial_conditions]`) would report
+    // an analytic inner here while `subject_eta_grad` returns `None`, splitting the
+    // inner route from the outer.
+    if crate::sens::provider::subject_routes_to_event_walk(model, subject) {
         return crate::sens::provider::tvcov_analytical_supported(model);
     }
     true

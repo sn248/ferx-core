@@ -322,8 +322,8 @@ fn iov_iiv_on_ruv_analytic_matches_fd_estimates() {
 /// Estimate-level validation for **M3 BLOQ + IOV** (#4a/#580): the new analytic FOCEI
 /// gradient must drive the optimizer to the *same MLE* as the finite-difference gradient.
 /// Both differentiate the identical M3-promoted FOCEI marginal `foce_subject_nll_iov`
-/// (censored rows enter as `−logΦ`, excluded from `H̃`), so the converged OFV and θ must
-/// agree — confirming the FD→analytic swap does not move the optimum. The FD path is the
+/// (censored rows enter as `−logΦ` and, at FOCEI order, `H̃`/`log|H̃|`), so the converged
+/// OFV and θ must agree — confirming the FD→analytic swap does not move the optimum. The FD path is the
 /// reference: the IOV FD gradient is NONMEM-anchored on warfarin_iov (≈307.8 vs NONMEM
 /// 308.83, see the module header / `tests/warfarin_iov_nonmem.rs`), and the M3 censored
 /// term is NONMEM-anchored on the non-IOV warfarin_bloq fit (`tests/bloq_convergence.rs`);

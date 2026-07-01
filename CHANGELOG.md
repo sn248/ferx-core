@@ -19,6 +19,18 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **M3 BLOQ censored rows now enter the FOCEI Laplace determinant `log|H̃|`** for a
+  consistent likelihood (#486). Previously censored rows contributed to the data term and
+  the true inner Hessian but were dropped from the outer `log|H̃|` — an internal
+  inconsistency with quantified rows. They now enter `H̃` at FOCEI (Gauss-Newton) order
+  (structural `g2·a·aᵀ`, plus the `iiv_on_ruv` residual-eta cross terms), with the exact
+  analytic gradient matching reconverged finite differences to ~1e-6 across non-IOV/IOV and
+  closed-form/ODE, including the `M3 + IOV + iiv_on_ruv` triple. **M3 FOCEI OFV values shift
+  accordingly** (estimates/SEs are essentially unchanged), and the OFV now matches NONMEM
+  `METHOD=1 LAPLACE` M3 up to the residual FOCEI-vs-LAPLACE second-order term. FOCE
+  (Sheiner–Beal) is a distinct objective and is unchanged.
+
 ### Added
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
@@ -26,6 +38,18 @@ section of the SDLC for the versioning policy).
   jet, and the moving infusion-end boundary carries `∂/∂{θ,η,κ}` — including when the
   modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`). Steady-state modeled doses
   stay on the finite-difference fallback for now.
+- A structural parameter that reads the event-time built-in `TIME`/`time` (a
+  NONMEM-style `$PK IF (TIME.GE.45) CL=…` time-dependent switch) now gets exact
+  analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
+  (#486 / #610). The per-event time is threaded into the same event-driven `Dual2`
+  (outer) / `Dual1` (inner EBE) walk used for time-varying covariates, so the
+  gradient is exact and faster. Covers closed-form (1-/2-/3-cpt) and ODE models,
+  with and without inter-occasion variability, including together with an
+  η-dependent `obs_scale` expression (the event-driven walk now applies the scale
+  quotient — which also makes time-varying-covariate + expression-scale models
+  analytic). The direct `pk(...=TIME)` structural mapping is covered too: the parser
+  desugars the mapped slot into a hidden individual parameter (`__ferx_pktime_*`), so
+  it rides the same per-event analytic walk as an `[individual_parameters]` switch.
 - A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
   **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
@@ -416,7 +440,24 @@ section of the SDLC for the versioning policy).
   notice — which described the now-removed promotion ("evaluated with η-interaction") — is
   reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
 
+### Removed
+- The `covariance_ofv_hessian` fit option and the analytical-gradient covariance
+  R-matrix stencil it selected (`covariance_ofv_hessian = false`) have been removed.
+  The covariance R-matrix is now **always** built from second differences of the
+  reconverged marginal OFV — the accurate, envelope-free stencil that recomputes the
+  full marginal curvature (`a = ∂f/∂η` and the `log|H̃|` EBE-response) at every
+  perturbed point. The old analytical stencil held `a` fixed and biased the SE of
+  weakly-identified structural parameters; its exact form requires third-order
+  sensitivities (tracked separately). Models that set `covariance_ofv_hessian` should
+  drop the key (it is now an unknown option) (#639).
+
 ### Fixed
+- **Optimizer trace is now flushed to disk after every row** so live consumers
+  (e.g. the ferx-r trace UI) see iterations as they happen. The `TraceWriter`
+  wrapped the file in a `BufWriter` and only flushed at `finish()`; high-volume
+  methods (SAEM) filled the buffer and streamed incidentally, but gradient
+  methods (FOCE/FOCEI/GN) emit few rows (smaller than the buffer) so the trace
+  file did not appear until the fit completed.
 - **Gradient optimizers no longer fail on a first-step overshoot into the EBE guard**
   (#486). When the outer optimizer's inner EBE loop rejected a trial step (too many
   unconverged subjects, or a non-finite OFV), the objective was clamped to a flat `1e20`

@@ -1155,19 +1155,30 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     } else {
         Vec::new()
     };
-    // #486 — the `__ferx_ro_` prefix is reserved for these synthetic params.
-    // Reject a user/generated parameter that carries it rather than silently
-    // misclassifying it as internal (it would vanish from EBE/sdtab output and be
-    // rejected as an unknown output column by `is_synthetic_readout_param`).
+    // #486 — the `__ferx_ro_` (Form-C readout) and `__ferx_pktime_` (direct `pk(...=TIME)`
+    // mapping) prefixes are reserved for synthetic individual parameters. Reject a
+    // user/generated parameter that carries either rather than silently misclassifying it
+    // as internal (it would vanish from EBE/sdtab output and be rejected as an unknown
+    // output column by `is_synthetic_readout_param`). This runs before either desugaring
+    // appends its own synthetic params, so `all_assigned`/`theta_names`/`eta_names` hold
+    // only user names here.
     if let Some(bad) = all_assigned
         .iter()
         .chain(theta_names.iter())
         .chain(eta_names.iter())
         .find(|n| is_synthetic_readout_param(n.as_str()))
     {
+        let (prefix, reserved_for) = if bad.starts_with(PKTIME_SYNTH_PREFIX) {
+            (
+                PKTIME_SYNTH_PREFIX,
+                "internal `pk(...=TIME)` mapping parameters",
+            )
+        } else {
+            (READOUT_SYNTH_PREFIX, "internal Form-C readout parameters")
+        };
         return Err(format!(
-            "parameter name `{bad}` uses the reserved `{READOUT_SYNTH_PREFIX}` prefix, which ferx \
-             reserves for internal Form-C readout parameters (#486). Rename it."
+            "parameter name `{bad}` uses the reserved `{prefix}` prefix, which ferx \
+             reserves for {reserved_for} (#486). Rename it."
         ));
     }
     // #486 slot headroom: each synthetic readout param consumes a PK slot. A model
@@ -1242,7 +1253,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     let (
         pk_model,
-        pk_param_map,
+        mut pk_param_map,
         mut ode_spec,
         diffusion_theta_names,
         diffusion_theta_inits,
@@ -1352,6 +1363,36 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             Vec::new(),
         )
     };
+
+    // #486 — desugar a direct `pk(...=TIME)` structural mapping into a synthetic
+    // individual parameter (`__ferx_pktime_<pk_name> = TIME`), mirroring the Form-C
+    // readout θ/η desugaring (#631). A bare `pk(v=TIME)` binding otherwise leaves the
+    // mapped PK slot out of the individual-parameter program's `pk_slots`, so
+    // `prog_covers_required_pk_slots` declines and the whole model routes to FD (#637
+    // follow-up). Rewriting the binding to reference the synthetic parameter makes the
+    // slot ride the validated per-event `TIME` sensitivity chain (value = event time via
+    // `Op::PushTime`, ∂/∂θ = ∂/∂η = 0). Runs before `pk_indices` / `build_pk_param_fn`
+    // consume `indiv_var_names` / `indiv_stmts`.
+    {
+        let mut time_bound: Vec<String> = pk_param_map
+            .iter()
+            .filter(|(_, v)| v.as_str() == "TIME" || v.as_str() == "time")
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !time_bound.is_empty() {
+            // A user parameter carrying the reserved `__ferx_pktime_` prefix is already
+            // rejected by the shared synthetic-prefix guard above (it runs before either
+            // desugaring adds its own synthetic params, so it sees only user names).
+            // Sorted for deterministic slot/var order across runs.
+            time_bound.sort();
+            for pk_name in time_bound {
+                let synth = format!("{PKTIME_SYNTH_PREFIX}{}", pk_name.to_lowercase());
+                indiv_var_names.push(synth.clone());
+                indiv_stmts.push(Statement::Assign(synth.clone(), Expression::Time));
+                pk_param_map.insert(pk_name, synth);
+            }
+        }
+    }
 
     // Build the CovariateNn handles up front (before build_pk_param_fn, which
     // captures them in the pk_param_fn closure). The same vector is also
@@ -4562,9 +4603,6 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 ));
             }
             opts.fd_hessian_step = v;
-        }
-        "covariance_ofv_hessian" => {
-            opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
         }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
@@ -8877,7 +8915,6 @@ fn build_pk_param_fn(
     pk_entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
     let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
-    let mut pk_time_mapping: Vec<usize> = Vec::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -8891,9 +8928,11 @@ fn build_pk_param_fn(
             .get(var_name)
             .copied()
             .or_else(|| var_idx.get(&var_name.to_lowercase()).copied());
-        if var_name == "TIME" || var_name == "time" {
-            pk_time_mapping.push(pk_slot);
-        } else if let Some(var_slot) = var_slot {
+        // A direct `pk(...=TIME)` binding is desugared into a synthetic
+        // `__ferx_pktime_*` individual parameter upstream in `parse_full_model` (#486),
+        // so `var_name` is that synthetic name here (resolved via `var_idx` below), never
+        // a literal `TIME`.
+        if let Some(var_slot) = var_slot {
             pk_assignment_mapping.push((pk_slot, var_slot));
         } else if let Ok(c) = var_name.parse::<f64>() {
             // A numeric literal binds the slot to a constant — but `f64::from_str`
@@ -8980,7 +9019,10 @@ fn build_pk_param_fn(
         ode_assignment_mapping.clone()
     };
     let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
-    let uses_time_builtin = stmts_use_time || !pk_time_mapping.is_empty();
+    // A direct `pk(...=TIME)` mapping is desugared into a `__ferx_pktime_* = TIME`
+    // statement upstream (#486), so `stmts_use_time` already covers it — no separate
+    // literal-TIME-binding term is needed.
+    let uses_time_builtin = stmts_use_time;
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
@@ -9003,11 +9045,11 @@ fn build_pk_param_fn(
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64| {
             // Resolve the `TIME` built-in from the event time the caller passed.
-            // `Expression::Time` / `Op::PushTime` and the analytical
-            // `pk_time_mapping` slots read the model-time thread-local, so set
-            // it here for the duration of this evaluation. Gated on
-            // `uses_time_builtin` so models that don't use the built-in (the
-            // common case) pay nothing for the guard (#610).
+            // `Expression::Time` / `Op::PushTime` (including the desugared
+            // `__ferx_pktime_* = TIME` parameters, #486) read the model-time
+            // thread-local, so set it here for the duration of this evaluation. Gated
+            // on `uses_time_builtin` so models that don't use the built-in (the common
+            // case) pay nothing for the guard (#610).
             let _time_guard = uses_time_builtin.then(|| ModelTimeGuard::enter(time));
             // Pre-compute each NN's forward output once per call. The
             // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
@@ -9073,9 +9115,6 @@ fn build_pk_param_fn(
                     // per-call evaluation, just write the parsed value.
                     for &(pk_slot, c) in &pk_const_mapping {
                         p.values[pk_slot] = c;
-                    }
-                    for &pk_slot in &pk_time_mapping {
-                        p.values[pk_slot] = current_model_time();
                     }
                     // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
                     // each duration parameter into its reserved spare slot so the
@@ -9166,6 +9205,17 @@ impl ModelTimeGuard {
     pub(crate) fn enter(time: f64) -> Self {
         let prev = MODEL_TIME.with(|cell| cell.replace(time));
         ModelTimeGuard(prev)
+    }
+
+    /// Enter the guard only when `cond` holds (typically `uses_time_builtin`),
+    /// returning `Some(guard)` that restores on drop or `None` when the model does
+    /// not read the `TIME` built-in. Collapses the repeated
+    /// `cond.then(|| ModelTimeGuard::enter(time))` idiom at the per-event seed seams so a
+    /// future widening of the gating condition (e.g. the direct `pk(...=TIME)` mapping)
+    /// updates one call each and can't silently miss a seam (#637 review #7).
+    #[inline]
+    pub(crate) fn enter_if(cond: bool, time: f64) -> Option<Self> {
+        cond.then(|| Self::enter(time))
     }
 }
 
@@ -9494,11 +9544,17 @@ fn collect_theta_eta_in_stmts(
 /// suppress these internal parameters — they are not user-declared quantities.
 pub(crate) const READOUT_SYNTH_PREFIX: &str = "__ferx_ro_";
 
-/// True for an individual-parameter name synthesized by the Form-C readout θ/η
-/// desugaring (see [`READOUT_SYNTH_PREFIX`]). User-facing per-subject output skips
-/// these so the synthetic parameters never surface as sdtab / fit-output columns.
+/// Reserved prefix for the individual parameter synthesized by desugaring a direct
+/// `pk(...=TIME)` structural mapping (`__ferx_pktime_<pk_name> = TIME`, #486). Like the
+/// readout prefix, it lets EBE / diagnostic output suppress the internal parameter.
+pub(crate) const PKTIME_SYNTH_PREFIX: &str = "__ferx_pktime_";
+
+/// True for a ferx-internal synthetic individual parameter — either a Form-C readout θ/η
+/// desugaring ([`READOUT_SYNTH_PREFIX`]) or a direct `pk(...=TIME)` mapping desugaring
+/// ([`PKTIME_SYNTH_PREFIX`]). User-facing per-subject output skips these so the synthetic
+/// parameters never surface as sdtab / fit-output columns.
 pub(crate) fn is_synthetic_readout_param(name: &str) -> bool {
-    name.starts_with(READOUT_SYNTH_PREFIX)
+    name.starts_with(READOUT_SYNTH_PREFIX) || name.starts_with(PKTIME_SYNTH_PREFIX)
 }
 
 /// A θ/η reference desugared out of a Form-C readout into a synthetic individual
@@ -14733,6 +14789,78 @@ mod tests {
         );
     }
 
+    /// #486 regression: the synthetic `__ferx_pktime_*` parameter a direct
+    /// `pk(...=TIME)` mapping desugars into must be exempt from the "computed but never
+    /// used" census (like the `__ferx_ro_*` readout synthetics). The census tokenizes the
+    /// raw block text, which still reads `q=TIME` (never `q=__ferx_pktime_q`), so the
+    /// synthetic name looks unreferenced — only the `is_synthetic_readout_param` prefix
+    /// match keeps it from being flagged. If that exemption is ever dropped, every direct
+    /// `pk(...=TIME)` model would tell users to remove a load-bearing parameter.
+    #[test]
+    fn direct_pk_time_synth_param_not_flagged_unused() {
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV1(10.0, 0.1, 1000.0)
+  theta TVV2(20.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  V2 = TVV2
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let p = super::parse_full_model(src).expect("parse ok");
+        assert!(
+            !p.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "direct pk(q=TIME) must not flag the synthetic __ferx_pktime_q as dead: {:?}",
+            p.model.parse_warnings
+        );
+    }
+
+    /// #486: a user parameter using the reserved `__ferx_pktime_` prefix is rejected, and
+    /// the message names the *correct* prefix and feature (`pk(...=TIME)`), not the Form-C
+    /// readout prefix — even though the shared guard also matches the readout prefix.
+    #[test]
+    fn reserved_pktime_prefix_rejected_with_correct_message() {
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  __ferx_pktime_cl = TVCL * exp(ETA_CL)
+
+[structural_model]
+  pk one_cpt_iv(cl=__ferx_pktime_cl, v=10.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = super::parse_full_model(src)
+            .err()
+            .expect("reserved prefix must be rejected");
+        assert!(
+            err.contains(PKTIME_SYNTH_PREFIX),
+            "message must name the pktime prefix: {err}"
+        );
+        assert!(
+            err.contains("pk(...=TIME)"),
+            "message must name the pk(...=TIME) feature, not Form-C readout: {err}"
+        );
+    }
+
     #[test]
     fn test_ode_dead_indiv_param_warns() {
         // #315: an ODE [individual_parameters] entry never referenced in the
@@ -15768,7 +15896,6 @@ mod tests {
                 // are method-specific, so none must warn under any method.
                 "covariance_method = s".to_string(),
                 "covariance_fallback = sir".to_string(),
-                "covariance_ofv_hessian = true".to_string(),
                 "verbose = false".to_string(),
                 "sir = true".to_string(),
                 "bloq_method = m3".to_string(),
@@ -15947,6 +16074,17 @@ mod tests {
         let err = parse_fit_options(&["n_exploraton = 200".to_string()]).unwrap_err();
         assert!(err.contains("unknown key"), "got: {err}");
         assert!(err.contains("n_exploraton"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_fit_options_covariance_ofv_hessian_removed() {
+        // The `covariance_ofv_hessian` option was removed in #639 (the analytical-
+        // gradient covariance R stencil it selected is gone; the reconverged-OFV
+        // second difference is the sole stencil). An old model file that still sets
+        // it must now fail loudly as an unknown key, not silently be accepted.
+        let err = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap_err();
+        assert!(err.contains("unknown key"), "got: {err}");
+        assert!(err.contains("covariance_ofv_hessian"), "got: {err}");
     }
 
     #[test]
@@ -16160,12 +16298,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_parameter_scaling_and_ofv_hessian() {
+    fn test_parse_parameter_scaling() {
         use crate::types::ParameterScaling;
-        // Defaults: parameter_scaling = Auto, covariance_ofv_hessian = true.
+        // Default: parameter_scaling = Auto.
         let def = parse_fit_options(&[]).unwrap();
         assert_eq!(def.parameter_scaling, ParameterScaling::Auto);
-        assert!(def.covariance_ofv_hessian);
         // parameter_scaling keywords, case-insensitive.
         for (input, expected) in [
             ("auto", ParameterScaling::Auto),
@@ -16177,9 +16314,6 @@ mod tests {
             assert_eq!(opts.parameter_scaling, expected, "input `{input}`");
         }
         assert!(parse_fit_options(&["parameter_scaling = bogus".to_string()]).is_err());
-        // covariance_ofv_hessian bool.
-        let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
-        assert!(!off.covariance_ofv_hessian);
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────

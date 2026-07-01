@@ -240,13 +240,30 @@ fn expression_scale_axes_admissible(
 /// count within [`MAX_ODE_SENS_DIM`]. Per-subject gates (bolus-only doses, no TV
 /// covariates/resets) are checked in [`ode_subject_sensitivities`].
 pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
-        return false;
-    }
+    // A `TIME`-built-in structural parameter is served analytically on the ODE path
+    // too: the subject routes through the event-driven TV-cov walk (`ode_tvcov_supported`
+    // admits `uses_time_builtin`), which seeds each event's PK-param duals at that
+    // event's time (#486). The RHS-clock `TIME` (`rhs_program.uses_time_vars`) was
+    // already analytic; this covers `TIME` read in `[individual_parameters]`.
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
     if ode.rhs_program.is_none() {
+        return false;
+    }
+    // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
+    // (`ode_subject_supported` declines it so it can't take the static superposition
+    // path). So being model-level "analytic" additionally requires that walk's model-level
+    // constraints — `init(...)` and built-in absorption input-rate forcing are handled only
+    // on the static walk (`integrate_tvcov_g` seeds compartments at zero and carries no
+    // `R_in`), so a TIME + `init(...)` or TIME + input-rate model has NO analytic walk and
+    // every subject falls back to FD. Decline here so `sens_supported` /
+    // `analytic_outer_gradient_available` (which call this with no per-subject check) report
+    // FD rather than claiming "analytic" for a 100%-FD population — the ODE twin of the
+    // closed-form `analytical_supported` fix (#637 round-2 review #1).
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        && (ode.init_fn.is_some() || !ode.input_rate.is_empty())
+    {
         return false;
     }
     // Readout: the state directly (`ObsCmt`), a simple Form C output program
@@ -368,9 +385,15 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
 /// outer gradient and the inner EBE loop, or neither (the inner/outer scope must
 /// match — a split would mix an analytic gradient with an FD Jacobian).
 pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) -> bool {
-    // Model-level scope + time-varying covariates (the dual walk holds the PK
-    // params constant across the integration).
-    if !ode_analytical_supported(model) || subject.has_tv_covariates() {
+    // Model-level scope + time-varying covariates (the static dual walk holds the PK
+    // params constant across the integration). A `TIME`-built-in structural parameter
+    // is per-event dynamic for the same reason a TV covariate is, so the static walk
+    // cannot serve it — decline here (it routes to the event-driven TV walk via
+    // `ode_tvcov_supported`, or to FD if that also declines) (#486).
+    if !ode_analytical_supported(model)
+        || subject.has_tv_covariates()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+    {
         return false;
     }
     // Steady-state dosing is not yet supported over the dual loop (needs dual
@@ -490,12 +513,17 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // lagtime carries the moving *start*. The static superposition walk can't, so route
     // these subjects here (`ode_subject_supported` keeps gating them off the static walk).
     let has_modeled_dose = !subject.all_doses_fixed();
+    // A `TIME`-built-in structural parameter is per-event dynamic (the switch fires at
+    // event times), so it routes through the event-driven walk even with no TV
+    // covariates — mirroring the closed-form `subject_sensitivities_tvcov` (#486).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     if !ode_analytical_supported(model)
         || !(subject.has_tv_covariates()
             || model.has_lagtime()
             || has_ss
             || has_rate_defined_under_f
-            || has_modeled_dose)
+            || has_modeled_dose
+            || uses_time)
     {
         return false;
     }
@@ -507,7 +535,9 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // Admissibility (`!log_transform`, axis counts, axis cap) is already enforced upstream
     // by `ode_analytical_supported`'s scaling allowlist (only `None`/`ScalarScale`/an
     // axis-admissible `ExpressionScale` reach here), so no extra guard is needed; LTBS
-    // stays FD via that allowlist's `!log_transform` admissibility.
+    // stays FD via that allowlist's `!log_transform` admissibility. A `TIME`-built-in
+    // structural parameter is served here too (per-event dynamic, mirrors TV-cov) and
+    // composes with the same subject-static scale quotient.
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
     // `integrate_tvcov_g` shifts each dose to `t_dose + lag` and injects the event-time
     // (saltation) sensitivity, propagated exactly through the per-event params (#439).
@@ -641,6 +671,12 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // the provider-agnostic assembly (`residual_inner_obs` / `prepare_stacked` via
     // `residual_var_scale`, keyed on `residual_error_eta`) — the same shared gradient the
     // closed-form IOV `iiv_on_ruv` path uses. Combined with M3 this is the full triple.
+    // A `TIME`-built-in structural parameter is threaded through the ODE IOV walk
+    // (`run_subject_iov`/`_eta` seed each occasion's stacked PK duals at that event's
+    // time via the per-event branch, #486). An η-dependent `ExpressionScale` obs_scale
+    // composes with it: the per-occasion scale jet is built at the static `t = 0`
+    // snapshot, which matches production's `apply_scaling` (also evaluated at `t = 0`,
+    // i.e. the switch's early value) — so no special-casing is needed here.
     // FREM + IOV: the analytic IOV inner gradient never substitutes the FREM covariate
     // pseudo-obs variance, and the IOV objective returns a `1e18` sentinel for FREM+IOV.
     // Route to FD. (#466 review round 2.)
@@ -1712,7 +1748,15 @@ fn seed_pk_dual2<const M: usize>(
     theta: &[f64],
     eta: &[f64],
     cov: &std::collections::HashMap<String, f64>,
+    time: f64,
 ) -> Vec<Dual2<M>> {
+    // Seed the model-time thread-local so a `TIME`-built-in structural parameter
+    // resolves to this event's time in both the f64 values and the `Dual2` walk
+    // (gated on `uses_time_builtin`, like the f64 `pk_param_fn` closure; #486).
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(
+        crate::parser::model_parser::compiled_model_uses_time_builtin(model),
+        time,
+    );
     let n_theta = model.n_theta;
     let n_eta = model.n_eta;
     // The dispatch sizes `M = n_theta + n_eta` exactly (θ on axes `0..n_theta`, η on
@@ -1729,7 +1773,7 @@ fn seed_pk_dual2<const M: usize>(
     // while saving only the cheap f64 eval (the M²-Hessian dual eval dominates, and the
     // covariate-snapshot dedup already elides repeats). Not worth that trade.
     let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-    let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
+    let pk = (model.pk_param_fn)(theta, eta, cov, time);
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; M];
@@ -1895,7 +1939,8 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
 /// re-seed (#460 review).
 fn seed_tvcov_snapshots<T: Clone>(
     subject: &Subject,
-    mut seed: impl FnMut(&std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
+    key_time: bool,
+    mut seed: impl FnMut(&std::collections::HashMap<String, f64>, f64) -> Option<Vec<T>>,
 ) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
     use std::collections::HashMap;
     // Canonical, hashable key for a covariate snapshot. `f64` is neither `Hash` nor
@@ -1908,24 +1953,29 @@ fn seed_tvcov_snapshots<T: Clone>(
         kv.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         kv
     }
-    let mut cache: HashMap<Vec<(String, u64)>, Vec<T>> = HashMap::new();
-    let mut seed_for = |cov: &HashMap<String, f64>| -> Option<Vec<T>> {
-        let key = snapshot_key(cov);
+    // When the model reads the `TIME` built-in, the seed depends on the event time as
+    // well as the covariate snapshot, so two events with identical covariates at
+    // different times must NOT share a seed — fold the event time into the cache key
+    // (`key_time`). Non-TIME models leave it out, so TV-cov dedup is unchanged (#486
+    // risk: dedup-cache key collision).
+    let mut cache: HashMap<(Vec<(String, u64)>, Option<u64>), Vec<T>> = HashMap::new();
+    let mut seed_for = |cov: &HashMap<String, f64>, time: f64| -> Option<Vec<T>> {
+        let key = (snapshot_key(cov), key_time.then(|| time.to_bits()));
         if let Some(v) = cache.get(&key) {
             return Some(v.clone());
         }
-        let v = seed(cov)?;
+        let v = seed(cov, time)?;
         cache.insert(key, v.clone());
         Some(v)
     };
     let pk_at_dose: Vec<Vec<T>> = (0..subject.doses.len())
-        .map(|k| seed_for(subject.dose_cov(k)))
+        .map(|k| seed_for(subject.dose_cov(k), subject.doses[k].time))
         .collect::<Option<_>>()?;
     let pk_at_obs: Vec<Vec<T>> = (0..subject.obs_times.len())
-        .map(|j| seed_for(subject.obs_cov(j)))
+        .map(|j| seed_for(subject.obs_cov(j), subject.obs_times[j]))
         .collect::<Option<_>>()?;
     let pk_at_pk_only: Vec<Vec<T>> = (0..subject.pk_only_times.len())
-        .map(|m| seed_for(subject.pk_only_cov(m)))
+        .map(|m| seed_for(subject.pk_only_cov(m), subject.pk_only_times[m]))
         .collect::<Option<_>>()?;
     Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
 }
@@ -1945,11 +1995,14 @@ fn run_subject_tvcov<const M: usize>(
     let n_eta = model.n_eta;
     let n_theta = model.n_theta;
 
-    // Seed each event's per-snapshot PK duals via the shared dedup helper.
+    // Seed each event's per-snapshot PK duals via the shared dedup helper. When the
+    // model reads `TIME`, fold the event time into the dedup key so events with equal
+    // covariates but different times don't share a (time-dependent) seed (#486).
     // `seed_pk_dual2` is infallible, so wrap it in `Some`; the `?` never fires here.
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let (pk_at_dose, pk_at_obs, pk_at_pk_only) =
-        seed_tvcov_snapshots::<Dual2<M>>(subject, |cov| {
-            Some(seed_pk_dual2::<M>(model, prog, theta, eta, cov))
+        seed_tvcov_snapshots::<Dual2<M>>(subject, uses_time, |cov, time| {
+            Some(seed_pk_dual2::<M>(model, prog, theta, eta, cov, time))
         })?;
 
     let preds = integrate_tvcov_readout::<Dual2<M>>(
@@ -1989,32 +2042,14 @@ fn run_subject_tvcov<const M: usize>(
         });
     }
     let mut sens = SubjectSens { obs: out };
-    // η-dependent `ExpressionScale` divisor (#486): the scale is **subject-static even under
-    // TV covariates** (production `apply_scaling` reads `subject.covariates`), so apply it as
-    // a single subject-static post-walk quotient — the SAME `apply_expression_scale_outer`
-    // the static walk uses (`ode_subject_sensitivities:820-848`). The TV-cov walk carries no
-    // whole-subject `pd`/`pk`, so compute them once here at the subject covariate snapshot.
-    // (The IOV per-occasion-group quotient collapses to this single jet — there is no κ.)
-    if let ScalingSpec::ExpressionScale {
-        deriv: Some(sprog), ..
-    } = &model.scaling
-    {
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        let pd = param_derivatives(model, subject, theta, eta)?;
-        let slots = prog.pk_slots_ref();
-        crate::sens::provider::apply_expression_scale_outer(
-            &mut sens,
-            sprog,
-            &pk,
-            &pd,
-            slots,
-            theta,
-            eta,
-            &subject.covariates,
-            n_theta,
-            n_eta,
-        );
-    }
+    // η-dependent `ExpressionScale` divisor: apply the subject-static quotient on the
+    // walked jet — the SAME shared helper the closed-form walk uses (#486, closing the
+    // TV-cov + expression-scale gap on the ODE event-driven path; a `TIME`-built-in
+    // parameter rides the same walk and composes with it). The scale is subject-static at
+    // `t = 0`, mirrored inside the helper.
+    crate::sens::provider::apply_event_walk_expression_scale_outer(
+        &mut sens, model, subject, prog, theta, eta,
+    )?;
     Some(sens)
 }
 
@@ -2267,6 +2302,17 @@ fn build_iov_scale_jets<T: crate::sens::num::PkNum>(
     jets
 }
 
+/// Whether the IOV ODE walk must seed each event individually (its own occasion ×
+/// covariate snapshot × time) rather than sharing one source per occasion group: TV
+/// covariates, EVID=2 covariate breakpoints, or a `TIME`-built-in structural parameter.
+/// Shared by `run_subject_iov` (outer `Dual2`) and `run_subject_iov_eta` (inner `Dual1`)
+/// so their per-event seeding decisions can't desync (#637 round-2 review #4).
+fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
+    subject.has_tv_covariates()
+        || !subject.pk_only_covariates.is_empty()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+}
+
 /// IOV outer (`Dual2<M>`, `M = n_theta + n_eta + K·n_kappa`) sensitivities for an ODE
 /// model — the IOV counterpart of [`run_subject_tvcov`]. Seeds each event's stacked
 /// PK duals at its (occasion, covariate-snapshot) — one source per occasion group when
@@ -2299,32 +2345,44 @@ fn run_subject_iov<const M: usize>(
     // Seed an occasion group's stacked PK duals at a covariate snapshot. `n_rows`
     // matches the program eval's `model.pk_indices`-parallel rows (the convention
     // `seed_pk_dual2` uses).
+    // A `TIME`-built-in structural parameter resolves `Op::PushTime` from the model-time
+    // thread-local, which `iov_combined_derivs`' walk reads; seed it with the per-event
+    // time (gated on `uses_time`, like the f64 `pk_param_fn`) so each occasion's stacked
+    // PK derivatives are evaluated at that event's TIME. It also forces per-event seeding
+    // below (the switch fires per event even with static covariates) (#486).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let n_rows = model.pk_indices.len();
-    let seed_group_cov =
-        |g: usize, cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual2<M>>> {
-            let combined = combined_for(g);
-            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
-            let cd = crate::sens::provider::iov_combined_derivs_dyn(
-                prog, n_theta, n_eff, n_rows, cov, theta, &combined,
-            )?;
-            Some(seed_pk_dual2_iov::<M>(
-                model,
-                &pk,
-                &cd,
-                Some(g),
-                n_eta,
-                n_kappa,
-                n_theta,
-            ))
-        };
+    let seed_group_cov = |g: usize,
+                          cov: &std::collections::HashMap<String, f64>,
+                          time: f64|
+     -> Option<Vec<Dual2<M>>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
+        let combined = combined_for(g);
+        let pk = (model.pk_param_fn)(theta, &combined, cov, time);
+        let cd = crate::sens::provider::iov_combined_derivs_dyn(
+            prog, n_theta, n_eff, n_rows, cov, theta, &combined,
+        )?;
+        Some(seed_pk_dual2_iov::<M>(
+            model,
+            &pk,
+            &cd,
+            Some(g),
+            n_eta,
+            n_kappa,
+            n_theta,
+        ))
+    };
     // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
     // closed-form provider, #598 review). Built lazily inside the closure so the common
     // IOV subject with no EVID=2 records pays no allocation — the closure is only invoked
     // when `seed_iov_events` actually has pk-only records to seed.
-    let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual2<M>>> {
+    let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
+                            time: f64|
+     -> Option<Vec<Dual2<M>>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         let combined_pk_only =
             crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
-        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, time);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
             n_theta,
@@ -2340,17 +2398,21 @@ fn run_subject_iov<const M: usize>(
     };
 
     // Build every occasion group's stacked PK seeding at the subject-static covariate
-    // snapshot. Shared by `static_group_dual` (the static-cov event-walk source) and the
-    // `ExpressionScale` scale jets' TV-cov fallback below — one source for both.
+    // snapshot (`t = 0`). Shared by `static_group_dual` (the static-cov event-walk source)
+    // and the `ExpressionScale` scale jets below — one source for both. For a `TIME` model
+    // `static_group_dual` is `None` (per-event forced), but the scale-jet path still calls
+    // this at `t = 0` — which matches production `apply_scaling` (also `t = 0`), so
+    // `ExpressionScale` + TIME composes correctly under IOV.
     let build_all_groups = || -> Option<Vec<Vec<Dual2<M>>>> {
-        (0..k_groups).map(|g| seed_group_cov(g, cov)).collect()
+        (0..k_groups).map(|g| seed_group_cov(g, cov, 0.0)).collect()
     };
 
     // For static-covariate subjects the per-occasion-group stacked PK seeding is the same
     // source the event walk uses, so build it once here and share it with `seed_iov_events`
-    // — no double seeding (#575 review). `None` for TV-cov subjects (each event seeds at
-    // its own snapshot in `seed_iov_events`).
-    let static_group_dual: Option<Vec<Vec<Dual2<M>>>> = if subject.has_tv_covariates() {
+    // — no double seeding (#575 review). `None` for TV-cov OR `TIME` subjects (each event
+    // seeds at its own snapshot/time in `seed_iov_events`).
+    let per_event = iov_walk_per_event(model, subject);
+    let static_group_dual: Option<Vec<Vec<Dual2<M>>>> = if per_event {
         None
     } else {
         Some(build_all_groups()?)
@@ -2360,6 +2422,7 @@ fn run_subject_iov<const M: usize>(
         subject,
         &occ_to_k,
         k_groups,
+        per_event,
         cov,
         static_group_dual.as_deref(),
         seed_group_cov,
@@ -2457,30 +2520,41 @@ fn run_subject_iov<const M: usize>(
 /// covariates are subject-static, one source per occasion group is built and shared,
 /// preserving the non-TV cost (mirrors the analytical IOV provider). `seed_group_cov`
 /// is fallible (`None` aborts the subject → FD fallback).
+#[allow(clippy::too_many_arguments)]
 fn seed_iov_events<T: Clone>(
     subject: &Subject,
     occ_to_k: &std::collections::HashMap<u32, usize>,
     k_groups: usize,
+    per_event: bool,
     static_cov: &std::collections::HashMap<String, f64>,
     precomputed_static: Option<&[Vec<T>]>,
-    mut seed_group_cov: impl FnMut(usize, &std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
-    mut seed_pk_only_cov: impl FnMut(&std::collections::HashMap<String, f64>) -> Option<Vec<T>>,
+    mut seed_group_cov: impl FnMut(
+        usize,
+        &std::collections::HashMap<String, f64>,
+        f64,
+    ) -> Option<Vec<T>>,
+    mut seed_pk_only_cov: impl FnMut(&std::collections::HashMap<String, f64>, f64) -> Option<Vec<T>>,
 ) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
-    if subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty() {
+    // `per_event`: seed each event at its own (occasion, covariate snapshot, time)
+    // rather than sharing one source per occasion group. True for TV covariates,
+    // EVID=2 covariate breakpoints, OR a `TIME`-built-in structural parameter (the
+    // switch fires per event even with static covariates, #486). Each event's time is
+    // threaded to `seed_group_cov`/`seed_pk_only_cov` so `TIME` resolves per event.
+    if per_event {
         let pk_at_dose = (0..subject.doses.len())
             .map(|d| {
                 let g = *occ_to_k.get(&subject.dose_occasions.get(d).copied()?)?;
-                seed_group_cov(g, subject.dose_cov(d))
+                seed_group_cov(g, subject.dose_cov(d), subject.doses[d].time)
             })
             .collect::<Option<_>>()?;
         let pk_at_obs = (0..subject.obs_times.len())
             .map(|j| {
                 let g = *occ_to_k.get(&subject.occasions.get(j).copied()?)?;
-                seed_group_cov(g, subject.obs_cov(j))
+                seed_group_cov(g, subject.obs_cov(j), subject.obs_times[j])
             })
             .collect::<Option<_>>()?;
         let pk_at_pk_only = (0..subject.pk_only_times.len())
-            .map(|m| seed_pk_only_cov(subject.pk_only_cov(m)))
+            .map(|m| seed_pk_only_cov(subject.pk_only_cov(m), subject.pk_only_times[m]))
             .collect::<Option<_>>()?;
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
     } else {
@@ -2491,7 +2565,7 @@ fn seed_iov_events<T: Clone>(
             Some(g) => g,
             None => {
                 owned = (0..k_groups)
-                    .map(|g| seed_group_cov(g, static_cov))
+                    .map(|g| seed_group_cov(g, static_cov, 0.0))
                     .collect::<Option<Vec<_>>>()?;
                 &owned
             }
@@ -2507,7 +2581,7 @@ fn seed_iov_events<T: Clone>(
         let pk_at_pk_only = if subject.pk_only_times.is_empty() {
             Vec::new()
         } else {
-            let seeded = seed_pk_only_cov(static_cov)?;
+            let seeded = seed_pk_only_cov(static_cov, 0.0)?;
             vec![seeded; subject.pk_only_times.len()]
         };
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
@@ -2577,30 +2651,39 @@ fn run_subject_iov_eta<const N: usize>(
     let combined_for =
         |g: usize| crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g);
 
+    // Per-event `TIME` seeding — the inner counterpart of the outer `run_subject_iov`
+    // (#486). Same thread-local guard + per-event forcing.
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let n_rows = model.pk_indices.len();
-    let seed_group_cov =
-        |g: usize, cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
-            let combined = combined_for(g);
-            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
-            let cd = crate::sens::provider::iov_combined_derivs_dyn(
-                prog, n_theta, n_eff, n_rows, cov, theta, &combined,
-            )?;
-            Some(seed_pk_dual1_iov::<N>(
-                model,
-                &pk,
-                &cd,
-                Some(g),
-                n_eta,
-                n_kappa,
-            ))
-        };
+    let seed_group_cov = |g: usize,
+                          cov: &std::collections::HashMap<String, f64>,
+                          time: f64|
+     -> Option<Vec<Dual1<N>>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
+        let combined = combined_for(g);
+        let pk = (model.pk_param_fn)(theta, &combined, cov, time);
+        let cd = crate::sens::provider::iov_combined_derivs_dyn(
+            prog, n_theta, n_eff, n_rows, cov, theta, &combined,
+        )?;
+        Some(seed_pk_dual1_iov::<N>(
+            model,
+            &pk,
+            &cd,
+            Some(g),
+            n_eta,
+            n_kappa,
+        ))
+    };
     // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
     // closed-form provider, #598 review). Built lazily inside the closure so the common
     // IOV subject with no EVID=2 records pays no allocation.
-    let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
+    let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
+                            time: f64|
+     -> Option<Vec<Dual1<N>>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         let combined_pk_only =
             crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
-        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, time);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
             n_theta,
@@ -2616,15 +2699,19 @@ fn run_subject_iov_eta<const N: usize>(
     };
 
     // Build every occasion group's stacked PK seeding at the subject-static covariate
-    // snapshot — the inner counterpart of the outer `build_all_groups`. Shared by
-    // `static_group_dual` and the `ExpressionScale` scale jets' TV-cov fallback below.
+    // snapshot (`t = 0`) — the inner counterpart of the outer `build_all_groups`. Shared by
+    // `static_group_dual` and the `ExpressionScale` scale jets below. For a `TIME` model the
+    // scale-jet path still calls this at `t = 0`, matching production `apply_scaling`, so
+    // `ExpressionScale` + TIME composes correctly under IOV.
     let build_all_groups = || -> Option<Vec<Vec<Dual1<N>>>> {
-        (0..k_groups).map(|g| seed_group_cov(g, cov)).collect()
+        (0..k_groups).map(|g| seed_group_cov(g, cov, 0.0)).collect()
     };
 
     // Static-cov per-group seeding built once and shared by the event walk — the inner
-    // counterpart of the outer `static_group_dual` (#575 review). `None` for TV-cov subjects.
-    let static_group_dual: Option<Vec<Vec<Dual1<N>>>> = if subject.has_tv_covariates() {
+    // counterpart of the outer `static_group_dual` (#575 review). `None` for TV-cov OR
+    // `TIME` subjects.
+    let per_event = iov_walk_per_event(model, subject);
+    let static_group_dual: Option<Vec<Vec<Dual1<N>>>> = if per_event {
         None
     } else {
         Some(build_all_groups()?)
@@ -2634,6 +2721,7 @@ fn run_subject_iov_eta<const N: usize>(
         subject,
         &occ_to_k,
         k_groups,
+        per_event,
         cov,
         static_group_dual.as_deref(),
         seed_group_cov,
@@ -2728,13 +2816,20 @@ fn seed_pk_dual1<const N: usize>(
     theta: &[f64],
     eta: &[f64],
     cov: &std::collections::HashMap<String, f64>,
+    time: f64,
 ) -> Option<Vec<Dual1<N>>> {
+    // Seed the model-time thread-local with this event's time so a `TIME`-built-in
+    // parameter resolves per event in both the f64 value and the `Dual1` η-walk (#486).
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(
+        crate::parser::model_parser::compiled_model_uses_time_builtin(model),
+        time,
+    );
     let n_eta = model.n_eta;
     // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` guard is always a no-op
     // — flat loop (#449 review #15).
     debug_assert_eq!(N, n_eta);
     let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
-    let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
+    let pk = (model.pk_param_fn)(theta, eta, cov, time);
     let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; N];
@@ -2764,9 +2859,10 @@ fn run_subject_tvcov_eta<const N: usize>(
     let n_eta = model.n_eta;
 
     // Dedup identical covariate snapshots via the shared helper (#451 re-review #8).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let (pk_at_dose, pk_at_obs, pk_at_pk_only) =
-        seed_tvcov_snapshots::<Dual1<N>>(subject, |cov| {
-            seed_pk_dual1::<N>(model, prog, theta, eta, cov)
+        seed_tvcov_snapshots::<Dual1<N>>(subject, uses_time, |cov, time| {
+            seed_pk_dual1::<N>(model, prog, theta, eta, cov, time)
         })?;
 
     let preds = integrate_tvcov_readout::<Dual1<N>>(
@@ -2790,30 +2886,14 @@ fn run_subject_tvcov_eta<const N: usize>(
             df_deta,
         });
     }
-    // η-dependent `ExpressionScale` divisor (#486): apply the subject-static η-only quotient
-    // on the light gradient, via the SAME `apply_expression_scale_inner_dispatch` the static
-    // inner walk uses (`ode_subject_eta_grad:918-944`). Subject-static even under TV-cov, so
-    // compute `pk` + `∂p/∂η` once at `subject.covariates`. Inner and outer MUST move in
-    // lockstep (shared gate) — else the inner EBE gradient silently diverges from the outer.
-    if let ScalingSpec::ExpressionScale {
-        deriv: Some(sprog), ..
-    } = &model.scaling
-    {
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
-        let slots = prog.pk_slots_ref();
-        crate::sens::provider::apply_expression_scale_inner_dispatch(
-            &mut out,
-            sprog,
-            &pk,
-            &dp_deta,
-            slots,
-            theta,
-            eta,
-            &subject.covariates,
-            n_eta,
-        );
-    }
+    // η-dependent `ExpressionScale` divisor: the η-only quotient, mirroring the outer
+    // `run_subject_tvcov` and the static inner path (#486; composes with a `TIME`-built-in
+    // structural parameter on this same walk). Subject-static scale at `t = 0` (shared
+    // helper). Inner and outer MUST move in lockstep (shared gate) — else the inner EBE
+    // gradient silently diverges from the outer.
+    crate::sens::provider::apply_event_walk_expression_scale_inner(
+        &mut out, model, subject, prog, theta, eta,
+    )?;
     Some(out)
 }
 
@@ -4970,7 +5050,13 @@ mod tests {
     /// can't be reproduced by a post-walk quotient — `expression_scale_axes_admissible`
     /// gates it on `!log_transform`, so the analytic scope declines it (#486).
     #[test]
-    fn ode_provider_expression_scale_ltbs_falls_back_to_fd() {
+    fn ode_provider_expression_scale_combos_fall_back_to_fd() {
+        // + LTBS → out of analytic scope (the walk applies LTBS pre-chain, so the
+        // production scale-then-log order can't be reproduced by a post-walk quotient).
+        // This is the only `ExpressionScale` combination that still declines: since #486
+        // the event-driven walk applies the subject-static scale quotient, so
+        // `ExpressionScale` + time-varying covariate / `TIME` is analytic (validated in
+        // `ode_expression_scale_on_event_walk_matches_production`).
         let mut ltbs = parse_model_string(TWOCPT_ODE_EXPRSCALE).expect("parse");
         ltbs.log_transform = true;
         assert!(
@@ -6768,6 +6854,221 @@ mod tests {
   ode_reltol = 1e-9
   ode_abstol = 1e-11
 "#;
+
+    /// #486: a `TIME`-switched CL on a **non-IOV ODE** model. With no TV covariates
+    /// the subject routes to the event-driven TV walk purely by `uses_time_builtin`
+    /// (`ode_tvcov_supported`); the full `ode_subject_sensitivities` value/∂η/∂θ (and
+    /// the 2nd-order blocks) must match central FD of `compute_predictions_with_tv`
+    /// (which threads the same per-event TIME), and the light inner `ode_subject_eta_grad`
+    /// must track the outer η-block.
+    #[test]
+    fn ode_time_builtin_provider_matches_fd_of_production() {
+        const ONECPT_ODE_TIME: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(ONECPT_ODE_TIME).expect("parse ODE TIME");
+        assert!(crate::parser::model_parser::compiled_model_uses_time_builtin(&model));
+        let subject = bolus_subject(&[1.0, 3.0, 8.0, 16.0, 30.0]); // straddle TIME=5
+        assert!(!subject.has_tv_covariates());
+        assert!(
+            ode_tvcov_supported(&model, &subject),
+            "TIME ODE subject must route to the event-driven walk"
+        );
+        let theta = vec![1.0, 0.5, 20.0];
+        let eta = vec![0.15, -0.10];
+
+        let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+        let pred = |e: &[f64], th: &[f64], j: usize| {
+            compute_predictions_with_tv(&model, &subject, th, e)[j]
+        };
+        let he = 1e-6;
+        for (j, obs) in sens.obs.iter().enumerate() {
+            approx::assert_relative_eq!(
+                obs.f,
+                pred(&eta, &theta, j),
+                max_relative = 1e-6,
+                epsilon = 1e-9
+            );
+            for k in 0..model.n_eta {
+                let mut ep = eta.clone();
+                ep[k] += he;
+                let mut em = eta.clone();
+                em[k] -= he;
+                let g = (pred(&ep, &theta, j) - pred(&em, &theta, j)) / (2.0 * he);
+                approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 1e-3, epsilon = 1e-6);
+            }
+            for m in 0..model.n_theta {
+                let s = he * (1.0 + theta[m].abs());
+                let mut tp = theta.clone();
+                tp[m] += s;
+                let mut tm = theta.clone();
+                tm[m] -= s;
+                let g = (pred(&eta, &tp, j) - pred(&eta, &tm, j)) / (2.0 * s);
+                approx::assert_relative_eq!(
+                    obs.df_dtheta[m],
+                    g,
+                    max_relative = 1e-3,
+                    epsilon = 1e-6
+                );
+            }
+            // 2nd-order blocks via central FD of the analytic first-order gradient.
+            let grad_at = |e: &[f64]| -> (Vec<f64>, Vec<f64>) {
+                let s = ode_subject_sensitivities(&model, &subject, &theta, e).expect("ode");
+                (s.obs[j].df_deta.clone(), s.obs[j].df_dtheta.clone())
+            };
+            for k in 0..model.n_eta {
+                let mut ep = eta.clone();
+                ep[k] += he;
+                let mut em = eta.clone();
+                em[k] -= he;
+                let (de_p, dt_p) = grad_at(&ep);
+                let (de_m, dt_m) = grad_at(&em);
+                for l in 0..model.n_eta {
+                    let d2 = (de_p[l] - de_m[l]) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta2[k * model.n_eta + l],
+                        d2,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+                for m in 0..model.n_theta {
+                    let d2 = (dt_p[m] - dt_m[m]) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta_dtheta[k * model.n_theta + m],
+                        d2,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
+
+        // Inner light Dual1 η-gradient tracks the outer η-block.
+        let light = ode_subject_eta_grad(&model, &subject, &theta, &eta).expect("inner");
+        assert_eq!(light.len(), sens.obs.len());
+        for (o, g) in sens.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-9, epsilon = 1e-9);
+            for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-9);
+            }
+        }
+    }
+
+    /// #486: an η-dependent `ExpressionScale` `obs_scale = 1000/V` on the **ODE
+    /// event-driven walk** — for a `TIME` switch AND a time-varying covariate. The walk
+    /// now applies the subject-static scale quotient (`apply_expression_scale_outer`)
+    /// post-walk, the SAME one the static ODE walk uses; value/∂η/∂θ (+2nd order) must
+    /// match FD of `compute_predictions_with_tv` (which divides by the same scale).
+    #[test]
+    fn ode_expression_scale_on_event_walk_matches_production() {
+        const ODE_IV_TIME_SCALED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        const ODE_IV_TVCOV_SCALED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        // TIME switch + obs_scale (routed to the event walk by uses_time_builtin).
+        let m_time = parse_model_string(ODE_IV_TIME_SCALED).expect("parse ODE TIME scaled");
+        assert!(matches!(
+            m_time.scaling,
+            ScalingSpec::ExpressionScale { .. }
+        ));
+        let s_time = bolus_subject(&[1.0, 3.0, 8.0, 16.0, 30.0]); // straddle TIME=5
+        assert!(ode_tvcov_supported(&m_time, &s_time));
+        check_vs_production(&m_time, &s_time, &[1.0, 0.5, 20.0], &[0.15, -0.10]);
+        // Time-varying covariate + obs_scale (the broader gap this closes).
+        let m_tv = parse_model_string(ODE_IV_TVCOV_SCALED).expect("parse ODE tvcov scaled");
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let mut s_tv = bolus_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+        s_tv.dose_covariates = vec![wt(60.0)];
+        s_tv.obs_covariates = vec![wt(60.0), wt(70.0), wt(80.0), wt(85.0), wt(90.0)];
+        assert!(s_tv.has_tv_covariates() && ode_tvcov_supported(&m_tv, &s_tv));
+        check_vs_production(&m_tv, &s_tv, &[1.0, 20.0, 0.75], &[0.15, -0.10]);
+
+        // #637 review #2: the light inner η-gradient (`run_subject_tvcov_eta` →
+        // `apply_expression_scale_inner_dispatch`) must track the outer η-block — this
+        // exercises the new ODE inner ExpressionScale quotient, which `check_vs_production`
+        // (outer only) does not.
+        let parity = |m: &CompiledModel, s: &Subject, theta: &[f64], eta: &[f64]| {
+            let full = ode_subject_sensitivities(m, s, theta, eta).expect("outer");
+            let light = ode_subject_eta_grad(m, s, theta, eta).expect("inner");
+            assert_eq!(full.obs.len(), light.len());
+            for (o, g) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
+                for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
+                    approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-10);
+                }
+            }
+        };
+        parity(&m_time, &s_time, &[1.0, 0.5, 20.0], &[0.15, -0.10]);
+        parity(&m_tv, &s_tv, &[1.0, 20.0, 0.75], &[0.15, -0.10]);
+    }
 
     #[test]
     fn ode_provider_tvcov_matches_production() {

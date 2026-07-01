@@ -733,6 +733,18 @@ impl Subject {
         self.doses.iter().any(|d| d.ss)
     }
 
+    /// True when any dose is a *periodic* steady-state dose: flagged `SS=1`
+    /// **and** carrying a positive dosing interval `II > 0`. This is the precise
+    /// predicate the analytic-sensitivity gates use to decline steady-state
+    /// combinations they don't yet handle (the dual SS-equilibration needs the
+    /// `II` recurrence). Distinct from [`has_ss_doses`](Self::has_ss_doses),
+    /// which tests the `SS` flag alone; the single source of truth for the
+    /// `d.ss && d.ii > 0.0` gate scan shared by `ode_provider.rs` and
+    /// `estimation/inner_optimizer.rs`.
+    pub fn has_periodic_ss_dose(&self) -> bool {
+        self.doses.iter().any(|d| d.ss && d.ii > 0.0)
+    }
+
     /// True when every dose carries concrete (`Fixed`) `rate`/`duration` — i.e.
     /// no dose is still a modeled NONMEM coded `RATE` awaiting
     /// [`DoseEvent::resolve_rate`]. The common case (no coded doses) is `true`,
@@ -6481,6 +6493,24 @@ mod tests {
         assert!(!s.has_ss_doses());
         s.doses.push(dose(true));
         assert!(s.has_ss_doses());
+    }
+
+    #[test]
+    fn subject_has_periodic_ss_dose_requires_ss_flag_and_positive_ii() {
+        let mut s = bare_subject("1");
+        // No doses → false.
+        assert!(!s.has_periodic_ss_dose());
+        // SS flag but `II = 0` (not a periodic SS dose) → false, unlike
+        // `has_ss_doses`, which keys on the flag alone.
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0)];
+        assert!(s.has_ss_doses());
+        assert!(!s.has_periodic_ss_dose());
+        // Periodic SS dose (`SS=1`, `II > 0`) → true.
+        s.doses.push(DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0));
+        assert!(s.has_periodic_ss_dose());
+        // `II > 0` without the SS flag → false.
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 24.0)];
+        assert!(!s.has_periodic_ss_dose());
     }
 
     #[test]

@@ -6340,6 +6340,205 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
+    /// 1-cpt IV ODE IOV with a **modeled-duration** dose (`RATE=-2` → `D1`). `D1` is a
+    /// structural individual parameter (`D1 = TVD1·exp(ETA_D1)`), so the infusion window
+    /// end `t_dose + D1` is a moving boundary in `D1`; the per-occasion rate-off saltation
+    /// carries its derivative on the IOV stacked axes exactly as on the non-IOV TV-cov walk
+    /// (#486 / #530). κ rides on CL here (the modeled slot itself is η-only).
+    const WARFARIN_IOV_ODE_MODELED_DUR: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **ODE IOV + modeled-duration dose** (#486, design A). A two-occasion IOV subject
+    /// whose per-occasion modeled `D1` sets each infusion's window length. The walk resolves
+    /// `D1` from the per-occasion stacked PK jet (`inf_eff` → `pk_at_dose[k][slot]`) and the
+    /// moving infusion-end saltation carries `∂/∂D1` over θ, η, and κ. Validated vs central
+    /// FD of `predict_iov` (which resolves `D1` per occasion). Observations straddle each
+    /// window end (`D1 ≈ 5`: obs at 1 inside, 6 after the first window; 25 inside, 30 after
+    /// the second) so the moving boundary is genuinely exercised.
+    #[test]
+    fn ode_iov_modeled_duration_provider_matches_fd_of_predict_iov() {
+        let model =
+            parse_model_string(WARFARIN_IOV_ODE_MODELED_DUR).expect("parse modeled-dur IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 3);
+        assert!(model.ode_spec.is_some());
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        assert!(
+            !subject.all_doses_fixed(),
+            "doses must be modeled, not fixed"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0, 5.0],
+                &[0.12, -0.08, 0.05, 0.05, -0.10],
+            )
+            .is_some(),
+            "modeled-duration ODE IOV subject (no SS) must be served analytically (#486)"
+        );
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
+        );
+    }
+
+    /// **ODE IOV + κ-coupled modeled-duration dose** (#486, design A — the κ-coupling guard).
+    /// Here the modeled window itself varies by occasion: `D1 = TVD1·exp(ETA_D1 + KAPPA_D1)`,
+    /// so each occasion's infusion has a *different* length. This pins the concern that the
+    /// `∂/∂D1` moving-boundary column lands in the correct κ-group axis — `inf_eff` reads the
+    /// per-occasion `seed_pk_dual2_iov` jet, and central FD of `predict_iov` (which rebuilds
+    /// `D1` from each occasion's κ) is the independent oracle.
+    #[test]
+    fn ode_iov_modeled_duration_kappa_coupled_matches_fd_of_predict_iov() {
+        const KCOUPLED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_D1 ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1 + KAPPA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(KCOUPLED).expect("parse kappa-coupled modeled-dur IOV");
+        assert_eq!(model.n_kappa, 1);
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1]; κ on D1 → each occasion's window differs.
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.06, -0.11],
+        );
+    }
+
+    /// **Still-FD edge: modeled-duration dose + steady-state** (#486, design B not yet done).
+    /// The dual SS equilibration reads a fixed per-cycle `t_inf` with no modeled-window jet,
+    /// so a modeled + SS subject must route to FD on BOTH the outer sensitivity walk and the
+    /// inner η-gradient (scope parity). Pins the `has_ss` arm of the relaxed IOV gate.
+    #[test]
+    fn ode_iov_modeled_duration_ss_falls_back_to_fd() {
+        let model =
+            parse_model_string(WARFARIN_IOV_ODE_MODELED_DUR).expect("parse modeled-dur IOV");
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        let theta = [0.2, 10.0, 5.0];
+        let stacked = [0.12, -0.08, 0.05, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked
+            )
+            .is_none(),
+            "modeled-duration + SS must fall back to FD (outer)"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_subject_eta_grad_iov(&model, &subject, &theta, &stacked)
+                .is_none(),
+            "modeled-duration + SS must fall back to FD (inner, scope parity)"
+        );
+    }
+
     /// Regression (#575 review): a plain `ScalingSpec::None` IOV ODE model under LTBS
     /// (`log_transform`, no `obs_scale`) must stay on FD. The #575 gate rewrite replaced
     /// the `|| model.log_transform` bail with a `match`, and the `None` arm initially

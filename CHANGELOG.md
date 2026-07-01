@@ -20,6 +20,46 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
+  exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
+  (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK
+  jet, and the moving infusion-end boundary carries `∂/∂{θ,η,κ}` — including when the
+  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`). Steady-state modeled doses
+  stay on the finite-difference fallback for now.
+- A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
+  **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
+  analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
+  (#486). The parser desugars each bare `THETA(i)`/`ETA(k)` in the readout into a
+  hidden individual parameter, so its `∂y/∂θ`/`∂y/∂η` (and the 2nd-order blocks)
+  ride the same validated individual-parameter sensitivity chain as `central/V1`;
+  the prediction value is unchanged and the synthetic parameters never appear in
+  EBE / sdtab output. (A readout referencing a neural-network output stays on the
+  FD fallback.)
+- Two more **non-IOV ODE** model combinations now get exact analytic FOCE/FOCEI
+  sensitivities instead of finite differences (#486): a time-varying-covariate ODE
+  model with **(a)** an `EVID=2` covariate-only breakpoint, or **(b)** an
+  η-dependent `obs_scale = expr(θ,η)` divisor. The `obs_scale` divisor is applied
+  as a single subject-static post-walk quotient (production evaluates it at the
+  subject covariate snapshot), and the EVID=2 breakpoint rides the event-driven
+  walk that already carried it — closing the matching cells the IOV path gained in
+  #590/#591. LTBS-combined `obs_scale` stays on the FD fallback.
+- **Analytic transit-compartment absorption** (#386). A new `pk one_cpt_transit(cl, v, n, mtt)`
+  structural model evaluates Savic (2007) transit absorption into a one-compartment disposition as
+  an exponential-tilting closed form (the incomplete-gamma `convolve_1cpt`), with exact `Dual2`
+  FOCE/FOCEI sensitivities `∂C/∂{CL,V,N,MTT,F,η}` and no ODE solve — the fast analytic counterpart
+  to the `transit()` ODE forcing, with continuous (estimable) `N`. Supports single/multiple bolus
+  doses, bioavailability, and lag time; with `N = 0` it reduces exactly to first-order (Bateman)
+  oral absorption. Steady-state doses, IOV, time-varying covariates, infusions, and a `depot`
+  initial amount are rejected with an actionable message (use an ODE transit model for those). See
+  `examples/one_cpt_transit.ferx`.
+- `block_sigma` correlated residual errors are now supported under
+  `method = focei` and `method = imp`, not just `foce` and `saem` (#616). FOCEI
+  carries the off-diagonal residual covariance through the Almquist interaction
+  Hessian (`H̃ = HᵀR⁻¹H + ½·tr(R⁻¹∂R/∂η R⁻¹∂R/∂η) + Ω⁻¹`), and IMP builds its
+  Student-t proposal precision from the dense `R⁻¹`. On the committed
+  `correlated_residual_combined` anchor, ferx FOCEI OFV 18.722087 matches NONMEM
+  `METHOD=1 INTER` (18.722087) to better than 1e-5. The Gauss-Newton
+  (`gn` / `gn_hybrid`) paths remain diagonal-only and are still rejected.
 - **AUC-target attainment metric + vancomycin AUC-TDM example/anchor** (#391, S2.5b). A new
   optional `[adaptive_dosing] auc_target = [low, high]` key adds `auc_target_attainment` to
   `AdaptiveSubjectMetrics` — the fraction of inter-decision windows whose area under the monitored
@@ -66,7 +106,7 @@ section of the SDLC for the versioning policy).
   observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
   supported and are rejected with a clear error.
 - **Exact analytic gradients for M3 BLOQ + IOV models — full FOCEI/FOCE matrix**
-  (closed-form 1/2/3-cpt, #580/#591/#486). An inter-occasion-variability model with M3
+  (closed-form 1/2/3-cpt and user-ODE, #580/#591/#486). An inter-occasion-variability model with M3
   below-limit handling now runs on exact analytic sensitivities instead of finite
   differences across the whole estimator matrix: **FOCEI**, **non-interaction FOCE**, and
   the triple **M3 + IOV + `iiv_on_ruv`**. The censored data term `−logΦ((LLOQ−f)/√v)` and
@@ -79,7 +119,17 @@ section of the SDLC for the versioning policy).
   Inner stacked-η gradients match central FD of the IOV inner objective and outer packed
   gradients match Richardson reconverged FD of the corresponding marginal, all to ~1e-3;
   estimate-level tests confirm the analytic fits land on the FD (NONMEM-anchored) optima.
-  Only the **ODE** M3 + IOV + `iiv_on_ruv` triple still routes to FD.
+  This applies equally to **user-ODE** models (#486), including the triple **M3 + IOV +
+  `iiv_on_ruv`**: the event-driven ODE sensitivity walk emits the standard per-observation
+  shape (with a structural zero `∂f/∂η_ruv` column for the residual-error η), and the
+  censoring and `exp(2·η_ruv)` variance scaling are applied downstream keyed on the `CENS`
+  flag and `residual_error_eta`, so the ODE path rides the exact same analytic assembly as
+  the closed-form path (inner and outer FD-comparison tests on censored ODE-IOV fixtures
+  confirm both tails for plain IOV, M3 + IOV, IOV + `iiv_on_ruv`, and the full triple). The
+  **non-IOV** ODE M3 + `iiv_on_ruv` combination is analytic too — the last `iiv_on_ruv`
+  holdout: the ODE and closed-form packed gradients are bit-identical and both match
+  reconverged FD to ~1e-7 on each censoring tail (inner and outer), completing the entire
+  `iiv_on_ruv` × {plain, IOV, M3} × {closed-form, ODE} matrix.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
@@ -317,6 +367,14 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Changed
+- For `block_sigma` correlated residual models, the SAEM reported OFV (the
+  FOCE-approximation used for AIC/BIC) now follows the `interaction` flag like
+  FOCE/FOCEI instead of always using the non-interaction marginal: with
+  interaction on (the default) it reports the dense interaction marginal
+  (e.g. 18.7221 on the `correlated_residual_combined` anchor, matching ferx
+  FOCEI) rather than the previous non-interaction value (18.7274) (#616). The
+  off-diagonal correlation is carried in both cases; only the marginal's
+  curvature term changed.
 - **SAEM now warns on non-mu-referenced individual parameters instead of listing detected
   mu-referencing** (#621). The broad `mu-ref: ...` info notice is replaced by a SAEM-only
   warning that names any individual parameter whose random effect is not mu-referenced
@@ -348,6 +406,19 @@ section of the SDLC for the versioning policy).
   methods (SAEM) filled the buffer and streamed incidentally, but gradient
   methods (FOCE/FOCEI/GN) emit few rows (smaller than the buffer) so the trace
   file did not appear until the fit completed.
+- **Gradient optimizers no longer fail on a first-step overshoot into the EBE guard**
+  (#486). When the outer optimizer's inner EBE loop rejected a trial step (too many
+  unconverged subjects, or a non-finite OFV), the objective was clamped to a flat `1e20`
+  while the gradient was set to a non-zero "push back toward the bound centre" vector — an
+  objective/gradient pair NLopt's L-BFGS / SLSQP line search cannot reconcile (the slope of
+  a constant is zero). For most fits this was harmless because the guard only triggers deep
+  in the run; but a model whose **first** optimizer step overshoots straight into the guard
+  (notably ODE models with `iiv_on_ruv`, where a large step diverges the inner EBEs and
+  overflows the `exp(2·η_ruv)` marginal) failed on iteration one and never moved off the
+  initial estimates. The guard now returns a quadratic penalty whose gradient *is* the
+  push-back vector, so the line search backtracks to a feasible step and the fit proceeds.
+  This makes the analytic **M3 + IOV + `iiv_on_ruv`** triple on ODE models (#486) converge
+  under the default gradient optimizer, matching the closed-form fit to estimator precision.
 - **Estimation-method chains now run the covariance step only once, at the end of
   the chain** (#615). When a chain ended in a *default (estimating)* IMP stage
   (e.g. `methods = [saem, imp]`), both the preceding estimator and the IMP stage
@@ -550,6 +621,40 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Analytic sensitivity gradients for moving infusion-end boundaries: modeled
+  duration / rate doses and `zero_order(dur)` absorption** (#530). Three dosing
+  features previously routed both the outer (θ/Ω/σ) and inner (EBE η) FOCE/FOCEI
+  gradients to finite differences because the infusion *end* time is a moving
+  boundary in an estimated parameter: a `RATE=-2` (`D{cmt}`, modeled duration) or
+  `RATE=-1` (`R{cmt}`, modeled rate) dose (end `t_dose + D` resp. `t_dose + amt/R`),
+  and a `zero_order(dur)` absorption forcing (end `t_dose + dur`). The dual walk now
+  resolves the modeled rate/window from its PK slot as a live jet and carries the
+  boundary derivative via the rate-off **event-time saltation** — the exact
+  sign-mirror of the estimated-lagtime dose-*start* saltation (#472). Modeled
+  duration/rate doses ride the event-driven walk; `zero_order(dur)` is delivered as a
+  per-segment constant window (like an infusion) on the static walk, with the
+  saltation injected at its cutoff. So these fits take the exact `Dual2`/`Dual1`
+  gradient (the estimates are unchanged; the gradient is faster and Hessian-clean).
+  Validated against finite differences of the production predictor, with the modeled
+  parameter η-coupled so both the θ- and η-blocks of the moving-boundary term are
+  checked, plus inner/outer scope parity. Modeled duration/rate doses stay analytic
+  when composed with an estimated lagtime (the start and end saltations carry the
+  combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying covariates, or
+  multiple doses; `zero_order(dur)` stays analytic across multiple doses and a mixed
+  (zero- + first-order) pathway. Still FD: a *steady-state* modeled dose or
+  `zero_order` window (the SS equilibration reads a fixed per-cycle window), a modeled
+  dose under IOV, and a `zero_order(dur)` *forcing* combined with an estimated
+  lagtime, an EVID 3/4 reset, or time-varying covariates (which keep it on the static
+  walk's FD fallback).
+- **Joint PK-TTE fits integrate the augmented PK + cumulative-hazard ODE once per
+  inner likelihood evaluation instead of twice** (#570). For a drug-driven hazard
+  (`[event_model] hazard = …`), the cumulative hazard at the event/censor times is now
+  read off the *same* integration as the Gaussian predictions by in-step cubic Hermite
+  interpolation, rather than a second dedicated solve. The predictions are bit-identical
+  and the hazard term is unchanged to integrator tolerance, so estimates and OFV are
+  unaffected within the solver's accuracy — the only difference is speed. Applies to
+  plain ODE PK-TTE subjects (no time-varying covariates, EVID-3/4 resets, SDE, or FREM,
+  which keep the previous path).
 - **Analytic sensitivity gradients for ODE IOV models with an `ExpressionScale`
   `obs_scale` divisor** (#575). An `[odes]` model combining IOV (occasion `kappa`)
   with an η-dependent `obs_scale = expr` (e.g. `obs_scale = V1`) previously routed

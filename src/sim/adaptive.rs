@@ -405,22 +405,43 @@ pub struct AdaptiveSubjectMetrics {
     /// under the latent monitored signal over the window) fell within the spec's
     /// `auc_target` band `[lo, hi]` (inclusive), in `[0, 1]` — e.g. the share of
     /// daily windows whose vancomycin AUC₂₄ is on target (#391 S2.5b). The
-    /// denominator is the number of windows between consecutive **scheduled**
-    /// decisions (`decisions − 1`), so a run with fewer than two decisions has no
-    /// window and the metric is `None`. `None` also when no `auc_target` is declared
-    /// (the signal-AUC pass is then skipped). Unlike the point summary above, this is
-    /// an **integrated-exposure** quantity: it is computed by re-integrating the
-    /// realized dose ledger on a dense grid (the AUC pass never perturbs the
+    /// denominator is the number of windows between consecutive **realized**
+    /// decisions (`realized_decisions − 1`), so a run with fewer than two decisions
+    /// has no window and the metric is `None`. `None` also when no `auc_target` is
+    /// declared (the signal-AUC pass is then skipped). Unlike the point summary above,
+    /// this is an **integrated-exposure** quantity: it is computed by re-integrating
+    /// the realized dose ledger on a dense grid (the AUC pass never perturbs the
     /// reactive run), not reduced from the decision-grid signals.
     ///
-    /// This is a **planned-horizon** measure: it scores every scheduled window,
-    /// including any after a `Stop`/discontinuation — those integrate the decaying
-    /// tail of the last realized dose, so they (correctly) read as under-exposed and
-    /// off-target. It therefore uses a different decision basis from the
-    /// realized-decision point metric [`Self::pct_time_in_window`]; the two agree
-    /// when the run never discontinues (the common case, and what the bundled
-    /// example exercises).
+    /// **Scored over realized decisions only.** If the controller `Stop`s, the later
+    /// *scheduled* decisions never happen, and their dose-free, washed-out windows are
+    /// **not** counted — discontinuation is already a first-class outcome
+    /// ([`Self::discontinued`] / [`Self::time_to_discontinuation`]), so folding it in
+    /// here too would double-count one event into two metrics and silently drag the
+    /// attainment down. So this stays a clean "of the windows we actually dosed, how
+    /// many hit the exposure target", on the same realized basis as the point metric
+    /// [`Self::pct_time_in_window`]. For a run that never discontinues, realized and
+    /// scheduled decisions coincide (the common case, and what the bundled example
+    /// exercises).
     pub auc_target_attainment: Option<f64>,
+}
+
+/// `true` if any logged decision is a `Stop` that *also* issued a dose — the
+/// `[dose, Stop]` shape (`DecisionOutcome::Stop { dosed > 0 }`).
+///
+/// The realized-window signal-AUC pass (`auc_target_attainment`) relies on this
+/// being **false**: it scores only the windows between realized decisions, so a
+/// dose issued *at* a stop has no following decision to bound its window and would
+/// be silently dropped. That case is currently unreachable on the AUC path — a
+/// declarative `Stop` is dose-free, and the only controller that can dose-then-stop
+/// (the programmatic API) runs with `auc_target = None` — so the call site
+/// `debug_assert!`s on this predicate rather than handling the window. If a future
+/// change lets a dose-on-stop reach the AUC pass, the assert trips in debug/test
+/// builds instead of quietly under-reporting exposure.
+pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
+    decisions
+        .iter()
+        .any(|d| matches!(d.outcome, DecisionOutcome::Stop { dosed } if dosed > 0))
 }
 
 /// Compute the [`AdaptiveSubjectMetrics`] for one realized run from its dose
@@ -1713,6 +1734,30 @@ mod tests {
         let no_band =
             compute_subject_metrics("S", 1, 1, &ledger, &decisions, None, None, &window_aucs);
         assert_eq!(no_band.auc_target_attainment, None);
+    }
+
+    #[test]
+    fn run_has_dose_on_stop_flags_only_dose_carrying_stops() {
+        // The invariant the realized-window AUC pass relies on: no `[dose, Stop]`. A
+        // declarative `Stop` is dose-free (`dosed: 0`); a dose issued *at* a stop
+        // (`dosed > 0`, the programmatic `[Bolus, Stop]` shape) is what would strand
+        // an unscored final-dose window — the call-site `debug_assert!` trips on it.
+        let dose_free_stop = vec![
+            decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(24.0, Some(12.0), DecisionOutcome::Stop { dosed: 0 }),
+        ];
+        assert!(!run_has_dose_on_stop(&dose_free_stop));
+
+        let dose_then_stop = vec![
+            decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 }),
+            decision(24.0, Some(12.0), DecisionOutcome::Stop { dosed: 1 }),
+        ];
+        assert!(run_has_dose_on_stop(&dose_then_stop));
+
+        // No stop at all, and the empty run — both clear.
+        let no_stop = vec![decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 })];
+        assert!(!run_has_dose_on_stop(&no_stop));
+        assert!(!run_has_dose_on_stop(&[]));
     }
 
     #[test]

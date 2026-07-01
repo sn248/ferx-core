@@ -273,14 +273,16 @@ impl InputRateKind {
             // pointwise like the three above — exact `Dual2` forcing sensitivities
             // for `ka` and the pathway fraction `frac` (#505).
             InputRateKind::FirstOrder => true,
-            // Zero-order has a hard cutoff at `tad = dur`; `∂R_in/∂dur` carries a
-            // Leibniz boundary term (a dual-channel impulse at the cutoff) that the
-            // smooth pointwise `rate(tad) → Dual2` walk misses. Until that impulse
-            // is built (#530, shared with #384's modeled-duration `Dn` infusion),
-            // `dur` is differentiated by FD — so this kind is *not* lifted, and
-            // `prepare_dual` returns `None` for it (pinned by
+            // Zero-order has a hard cutoff at `tad = dur`. The *magnitude* part of
+            // `∂R_in/∂dur` is smooth (`R_in = F·amt·frac/dur`) and rides the pointwise
+            // dual, but the *boundary* part is a Leibniz impulse at the moving cutoff.
+            // The analytic ODE provider delivers the window as a per-segment constant
+            // (like an infusion) and injects the rate-off **saltation** at `tad = dur`
+            // for that boundary term (#530, the sign-mirror of estimated-lagtime's
+            // dose-start saltation) — so this kind is now lifted, and `prepare_dual`
+            // returns `Some` for it (pinned by
             // `supported_over_dual_agrees_with_prepare_dual`).
-            InputRateKind::ZeroOrder => false,
+            InputRateKind::ZeroOrder => true,
         }
     }
 }
@@ -414,9 +416,13 @@ impl InputRateForcing {
                 self.arg(params, 0, 1.0),
                 self.arg(params, 1, 1.0),
             )),
-            // Not lifted: the cutoff at `tad = dur` makes `∂/∂dur` a boundary
-            // impulse the pointwise dual walk can't carry (#530). FD fallback.
-            InputRateKind::ZeroOrder => None,
+            // Lifted (#530): the pointwise `dur` jet carries the smooth magnitude
+            // term; the analytic provider's `integrate_g` delivers the window as a
+            // per-segment constant and injects the rate-off saltation at the cutoff
+            // for the moving-boundary term. The `dur` field threads `∂/∂dur` into both.
+            InputRateKind::ZeroOrder => {
+                Some(PreparedInputRate::zero_order(self.arg(params, 0, 1.0)))
+            }
             // Lifted: a smooth `exp`-only density, exact `Dual2` like the others.
             InputRateKind::FirstOrder => {
                 Some(PreparedInputRate::first_order(self.arg(params, 0, 1.0)))
@@ -565,12 +571,12 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// the optimiser can climb back to the interior, and the converged optimum is
     /// interior so reported estimates are unaffected. `NaN` falls to the floor.
     ///
-    /// Generic over `T` for uniformity with the other constructors, but unlike
-    /// them the `dur` parameter's gradient is **not** exact here: the cutoff at
-    /// `tad = dur` ([`Self::rate`]) is a moving boundary whose `∂/∂dur` impulse the
-    /// pointwise dual walk misses, so a `zero_order()` model is gated to the FD
-    /// fallback ([`InputRateKind::supported_over_dual`] = `false`) and this is
-    /// reached only for `T = f64` (and the consistency test's `T = f64` probe).
+    /// Generic over `T` (the `sens/` `*_g<T>` convention). The pointwise `rate`
+    /// below carries the smooth *magnitude* part of `∂R_in/∂dur` via the `dur`/
+    /// `inv_dur` jets; the moving-boundary part at the `tad = dur` cutoff is supplied
+    /// separately by the analytic provider's rate-off saltation (`integrate_g`, #530),
+    /// so a `zero_order()` model is now served analytically
+    /// ([`InputRateKind::supported_over_dual`] = `true`).
     #[inline]
     fn zero_order(dur: T) -> Self {
         let dur = dur.guard_floor(Self::MIN_PARAM);
@@ -1509,12 +1515,14 @@ mod tests {
         assert!(forcing.validate(&bad).unwrap_err().contains("dur"));
     }
 
-    /// Zero-order is **not** lifted over `Dual2` (its moving-boundary `∂/∂dur` is
-    /// FD-only, #530): the gate must say so and `prepare_dual` must return `None`,
-    /// so the ODE provider keeps a `zero_order()` subject on the FD fallback.
+    /// Zero-order **is** now lifted over `Dual2` (#530): the gate says so and
+    /// `prepare_dual` returns `Some`, so the ODE provider admits a `zero_order()`
+    /// subject and `integrate_g` delivers the window with the rate-off saltation
+    /// carrying the moving-boundary `∂/∂dur`. The pointwise `dur` field carries the
+    /// smooth magnitude jet; the boundary impulse is added by the provider, not here.
     #[test]
-    fn zero_order_is_not_lifted_over_dual() {
-        assert!(!InputRateKind::ZeroOrder.supported_over_dual());
+    fn zero_order_is_lifted_over_dual() {
+        assert!(InputRateKind::ZeroOrder.supported_over_dual());
         let forcing = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::ZeroOrder,
@@ -1522,15 +1530,15 @@ mod tests {
             frac_slot: None,
         };
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
-        assert!(forcing.prepare_dual::<f64>(&params).is_none());
+        assert!(forcing.prepare_dual::<f64>(&params).is_some());
     }
 
-    /// `prepare_dual` lifts the **smooth** forcings (IG, transit, Weibull,
-    /// first-order) to a `PkNum` type (here `T = f64`), reproducing the scalar
-    /// `prepare` exactly — the `T = f64` byte-identity that lets the analytic ODE
-    /// provider evaluate them over `Dual2` without drifting from the production
-    /// predictor (#430; Weibull = Phase 2; first-order = #505). Zero-order is the
-    /// one non-lifted kind, checked separately (`zero_order_is_not_lifted_over_dual`).
+    /// `prepare_dual` lifts every forcing kind to a `PkNum` type (here `T = f64`),
+    /// reproducing the scalar `prepare` exactly — the `T = f64` byte-identity that lets
+    /// the analytic ODE provider evaluate them over `Dual2` without drifting from the
+    /// production predictor (#430; Weibull = Phase 2; first-order = #505; zero-order =
+    /// #530, with its moving-boundary term added by the provider's saltation, checked in
+    /// `zero_order_is_lifted_over_dual`).
     #[test]
     fn prepare_dual_lifts_all_kinds() {
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];

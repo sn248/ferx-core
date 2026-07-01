@@ -1134,6 +1134,72 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
+/// Features the analytic `one_cpt_transit` model does not support in its first
+/// version (#386): the exponential-tilting closed form is a constant-parameter
+/// bolus superposition, so steady-state doses, IOV, within-subject time-varying
+/// covariates, and infusion doses are rejected up front — otherwise they would
+/// silently mis-predict or hit an `unreachable!` in the superposition dispatch.
+/// `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
+/// [`assert_transit_support`], mirroring [`assert_modeled_doses_supported`].
+/// Returns the first offending feature's message, or `None` when compatible.
+pub(crate) fn check_transit_support(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    if model.pk_model != PkModel::OneCptTransit {
+        return None;
+    }
+    if model.n_kappa > 0 {
+        return Some(
+            "one_cpt_transit does not support IOV (n_kappa > 0): the transit closed form \
+             assumes constant disposition over each absorption window. Use an ODE transit \
+             model (transit() forcing in [odes]) for IOV."
+                .to_string(),
+        );
+    }
+    for subject in &population.subjects {
+        if subject.has_tv_covariates() {
+            return Some(format!(
+                "one_cpt_transit does not support within-subject time-varying covariates \
+                 (subject {}): the transit closed form assumes constant parameters over each \
+                 absorption window. Use an ODE transit model.",
+                subject.id
+            ));
+        }
+        for dose in &subject.doses {
+            if dose.ss {
+                return Some(format!(
+                    "one_cpt_transit does not support steady-state (SS) doses yet (subject \
+                     {}): the periodic-sum SS closed form is a follow-up. Use a non-SS \
+                     multiple-dose schedule, or an ODE transit model.",
+                    subject.id
+                ));
+            }
+            if dose.is_infusion() {
+                return Some(format!(
+                    "one_cpt_transit does not support infusion doses (subject {}): the transit \
+                     closed form absorbs an instantaneous bolus through the transit chain. Use \
+                     an ODE transit model for a zero-order input.",
+                    subject.id
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Panic on an unsupported `one_cpt_transit` model/data combination, for the
+/// `Vec`-returning `predict()`/`simulate()` paths (mirrors
+/// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
+pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_transit_support(model, population) {
+        panic!(
+            "predict()/simulate() received a model/data combination one_cpt_transit cannot \
+             honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
 /// Model + estimation-option *compatibility* checks that don't depend on data:
 /// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
 /// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
@@ -1245,13 +1311,19 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
-            if !matches!(m, EstimationMethod::Foce | EstimationMethod::Saem) {
+            if !matches!(
+                m,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::Saem
+                    | EstimationMethod::Imp
+            ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce and method = saem only. FOCEI, GN, and \
-                         importance-sampling paths still use diagonal residual-error derivatives.",
+                         method = foce, focei, saem, and imp only. The gn / gn_hybrid \
+                         Gauss-Newton paths still use diagonal residual-error derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -1941,6 +2013,11 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
+    // before any prediction reaches the superposition dispatch's `unreachable!` arms.
+    if let Some(e) = check_transit_support(model, population) {
+        return Err(e);
+    }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set
     // `log_transform = true` together with a proportional/combined error or a
@@ -2268,16 +2345,23 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
-        // Valid if it's a covariate, indiv param, or derived name
+        // Valid if it's a covariate, indiv param, or derived name. Synthetic
+        // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
-            || model
-                .indiv_param_names
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(col))
+            || model.indiv_param_names.iter().any(|p| {
+                !crate::parser::model_parser::is_synthetic_readout_param(p)
+                    && p.eq_ignore_ascii_case(col)
+            })
             || derived_names.iter().any(|d| d.eq_ignore_ascii_case(col));
         if !known {
             let mut candidates: Vec<&str> = cov_names.iter().map(|s| s.as_str()).collect();
-            candidates.extend(model.indiv_param_names.iter().map(|s| s.as_str()));
+            candidates.extend(
+                model
+                    .indiv_param_names
+                    .iter()
+                    .filter(|p| !crate::parser::model_parser::is_synthetic_readout_param(p))
+                    .map(|s| s.as_str()),
+            );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
             diags.push(Diagnostic::error(
@@ -2355,13 +2439,42 @@ pub fn tafd_tad_for_subject(
 // ── Step 8: post-fit extra column computation ────────────────────────────────
 
 /// Build a per-observation HashMap mapping `model.indiv_param_names` to their
-/// values from `pk`.
+/// values from `pk`. Individual parameters the parser synthesized for a direct-θ/η
+/// Form-C readout (`__ferx_ro_*`, #486) are internal — they are skipped so they never
+/// surface as a user-facing EBE / sdtab column.
 fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> HashMap<String, f64> {
     names
         .iter()
         .zip(pk_indices.iter())
+        .filter(|(name, _)| !crate::parser::model_parser::is_synthetic_readout_param(name))
         .map(|(name, &idx)| (name.clone(), pk.values[idx]))
         .collect()
+}
+
+#[cfg(test)]
+mod build_indiv_map_tests {
+    use super::*;
+    use crate::types::PkParams;
+
+    /// #486: individual parameters the parser synthesized for a direct-θ/η Form-C
+    /// readout (`__ferx_ro_*`) are internal and must never appear in the user-facing
+    /// per-observation EBE map.
+    #[test]
+    fn synthetic_readout_params_hidden_from_indiv_map() {
+        let mut pk = PkParams::default();
+        pk.values[0] = 1.5; // real CL
+        pk.values[2] = 3.0; // synthetic readout slot
+        let names = vec!["CL".to_string(), "__ferx_ro_th0".to_string()];
+        let pk_indices = vec![0usize, 2usize];
+        let map = build_indiv_map(&pk, &names, &pk_indices);
+        assert_eq!(map.len(), 1, "only the real parameter is exposed");
+        assert_eq!(map.get("CL"), Some(&1.5));
+        assert!(
+            !map.keys()
+                .any(|k| crate::parser::model_parser::is_synthetic_readout_param(k)),
+            "synthetic readout params must be hidden from the EBE map"
+        );
+    }
 }
 
 /// Trapezoid integration over (time, value) pairs.
@@ -5511,6 +5624,7 @@ pub fn simulate_with_options(
     // guard. Asserting here makes both branches fail with the same actionable
     // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
     assert_modeled_doses_supported(model, population);
+    assert_transit_support(model, population);
 
     let method = match opts.match_method {
         Some(m) => m,
@@ -5707,6 +5821,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // precondition once per call, as `predict()` does — `simulate()` runs no
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
+    assert_transit_support(model, population);
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
     // no resets / left truncation). `simulate_with_options` checks them first and
@@ -6127,18 +6242,57 @@ where
             // `auc_target` is declared (its sole consumer) and a monitor exists. It
             // re-integrates the realized ledger on its own dense grid — separate from,
             // and never perturbing, the reactive run + verifier above.
+            //
+            // Windowed over the **realized** decision times (`run.decisions`), NOT the
+            // full scheduled `decision_times`: after a `Stop` the controller
+            // discontinues and the later scheduled decisions never happen, so scoring
+            // their dose-free, washed-out windows would fold discontinuation — already
+            // a first-class outcome (`discontinued` / `time_to_discontinuation`) — into
+            // the exposure metric as silent misses (double-counting one event into two
+            // metrics). Confining to realized decisions keeps `auc_target_attainment`
+            // a clean "of the windows we dosed, how many hit target", on the same
+            // realized basis as `pct_time_in_window`. For a run that never
+            // discontinues the two decision lists are identical.
+            //
+            // Dropping the post-`Stop` windows loses no *dosed* window: a declarative
+            // `Stop` is dose-free (`adaptive_control::Controller::apply` maps it to
+            // `[DoseAction::Stop]`, never `[dose, Stop]`), so the last realized window
+            // already covers the last dose. The one controller that *can* dose-then-
+            // stop is the programmatic `Vec<DoseAction>` API, and that path runs with
+            // `auc_target = None` (the AUC pass is skipped) — so a dose issued *at* a
+            // stop never coincides with this metric. If that ever changes (a
+            // dose-on-stop reaching the AUC pass), the final dose's window would need
+            // explicit handling — the `debug_assert!` in the match arm below is the
+            // tripwire for exactly that, and `sim::adaptive::run_has_dose_on_stop` (with
+            // its unit test plus the `..._after_discontinuation` test) pins the
+            // dose-free-`Stop` invariant this relies on.
             let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
-                (Some(_), Some(mon)) => crate::ode::adaptive_window_signal_aucs(
-                    ode,
-                    &pk.values,
-                    &params.theta,
-                    &eta_slice,
-                    subject,
-                    decision_times,
-                    &run.ledger,
-                    mon.observe,
-                    mon.spec.cmt,
-                ),
+                (Some(_), Some(mon)) => {
+                    // Tripwire (see the note above): realized-window scoring is exact only
+                    // while no `Stop` carries a dose. Unreachable today; this fires in
+                    // debug/test builds if a future change ever routes a dose-on-stop here,
+                    // rather than silently under-reporting that final dose's exposure.
+                    debug_assert!(
+                        !crate::sim::adaptive::run_has_dose_on_stop(&run.decisions),
+                        "auc_target_attainment: a Stop carried a final dose (`[dose, Stop]`); \
+                         its post-stop exposure window is unscored under realized-window \
+                         scoring — the dose-free-Stop invariant no longer holds, so that \
+                         window now needs explicit handling"
+                    );
+                    let realized_decision_times: Vec<f64> =
+                        run.decisions.iter().map(|d| d.time).collect();
+                    crate::ode::adaptive_window_signal_aucs(
+                        ode,
+                        &pk.values,
+                        &params.theta,
+                        &eta_slice,
+                        subject,
+                        &realized_decision_times,
+                        &run.ledger,
+                        mon.observe,
+                        mon.spec.cmt,
+                    )
+                }
                 _ => Vec::new(),
             };
 
@@ -6412,6 +6566,7 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
+    assert_transit_support(model, population);
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
@@ -7231,8 +7386,9 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
-    // block_sigma correlated residual errors are wired into ordinary Gaussian
-    // FOCE and SAEM; every other method in the chain must be rejected up front.
+    // block_sigma correlated residual errors are wired into the Gaussian FOCE,
+    // FOCEI, SAEM, and IMP paths; the Gauss-Newton (gn / gn_hybrid) methods still
+    // use diagonal residual-error derivatives and must be rejected up front.
     #[test]
     fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
         let mut model =
@@ -7243,28 +7399,39 @@ mod iov_integration {
             rho: 0.5,
         }];
 
-        // FOCEI is rejected.
-        let opts = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, true);
+        // gn (Gauss-Newton) is rejected.
+        let opts = fast_opts(EstimationMethod::FoceGn, Optimizer::Bobyqa, true);
         let diags = super::check_model_options(&model, &opts);
         let d = diags
             .iter()
             .find(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED")
-            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for FOCEI");
-        assert!(d.is_error() && d.message.contains("method = foce") && d.message.contains("saem"));
+            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for gn");
+        assert!(d.is_error() && d.message.contains("focei") && d.message.contains("gn"));
 
-        // SAEM is accepted for the ordinary Gaussian subset.
-        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
-        assert!(!super::check_model_options(&model, &saem)
+        // gn_hybrid is likewise rejected.
+        let hybrid = fast_opts(EstimationMethod::FoceGnHybrid, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &hybrid)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-        // Plain FOCE is accepted (no block_sigma diagnostic).
-        let foce = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
-        assert!(!super::check_model_options(&model, &foce)
-            .iter()
-            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+        // FOCE, FOCEI, SAEM, and IMP are all accepted (no method diagnostic).
+        for method in [
+            EstimationMethod::Foce,
+            EstimationMethod::FoceI,
+            EstimationMethod::Saem,
+            EstimationMethod::Imp,
+        ] {
+            let opts = fast_opts(method, Optimizer::Bobyqa, false);
+            assert!(
+                !super::check_model_options(&model, &opts)
+                    .iter()
+                    .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"),
+                "block_sigma must be accepted for {method:?}"
+            );
+        }
 
         model.n_kappa = 1;
+        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
         assert!(super::check_model_options(&model, &saem)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
@@ -7417,6 +7584,98 @@ mod iov_integration {
         assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
     }
 
+    // Importance sampling must accept a correlated $SIGMA block: the weights use
+    // the dense residual covariance (obs_nll_subject_into) and the Student-t
+    // proposal precision is built from R⁻¹ (compute_posterior_hessian dense
+    // branch). A short evaluation-only run must produce a finite marginal.
+    #[test]
+    fn test_imp_accepts_block_sigma_cross_endpoint() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0) FIX
+  theta TVV(10.0, 1.0, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+        )
+        .expect("cross-endpoint block_sigma ODE model parses");
+
+        let mut subjects = Vec::new();
+        for (id, dose_amt, obs) in [
+            ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
+            ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 1.0, 2.0, 2.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 2, 1, 2],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 4],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        // No method diagnostic for IMP + block_sigma.
+        let mut opts = fast_opts(EstimationMethod::Imp, Optimizer::Bobyqa, false);
+        assert!(!super::check_model_options(&model, &opts)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+
+        // Evaluation-only marginal at the initial params (fast + deterministic).
+        opts.imp_eval_only = true;
+        opts.imp_samples = 200;
+        opts.imp_iterations = 1;
+        opts.imp_seed = Some(7);
+        let result = fit(&model, &population, &model.default_params, &opts)
+            .expect("IMP eval with cross-endpoint block_sigma should succeed");
+        assert!(result.ofv.is_finite(), "IMP block_sigma OFV must be finite");
+    }
+
     // Regression: the SAEM final OFV (computed via `2·pop_nll` with
     // `interaction = true`) must include the block_sigma cross-endpoint
     // covariance. The interaction Laplace accumulator builds R diagonally, so
@@ -7512,6 +7771,98 @@ mod iov_integration {
         assert!(
             (saem_ofv - foce_ofv).abs() < 1e-3,
             "SAEM OFV {saem_ofv} must match FOCE OFV {foce_ofv} (block_sigma correlation dropped?)"
+        );
+    }
+
+    // FOCEI with a correlated $SIGMA block must (a) evaluate to a finite OFV and
+    // (b) genuinely apply the interaction correction — i.e. differ from the FOCE
+    // (non-interaction) OFV on an f-dependent (combined) error model. Before #616
+    // the only correlated objective was the FOCE marginal, so the interaction term
+    // was unavailable (FOCEI was rejected up front). Fixed params → maxiter 0 just
+    // evaluates the OFV at the typical values, so this stays fast.
+    #[test]
+    fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+",
+        )
+        .expect("fixed-param block_sigma combined model parses");
+
+        let mut subjects = Vec::new();
+        for (id, obs) in [
+            ("1", vec![9.5, 8.0, 6.2]),
+            ("2", vec![10.5, 7.4, 5.6]),
+            ("3", vec![8.8, 7.9, 6.7]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 2.0, 4.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 3],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let eval = |method, interaction| {
+            let mut opts = fast_opts(method, Optimizer::Bobyqa, false);
+            opts.outer_maxiter = 0;
+            opts.interaction = interaction;
+            fit(&model, &population, &model.default_params, &opts)
+                .expect("block_sigma evaluation succeeds")
+                .ofv
+        };
+
+        let focei_ofv = eval(EstimationMethod::FoceI, true);
+        let foce_ofv = eval(EstimationMethod::Foce, false);
+
+        assert!(
+            focei_ofv.is_finite(),
+            "FOCEI block_sigma OFV must be finite"
+        );
+        // The interaction term (½·log|H̃| with the dense ∂R/∂η curvature) shifts
+        // the OFV away from the non-interaction marginal on a combined model.
+        assert!(
+            (focei_ofv - foce_ofv).abs() > 1e-4,
+            "FOCEI OFV {focei_ofv} must differ from FOCE OFV {foce_ofv} (interaction dropped?)"
         );
     }
 
@@ -11905,6 +12256,88 @@ mod adaptive_sim_tests {
         // band *is* declared and there *are* windows).
         spec.auc_target = Some((1e18, f64::INFINITY));
         assert_eq!(run(&spec).metrics[0].auc_target_attainment, Some(0.0));
+    }
+
+    #[test]
+    fn auc_attainment_is_scored_over_realized_windows_after_discontinuation() {
+        // Regression: under discontinuation, `auc_target_attainment` must score only
+        // the windows between REALIZED decisions, not the full scheduled horizon.
+        // After a `Stop` the later scheduled decisions never happen; counting their
+        // dose-free, washed-out windows would fold discontinuation (already reported
+        // by `discontinued` / `time_to_discontinuation`) into the exposure metric as
+        // silent misses. Here the model doses once at decision 0; the pre-dose trough
+        // then rises above the stop threshold at decision 1 → discontinue. Of the 15
+        // SCHEDULED daily decisions only 2 are realized, so there is exactly ONE
+        // realized window [0, 24] — well above the one-sided `[1, ∞)` floor ⇒
+        // attainment 1.0. The old planned-horizon behavior scored all 14 scheduled
+        // windows, the washout tail dragging attainment to ~3/14, so it fails here.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 336
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 5 : increase 25%
+  when signal > 5 : stop
+"#;
+        let parsed = parse_full_model(src).expect("parse stop block");
+        let mut spec = parsed.adaptive_dosing.clone().expect("block present");
+        // One-sided floor: every dosed window clears it; the post-stop washout windows
+        // (which the old behavior would have scored) fall below it.
+        spec.auc_target = Some((1.0, f64::INFINITY));
+
+        let pop = population(vec![subj("P", vec![342.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let res = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            &spec,
+            &opts,
+        )
+        .expect("discontinuing run");
+
+        // It actually discontinues, at the second decision (t = 24).
+        let m = &res.metrics[0];
+        assert!(m.discontinued, "run should hit the stop rule");
+        assert_eq!(m.time_to_discontinuation, Some(24.0));
+        // Only the realized decisions are logged (decision 0 dosed, decision 1
+        // stopped); the 13 later scheduled decisions never occurred.
+        assert_eq!(res.decisions.len(), 2, "only realized decisions logged");
+        // One realized dose, at t=0: the `Stop` at decision 1 is DOSE-FREE. This is
+        // the invariant that makes realized-window scoring lose no dosed window — a
+        // declarative `Stop` never carries a final dose, so there is no dose issued
+        // *at* the stop whose (dropped) post-stop window would have mattered.
+        assert_eq!(
+            res.ledger.len(),
+            1,
+            "one realized dose; the Stop dosed nothing"
+        );
+
+        // Scored over the ONE realized window [0, 24] ⇒ 1.0. (Old planned-horizon
+        // behavior: ~3 of 14 scheduled windows in band ⇒ ~0.214, so this fails on it.)
+        assert_eq!(m.auc_target_attainment, Some(1.0));
     }
 
     #[test]

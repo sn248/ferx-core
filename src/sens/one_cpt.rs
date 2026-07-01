@@ -7,6 +7,7 @@
 
 use super::dual2::Dual2;
 use super::num::PkNum;
+use crate::pk::analytical_absorption::{convolve_1cpt, TransitAbsorption};
 use crate::types::DoseEvent;
 
 // ── Generic closed-form single-dose solutions ────────────────────────────────
@@ -48,6 +49,37 @@ pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) 
     } else {
         (d * ka / (v * (ka - k))) * ((-(k * t)).exp() - (-(ka * t)).exp())
     }
+}
+
+/// 1-cpt with Savic transit-compartment absorption (`n` transit compartments,
+/// mean transit time `mtt`) — the analytic closed form of #386. Like
+/// [`one_cpt_oral_g`] this is the single exact `Dual2`-differentiable model; it
+/// routes through [`convolve_1cpt`] over a [`TransitAbsorption`] (Gamma) density,
+/// so `T = f64` gives the concentration and `T = Dual2<N>` gives exact
+/// `∂C/∂{cl,v,n,mtt,f}` (+ 2nd order). With `n = 0` it reduces to first-order oral.
+pub fn one_cpt_transit_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
+    one_cpt_transit_amt_g(T::from_f64(amt), t, cl, v, n, mtt, f_bio)
+}
+
+/// As [`one_cpt_transit_g`] but with a generic amount `amt` (issue #524 init path).
+///
+/// Domain: the exponential-tilting closed form converges only for `ke = CL/V` below
+/// the transit rate `KTR = (n+1)/mtt` (the absorption-rate-limited regime). Outside
+/// it — invalid params, or flip-flop `ke ≥ KTR` — this returns `0.0`, matching the
+/// sibling closed forms' invalid-parameter convention (penalising the optimiser back
+/// into the valid region rather than letting `convolve_1cpt` emit a NaN; `mgf`'s own
+/// `debug_assert` then never fires on this guarded path).
+pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
+        return T::from_f64(0.0);
+    }
+    let ke = cl / v;
+    let ktr = (n + T::from_f64(1.0)) / mtt;
+    if ke.val() >= ktr.val() {
+        return T::from_f64(0.0);
+    }
+    let abs = TransitAbsorption { n, mtt };
+    convolve_1cpt(&abs, t, ke, (f_bio * amt) / v)
 }
 
 /// 1-cpt infusion (zero-order input of duration `dur`, rate `rate`).
@@ -199,6 +231,24 @@ pub fn one_cpt_conc_g<T: PkNum>(
     }
 }
 
+/// Transit-absorption counterpart to [`one_cpt_conc_g`] for the analytic
+/// `one_cpt_transit` model (#386). Transit rejects infusion and SS doses at parse,
+/// so only the absorbed-bolus route exists — a thin wrapper over
+/// [`one_cpt_transit_amt_g`] with `F` baked into the kernel (no post-multiply, the
+/// `oral_bolus` branch of [`one_cpt_conc_g`]). Generic over [`PkNum`] so prediction
+/// (`T = f64`) and the `Dual2` sensitivity share one definition.
+pub fn one_cpt_transit_conc_g<T: PkNum>(
+    dose: &DoseEvent,
+    t: T,
+    cl: T,
+    v: T,
+    n: T,
+    mtt: T,
+    f_bio: T,
+) -> T {
+    one_cpt_transit_amt_g(T::from_f64(dose.amt), t, cl, v, n, mtt, f_bio)
+}
+
 // ── Sensitivity extraction (seed the active PK params as Dual2 variables) ─────
 
 /// `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for the IV bolus.
@@ -329,6 +379,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The analytic `one_cpt_transit_amt_g` wrapper (#386) seeds the *model*
+    /// parameters CL, V, N, MTT, F as dual axes and packs them into `convolve_1cpt`
+    /// (`ke = CL/V`, `KTR = (N+1)/MTT`, scale `F·amt/V`). #606 FD-checks the
+    /// `convolve_1cpt` kernel directly, but in terms of `ke` / `F·Dose/V` — so a
+    /// `CL/V → ke` slip or an `N`/`MTT` packing swap in *this* wrapper would not
+    /// show up there. This is the exact sensitivity the FOCEI provider seeds for an
+    /// estimable transit fit, so check `∂f/∂{CL,V,N,MTT,F}` (and the Hessian)
+    /// against a central difference of the f64 form. Guards the headline
+    /// "continuous (estimable) N" against a silent gradient regression.
+    #[test]
+    fn transit_amt_dual_matches_fd() {
+        // ke = CL/V = 0.10 well below KTR = (N+1)/MTT = 4/1.5 ≈ 2.67 (valid regime).
+        let (amt, t, cl, v, n, mtt, fb) = (100.0, 2.0, 1.2, 12.0, 3.0, 1.5, 0.9);
+        let d = one_cpt_transit_amt_g::<Dual2<5>>(
+            Dual2::constant(amt),
+            Dual2::constant(t),
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+            Dual2::var(n, 2),
+            Dual2::var(mtt, 3),
+            Dual2::var(fb, 4),
+        );
+        let (gfd, hfd) = fd([cl, v, n, mtt, fb], |p| {
+            one_cpt_transit_amt_g::<f64>(amt, t, p[0], p[1], p[2], p[3], p[4])
+        });
+        // A real (positive, finite) concentration, so the gradient check is non-trivial.
+        assert!(d.value > 0.0 && d.value.is_finite(), "value = {}", d.value);
+        // First order is the load-bearing check (these are the exact ∂C/∂{CL,V,N,MTT,F}
+        // the estimator seeds); assert it tightly.
+        for (g, gf) in d.grad.iter().zip(&gfd) {
+            approx::assert_relative_eq!(*g, *gf, max_relative = 2e-4, epsilon = 1e-9);
+        }
+        // Second order as a sanity check on the wrapper composition. `C` is exactly
+        // linear in `F`, so `∂²C/∂F²` is a structural 0 against which the FD reference
+        // is pure rounding noise — an absolute floor (not just a relative bound)
+        // keeps that term, and any other near-zero entry, from flaking. The exact
+        // kernel Hessian is FD-validated in #606's `convolve_1cpt_dual_gradients_match_fd`.
+        for (hrow, hfrow) in d.hess.iter().zip(&hfd) {
+            for (h, hf) in hrow.iter().zip(hfrow) {
+                approx::assert_relative_eq!(*h, *hf, max_relative = 5e-3, epsilon = 1e-4);
+            }
+        }
+    }
+
+    /// Out-of-domain / invalid params return `0.0` (the sibling closed forms'
+    /// invalid-parameter convention): bad `n`/`mtt`, and the flip-flop
+    /// `ke = CL/V ≥ KTR = (n+1)/mtt`.
+    #[test]
+    fn one_cpt_transit_amt_guards_return_zero() {
+        let z = 0.0_f64;
+        // n < 0 → invalid-param guard
+        assert_eq!(
+            one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, -0.5, 1.5, 1.0),
+            z
+        );
+        // mtt = 0 → invalid-param guard
+        assert_eq!(
+            one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, 3.0, 0.0, 1.0),
+            z
+        );
+        // ke = CL/V = 3.0 ≥ KTR = (3+1)/1.5 ≈ 2.67 → flip-flop guard
+        assert_eq!(
+            one_cpt_transit_g::<f64>(100.0, 1.0, 30.0, 10.0, 3.0, 1.5, 1.0),
+            z
+        );
     }
 
     /// Force the full `f+grad+hess` of an IV-bolus sensitivity at dual width `N`

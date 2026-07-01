@@ -157,10 +157,19 @@ fn tte_ode_nll(
 
     // Solve the augmented ODE once and read H/h at those times — shared with
     // predict_survival via `ode_cumhaz_hazard` (a missing ODE or a short solve yields
-    // NaN curves, which `tte_nll_from_curves` maps to the 1e20 sentinel). The closures
-    // look up by the same f64 values that populated `times`, so the search is exact.
+    // NaN curves, which `tte_nll_from_curves` maps to the 1e20 sentinel).
     let (cum, haz) =
         crate::survival::ode_cumhaz_hazard(model, subject, chz_state, theta, eta, &times);
+    tte_ode_nll_from_curves(records, &times, &cum, &haz)
+}
+
+/// Per-record TTE NLL from cumulative-hazard / hazard curves already sampled at
+/// `times` (sorted-unique). The lookup closures binary-search `times`, exact on the
+/// f64 values that populated it. Shared by [`tte_ode_nll`] (which solves the ODE to
+/// build `cum`/`haz`) and the #570 joint-PK-TTE inner-NLL share (which reads `H`/`h`
+/// off the Gaussian solve), so the per-record likelihood logic lives in one place.
+#[cfg(feature = "survival")]
+fn tte_ode_nll_from_curves(records: &[ObsRecord], times: &[f64], cum: &[f64], haz: &[f64]) -> f64 {
     let cumhaz_at = |t: f64| -> f64 {
         times
             .binary_search_by(|x| x.partial_cmp(&t).unwrap())
@@ -171,8 +180,149 @@ fn tte_ode_nll(
             .binary_search_by(|x| x.partial_cmp(&t).unwrap())
             .map_or(f64::NAN, |i| haz[i])
     };
-
     crate::survival::tte_nll_from_curves(records, cumhaz_at, hazard_at)
+}
+
+/// #570: a single augmented PK+CHZ integration reused for both endpoints of a joint
+/// PK-TTE subject — the scaled Gaussian predictions and the cumulative-hazard state
+/// at the TTE event/censor/entry times — so the inner NLL no longer integrates the
+/// same system a second time via `ode_cumhaz_hazard`.
+#[cfg(feature = "survival")]
+struct JointPkTteSolve {
+    /// Scaled Gaussian predictions — bit-identical to the standalone prediction path.
+    preds: Vec<f64>,
+    /// Sorted-unique union of every OdeAccumulated endpoint's record times.
+    times: Vec<f64>,
+    /// Full ODE state at each `times[i]` (NaN if before the integration start).
+    chz_states: Vec<Vec<f64>>,
+    /// PK-parameter snapshot used for the solve — reused to evaluate `h = dCHZ/dt`.
+    pk_values: Vec<f64>,
+}
+
+/// Build the shared joint PK-TTE solve, but only when it is provably equivalent to
+/// the separate Gaussian + `ode_cumhaz_hazard` solves: a plain ODE model with at
+/// least one OdeAccumulated hazard and none of the features that route the Gaussian
+/// path away from the no-TV `ode_predictions` (time-varying covariates, EVID-3/4
+/// resets, SDE diffusion, FREM pseudo-observations). Returns `None` otherwise, and the
+/// caller keeps the established two-solve path.
+#[cfg(feature = "survival")]
+fn try_joint_pktte_shared_solve(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<JointPkTteSolve> {
+    let ode = model.ode_spec.as_ref()?;
+    // The share computes the Gaussian predictions via `ode_predictions_and_chz`, i.e.
+    // the plain no-TV `ode_predictions` with a single t=0 PK snapshot. It is only
+    // equivalent when the standalone prediction path (`compute_predictions_with_tv_*`)
+    // takes that same snapshot route. Reject every case it routes elsewhere: a `TIME`
+    // built-in (`compiled_model_uses_time_builtin`) or time-varying covariates send it
+    // through the per-event `ode_predictions_event_driven` (pk/mod.rs); EVID-3/4 resets
+    // also need the event-driven walker; SDE adds EKF process noise; FREM rewrites the
+    // pseudo-observation predictions. Each keeps the established two-solve fallback.
+    if subject.obs_records.is_empty()
+        || subject.has_tv_covariates()
+        || subject.has_resets()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        || model.is_sde()
+        || subject.fremtype.iter().any(|&f| f > 0)
+    {
+        return None;
+    }
+    let is_ode_tte = |e: &EndpointLikelihood| {
+        matches!(
+            e,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { .. }
+            }
+        )
+    };
+    if !model.endpoints.values().any(is_ode_tte) {
+        return None; // nothing to share
+    }
+
+    // Union of every OdeAccumulated endpoint's record times (event / entry / interval
+    // bounds), sorted-unique — the soft sample points fed to the Gaussian solve.
+    let mut times: Vec<f64> = Vec::new();
+    for (cmt, endpoint) in &model.endpoints {
+        if !is_ode_tte(endpoint) {
+            continue;
+        }
+        for r in &subject.obs_records {
+            let ObsRecord::Event {
+                time,
+                event_type,
+                entry_time,
+                cmt: rc,
+            } = r;
+            if rc != cmt {
+                continue;
+            }
+            if *entry_time > 0.0 {
+                times.push(*entry_time);
+            }
+            match event_type {
+                EventType::IntervalCensored { left, right } => {
+                    times.push(*left);
+                    times.push(*right);
+                }
+                _ => times.push(*time),
+            }
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).expect("TTE times are finite"));
+    times.dedup();
+
+    // One augmented integration: Gaussian observable readout + CHZ at `times`.
+    // `pk_param_fn`'s 4th arg is the evaluation time (#591); the share is guarded to
+    // no-TV subjects, so a single snapshot at t=0 matches `ode_cumhaz_hazard`'s call.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let (mut preds, chz_states) =
+        crate::ode::ode_predictions_and_chz(ode, &pk.values, theta, eta, subject, &times);
+    // Apply exactly the post-processing the standalone no-TV ODE prediction path does
+    // (compute_predictions_with_tv_into_with_schedule): init impulse, [scaling], LTBS.
+    // No-op for Form-C / no-init / linear-scale models; FREM is excluded by the guard.
+    crate::pk::add_analytical_init(model, subject, theta, eta, &mut preds);
+    crate::pk::apply_scaling(model, subject, theta, eta, &mut preds);
+    crate::pk::apply_log_transform(model, &mut preds);
+
+    Some(JointPkTteSolve {
+        preds,
+        times,
+        chz_states,
+        pk_values: pk.values.to_vec(),
+    })
+}
+
+/// TTE NLL for an OdeAccumulated endpoint, reading `H`/`h` from the shared joint solve
+/// instead of integrating again. `cum = CHZ` and `haz = dCHZ/dt` are read exactly as
+/// `ode_cumhaz_hazard` does (state slot `chz_state`; the bare RHS for the derivative);
+/// the only difference is that the state came from the Gaussian solve's Hermite
+/// read-back, equal to a dedicated clamped solve to solver tolerance. A NaN state
+/// (time before the integration start, or a diverged solve) stays NaN, which
+/// `tte_nll_from_curves` maps to the `1e20` sentinel — matching `ode_cumhaz_hazard`.
+#[cfg(feature = "survival")]
+fn tte_ode_nll_from_shared(
+    ode: &crate::ode::OdeSpec,
+    share: &JointPkTteSolve,
+    chz_state: usize,
+    records: &[ObsRecord],
+) -> f64 {
+    let n = share.times.len();
+    let mut cum = vec![f64::NAN; n];
+    let mut haz = vec![f64::NAN; n];
+    let mut du = vec![0.0; ode.n_states];
+    for (i, &t) in share.times.iter().enumerate() {
+        let st = &share.chz_states[i];
+        if st.len() != ode.n_states || st.iter().any(|x| !x.is_finite()) {
+            continue;
+        }
+        cum[i] = st[chz_state];
+        (ode.rhs)(st, &share.pk_values, t, &mut du);
+        haz[i] = du[chz_state];
+    }
+    tte_ode_nll_from_curves(records, &share.times, &cum, &haz)
 }
 
 /// Dispatch a TTE endpoint's per-subject NLL on its hazard representation: the
@@ -225,9 +375,22 @@ pub fn individual_nll_into_with_schedule(
     let eta_vec = DVector::from_column_slice(eta);
     let eta_prior = eta_vec.dot(&(omega_inv * &eta_vec));
 
+    // #570: a joint PK-TTE subject otherwise integrates the augmented PK+CHZ system
+    // twice per eval (Gaussian preds, then `ode_cumhaz_hazard` for `H`/`h`). When the
+    // model qualifies, do it once: the predictions are bit-identical and CHZ is read
+    // off the same solve by Hermite interpolation. `None` ⇒ the established path.
+    #[cfg(feature = "survival")]
+    let joint_share = try_joint_pktte_shared_solve(model, subject, theta, eta);
+
     // Compute individual predictions using the caller's scratch buffer
     // for per-event PK params (only consumed on the TV-cov path; ignored
     // on the no-TV fast path).
+    #[cfg(feature = "survival")]
+    let preds = match &joint_share {
+        Some(s) => s.preds.clone(),
+        None => model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule),
+    };
+    #[cfg(not(feature = "survival"))]
     let preds = model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule);
     // For SDE models, compute per-observation EKF process-noise variance and
     // add it to the residual variance to form V_total.
@@ -319,8 +482,19 @@ pub fn individual_nll_into_with_schedule(
                 }
                 // tte_endpoint_nll returns a raw NLL; multiply by 2 to match the
                 // Gaussian data_ll convention (everything is halved at the end).
-                data_ll +=
-                    2.0 * tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta);
+                // #570: when the shared joint solve is active, an OdeAccumulated
+                // endpoint reads `H`/`h` off it instead of integrating again; every
+                // other case keeps the established per-endpoint dispatch.
+                let raw = match (joint_share.as_ref(), hazard) {
+                    (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
+                        model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
+                        s,
+                        *chz_state,
+                        &records_for_cmt,
+                    ),
+                    _ => tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta),
+                };
+                data_ll += 2.0 * raw;
             }
         }
     }
@@ -636,6 +810,17 @@ pub fn foce_subject_nll(
     interaction: bool,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
+    // #570: at the EBE mode the Gaussian `ipreds` solve and the at-mode TTE-term solve
+    // are both at `eta_hat`; when the subject qualifies, share one augmented integration
+    // (the FD-Hessian's perturbed-η TTE solves below are at different η and stay separate).
+    #[cfg(feature = "survival")]
+    let joint_share = try_joint_pktte_shared_solve(model, subject, theta, eta_hat.as_slice());
+    #[cfg(feature = "survival")]
+    let ipreds = match &joint_share {
+        Some(s) => s.preds.clone(),
+        None => model_predictions(model, subject, theta, eta_hat.as_slice()),
+    };
+    #[cfg(not(feature = "survival"))]
     let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
 
     // Per-observation custom residual magnitude (#484). η-independent, so one
@@ -690,7 +875,17 @@ pub fn foce_subject_nll(
                 let tte_fn = |eta_eval: &[f64]| -> f64 {
                     tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta_eval)
                 };
-                tte_nll_at_mode += tte_fn(eta_hat.as_slice());
+                // #570: at the mode, read H/h off the shared solve when available; the
+                // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
+                tte_nll_at_mode += match (joint_share.as_ref(), hazard) {
+                    (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
+                        model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
+                        s,
+                        *chz_state,
+                        &records_for_cmt,
+                    ),
+                    _ => tte_fn(eta_hat.as_slice()),
+                };
                 if n_eta > 0 {
                     let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
                     tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
@@ -730,29 +925,43 @@ pub fn foce_subject_nll(
     // entering the standard path as `−logΦ` terms (excluded from R̃). FOCEI still
     // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
     // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
-    // block_sigma cross-endpoint residual covariance is only carried by the
-    // non-interaction (Sheiner–Beal) path via `compute_r_matrix_with_correlations`;
-    // the interaction accumulator builds R diagonally and would silently drop the
-    // off-diagonal covariance. FOCEI + block_sigma is rejected up front
-    // (E_BLOCK_SIGMA_METHOD_UNSUPPORTED), and SAEM — which evaluates this OFV with
-    // `interaction = true` for AIC/BIC comparability — has no interaction-aware
-    // correlated objective to match, so route any correlated model through the
-    // FOCE objective instead of returning a correlation-free OFV (#557).
-    if interaction && model.residual_correlations.is_empty() {
-        foce_subject_nll_interaction(
-            subject,
-            &ipreds,
-            eta_hat,
-            h_matrix,
-            omega,
-            sigma_values,
-            &model.error_spec,
-            model.bloq_method,
-            &p_obs,
-            frem_r_override.as_deref(),
-            model.residual_error_eta,
-            ruv_mult.as_deref(),
-        )
+    // Interaction (FOCEI, and SAEM's AIC/BIC-comparable OFV which evaluates this
+    // with `interaction = true`) routes by whether the residual covariance is
+    // diagonal. A correlated (`block_sigma`) model uses the dense-R interaction
+    // marginal [`foce_subject_nll_interaction_dense`] (#616); the diagonal
+    // accumulator [`foce_subject_nll_interaction`] would silently drop the
+    // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
+    // the dense R for both cases via `compute_r_matrix_with_correlations`.
+    if interaction {
+        if model.residual_correlations.is_empty() {
+            foce_subject_nll_interaction(
+                subject,
+                &ipreds,
+                eta_hat,
+                h_matrix,
+                omega,
+                sigma_values,
+                &model.error_spec,
+                model.bloq_method,
+                &p_obs,
+                frem_r_override.as_deref(),
+                model.residual_error_eta,
+                ruv_mult.as_deref(),
+            )
+        } else {
+            foce_subject_nll_interaction_dense(
+                subject,
+                &ipreds,
+                eta_hat,
+                h_matrix,
+                omega,
+                sigma_values,
+                &model.error_spec,
+                &model.residual_correlations,
+                &p_obs,
+                ruv_mult.as_deref(),
+            )
+        }
     } else {
         // FOCE (no interaction): evaluate the residual variance R at the
         // population prediction f(η=0) — NONMEM's no-interaction semantics —
@@ -1062,6 +1271,153 @@ pub fn foce_subject_nll_interaction(
     };
 
     0.5 * (g.data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
+}
+
+/// FOCEI INTER per-subject −2·log marginal for a **correlated** (`block_sigma`)
+/// residual covariance — the dense-`R` generalisation of
+/// [`foce_subject_nll_interaction`].
+///
+/// The diagonal interaction path forms `R` one observation at a time and so
+/// silently drops the `block_sigma` off-diagonals. This path instead carries the
+/// full residual covariance `R` (from [`compute_r_matrix_with_correlations`],
+/// the same matrix the FOCE non-interaction and SAEM paths use), giving the
+/// Almquist 2015 first-order conditional Hessian
+///
+/// ```text
+///   data_ll(η̂) = rᵀ R⁻¹ r + log|R|
+///   H̃          = Hᵀ R⁻¹ H + ½·B + Ω⁻¹
+///   B_{kl}      = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l),  ∂R/∂η_k = Σ_m H[m,k]·∂R/∂f_m
+/// ```
+///
+/// where `H = ∂f/∂η` (`h_matrix`) and the per-observation `∂R/∂f_m` come from
+/// [`crate::stats::residual_error::compute_dr_df_matrices`].
+///
+/// Reduces **exactly** to [`foce_subject_nll_interaction`] when `R` is diagonal
+/// (ρ = 0): `Hᵀ diag(1/V) H = Σ_m a_m a_mᵀ/V_m` (`hrh`) and, since each `∂R/∂f_m`
+/// is then the single diagonal entry `∂V_m/∂f_m`, `R⁻¹ ∂R/∂η_k` is diagonal with
+/// entries `c̃_{m,k} = (∂V_m/∂η_k)/V_m`, so `B = c̃ᵀc̃` (`ctc`). The dispatcher
+/// keeps ρ = 0 on the diagonal path, so that function stays the bit-for-bit
+/// reference and this one runs only when correlations are present.
+///
+/// `block_sigma` is rejected up front together with M3, FREM, IOV (κ), and
+/// `iiv_on_ruv`, so none of those appear here; `p_obs` (SDE EKF process noise)
+/// inflates the `R` diagonal as an η-independent term, matching the diagonal
+/// interaction path (and excluded from `∂R/∂η`).
+#[allow(clippy::too_many_arguments)]
+pub fn foce_subject_nll_interaction_dense(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    correlations: &[ResidualCorrelation],
+    p_obs: &[f64],
+    // Per-observation custom residual magnitude (#484); `None` on the legacy path.
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> f64 {
+    let n_obs = subject.observations.len();
+    let n_eta = eta_hat.len();
+
+    // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as
+    // the data term and FOCE-standard path assemble it.
+    let mut r = match ruv_mult {
+        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+            error_spec,
+            ipreds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            error_spec,
+            ipreds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            correlations,
+        ),
+    };
+    for (j, v) in p_obs.iter().enumerate() {
+        if j < r.nrows() {
+            r[(j, j)] += *v;
+        }
+    }
+
+    let chol = match r.clone().cholesky() {
+        Some(c) => c,
+        None => return 1e20,
+    };
+    let r_inv = chol.inverse();
+
+    // data_ll = rᵀ R⁻¹ r + log|R|.
+    let residuals = DVector::from_iterator(
+        n_obs,
+        subject
+            .observations
+            .iter()
+            .zip(ipreds.iter())
+            .map(|(&y, &f)| y - f),
+    );
+    let solved = chol.solve(&residuals);
+    let data_ll = residuals.dot(&solved) + chol_log_det(&chol.l());
+
+    // First-order conditional Hessian terms.
+    // term1 = Hᵀ R⁻¹ H.
+    let term1 = h_matrix.transpose() * &r_inv * h_matrix;
+
+    // B_{kl} = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l). Build M_k = R⁻¹ ∂R/∂η_k once per η,
+    // then B_{kl} = tr(M_k M_l) = Σ_{p,q} M_k[p,q]·M_l[q,p].
+    let dr = crate::stats::residual_error::compute_dr_df_matrices(
+        error_spec,
+        ipreds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma_values,
+        correlations,
+        ruv_mult,
+    );
+    let mut m_mats: Vec<DMatrix<f64>> = Vec::with_capacity(n_eta);
+    for k in 0..n_eta {
+        let mut dr_k = DMatrix::<f64>::zeros(n_obs, n_obs);
+        for (m, dr_m) in dr.iter().enumerate() {
+            let h_mk = h_matrix[(m, k)];
+            if h_mk != 0.0 {
+                dr_k += h_mk * dr_m;
+            }
+        }
+        m_mats.push(&r_inv * dr_k);
+    }
+    let mut b = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for k in 0..n_eta {
+        for l in 0..n_eta {
+            let mut t = 0.0;
+            for p in 0..n_obs {
+                for q in 0..n_obs {
+                    t += m_mats[k][(p, q)] * m_mats[l][(q, p)];
+                }
+            }
+            b[(k, l)] = t;
+        }
+    }
+
+    let htilde = term1 + 0.5 * b + &omega.inv;
+    let log_det_htilde = match htilde.cholesky() {
+        Some(c) => chol_log_det(&c.l()),
+        None => return 1e20,
+    };
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+
+    0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde)
 }
 
 /// FOCEI NLL with both Gaussian interaction terms and a TTE Laplace correction.
@@ -2346,6 +2702,78 @@ mod tests {
         );
     }
 
+    /// The dense-`R` FOCEI interaction marginal must reduce **exactly** to the
+    /// diagonal accumulator [`foce_subject_nll_interaction`] when there is no
+    /// `block_sigma` correlation (ρ = 0), across a multi-η proportional model.
+    /// This anchors the dense generalisation against the bit-for-bit reference.
+    #[test]
+    fn dense_interaction_reduces_to_diagonal_when_uncorrelated() {
+        let subject = make_simple_subject(); // 6 obs, single proportional endpoint
+        let sigma = vec![0.2];
+        let error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let ipreds = vec![50.0, 40.0, 30.0, 45.0, 35.0, 25.0];
+        let eta_hat = DVector::from_vec(vec![0.15, -0.1]);
+        let omega =
+            OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
+        let h_matrix = DMatrix::from_row_slice(
+            6,
+            2,
+            &[
+                5.0, 1.0, //
+                4.0, 1.5, //
+                3.0, 2.0, //
+                4.5, 1.2, //
+                3.5, 1.8, //
+                2.5, 2.2,
+            ],
+        );
+
+        let diag = foce_subject_nll_interaction(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            BloqMethod::Drop,
+            &[],
+            None,
+            None,
+            None,
+        );
+        let dense = foce_subject_nll_interaction_dense(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            &[], // ρ = 0 → diagonal R, must match the reference exactly
+            &[],
+            None,
+        );
+        approx::assert_relative_eq!(dense, diag, max_relative = 1e-10);
+
+        // The #484 magnitude path (Some(mult)) with an all-ones multiplier must
+        // reproduce the bare path (modulo the documented ~1 ULP reassociation).
+        let ones_mult: Vec<Vec<f64>> = vec![vec![1.0]; 6];
+        let dense_mult = foce_subject_nll_interaction_dense(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            &[],
+            &[],
+            Some(&ones_mult),
+        );
+        approx::assert_relative_eq!(dense_mult, dense, max_relative = 1e-9);
+    }
+
     /// Regression for the FOCE+proportional fix: the residual variance must be
     /// evaluated at a supplied population prediction `f(η=0)`, not the
     /// SB-linearized `f0 = ipred − H·η̂`. When `f0` crosses zero (a nonlinear
@@ -2986,6 +3414,139 @@ mod tests {
         assert!(
             moved.is_finite() && (moved - inner).abs() > 1e-9,
             "η must move the joint NLL (inner={inner}, moved={moved})"
+        );
+
+        // #570: the shared single-solve path must agree with the dedicated two-solve
+        // path it replaces — predictions bit-identical, TTE term equal to solver
+        // tolerance. Use a non-zero η so the PK trajectory (and thus the hazard) is
+        // non-trivial. This is what makes the fast coverage of the share *meaningful*
+        // rather than merely "finite".
+        let eta_nz = [0.3_f64];
+        let share = try_joint_pktte_shared_solve(&model, &subject, &p.theta, &eta_nz)
+            .expect("joint ODE PK-TTE model must qualify for the #570 shared solve");
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let preds_ref = crate::pk::compute_predictions_with_tv_into_with_schedule(
+            &model,
+            &subject,
+            &p.theta,
+            &eta_nz,
+            &mut scratch,
+            None,
+        );
+        assert_eq!(
+            share.preds, preds_ref,
+            "shared preds must be bit-identical to the standalone prediction path"
+        );
+        let (chz_state, hazard) = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+            }) => (*chz_state, h),
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+        let shared_tte = tte_ode_nll_from_shared(
+            model.ode_spec.as_ref().unwrap(),
+            &share,
+            chz_state,
+            &subject.obs_records,
+        );
+        let dedicated_tte = tte_endpoint_nll(
+            &model,
+            &subject,
+            hazard,
+            &subject.obs_records,
+            &p.theta,
+            &eta_nz,
+        );
+        assert!(
+            (shared_tte - dedicated_tte).abs() <= 1e-4 * dedicated_tte.abs().max(1.0),
+            "shared TTE NLL {shared_tte} must match dedicated {dedicated_tte} to solver tol"
+        );
+    }
+
+    /// #570 guard regression (found by an independent review of #613): a joint PK-TTE
+    /// model whose `[individual_parameters]` references the `TIME` built-in must NOT
+    /// take the shared single-solve path. The standalone prediction path routes such a
+    /// model through the per-event, TIME-resolved `ode_predictions_event_driven`
+    /// (`pk/mod.rs`), so the share's single t=0 PK snapshot would be silently wrong
+    /// (~30–50% off on a time-switching parameter — no error, no NaN, just a wrong
+    /// OFV). The guard must return `None` so the established two-solve path runs.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn joint_pktte_share_rejects_time_builtin_model() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        // Same joint PK-TTE shape as `joint_pktte_ode_hazard_nll_paths_finite`, but CL
+        // switches on TIME, so the prediction path is genuinely time-dependent.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  STEP = if (TIME > 3) 1 else 0
+  CL   = TVCL * (1 + STEP) * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(src).expect("TIME-using joint PK-TTE model must parse");
+        // Sanity: the fixture really does trip the TIME built-in detector.
+        assert!(
+            crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
+            "fixture must use the TIME built-in"
+        );
+        let mut subject = make_simple_subject();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let p = &model.default_params;
+
+        // The guard must reject the share → established two-solve fallback.
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_none(),
+            "a TIME-using joint PK-TTE model must not take the #570 shared-solve path"
+        );
+        // The fallback still yields a finite NLL (and η still moves it).
+        let nll = individual_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &[0.0],
+            &p.omega,
+            &p.sigma.values,
+        );
+        let moved = individual_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &[0.3],
+            &p.omega,
+            &p.sigma.values,
+        );
+        assert!(
+            nll.is_finite() && moved.is_finite() && (nll - moved).abs() > 1e-9,
+            "fallback joint NLL must be finite and η-sensitive (nll={nll}, moved={moved})"
         );
     }
 }

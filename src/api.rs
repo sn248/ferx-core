@@ -3232,7 +3232,7 @@ fn fit_inner(
     // user setting; non-LTBS models are untouched (same `options` reference).
     let ltbs_opts;
     let options = {
-        let eff = options.effective_inner_tol(model.log_transform);
+        let eff = options.effective_inner_tol(model.uses_closed_form_ltbs_inner());
         if eff < options.inner_tol {
             ltbs_opts = FitOptions {
                 inner_tol: eff,

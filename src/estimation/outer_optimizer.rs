@@ -3308,7 +3308,7 @@ pub(crate) fn compute_covariance(
     // far more sensitive to EBE precision than the fit, so LTBS tightens it by default
     // (the `g = ln(f)` Hessian needs it) and any model can opt in. Defaults to
     // `inner_tol` for non-LTBS (byte-identical). See `FitOptions::effective_cov_inner_tol`.
-    let cov_inner_tol = options.effective_cov_inner_tol(model.log_transform);
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
     let reconverge_point = |xv: &[f64]| -> (
         ModelParameters,
         Vec<DVector<f64>>,

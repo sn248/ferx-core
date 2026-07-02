@@ -57,10 +57,12 @@ impl GradientMethodKind {
 /// Coarse model-level mirror of the per-subject route in
 /// [`estimation::inner_optimizer::resolve_gradient_method`]: the analytic `Dual2`
 /// gradient runs when the model has an analytical PK path (`tv_fn` populated —
-/// ODE models have none) and is in the provider's scope (not LTBS / SDE;
-/// η-dependent `ExpressionScale` is now served via the inner quotient rule), and
-/// the user did not force `gradient_method = Fd`. Otherwise FD. (The exact
-/// per-subject split is reported by `gradient_route_summary`.)
+/// ODE models have none) and is in the provider's scope (not SDE; plain LTBS is
+/// served, but LTBS + η-dependent `ExpressionScale` is not), and the user did not
+/// force `gradient_method = Fd`. Otherwise FD. This is best-case, model-level:
+/// per-subject fallbacks — including **TV-cov + LTBS**, where the event-driven
+/// inner walk declines LTBS so every such subject actually runs FD — are reported
+/// by `gradient_route_summary` (banner) and `fd_fallback_warning`.
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
     // Report off the *same* model-level predicates `find_ebe` / `find_ebe_iov` consult, so
     // the two can't diverge as scope grows (PR #381 review #9). Per-subject FD fallbacks

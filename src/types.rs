@@ -2798,6 +2798,16 @@ impl CompiledModel {
         self.diffusion_theta_start.is_some()
     }
 
+    /// True for the **closed-form, non-IOV LTBS** path — the only path that runs the
+    /// analytic `g = ln(f)` *inner* EBE gradient whose ~1e-9 provider-vs-predictor
+    /// gap makes the covariance step tolerance-sensitive (PR #665). ODE-LTBS shares
+    /// `solve_ode_g` with the objective (no gap) and LTBS + IOV routes the inner loop
+    /// to FD, so neither needs the tightened fit/covariance tolerances. Used by
+    /// [`FitOptions::effective_inner_tol`] / [`FitOptions::effective_cov_inner_tol`].
+    pub fn uses_closed_form_ltbs_inner(&self) -> bool {
+        self.log_transform && self.ode_spec.is_none() && self.n_kappa == 0
+    }
+
     /// Returns true when the model has a time-to-event (`[event_model]`)
     /// endpoint. The analytical single-snapshot AD kernel computes the
     /// PK-observation NLL, not the hazard/survival likelihood, so its
@@ -4877,24 +4887,28 @@ impl FitOptions {
         }
     }
 
-    /// Covariance-step inner EBE-reconvergence tolerance that **LTBS** models tighten
-    /// to when `cov_inner_tol` is unset. The covariance R-matrix reconverges EBEs
-    /// under the `g = ln(f)` wrap, which amplifies a loosely-converged EBE into the
-    /// Hessian and inflates the standard errors (empirically ~65% on warfarin θ SEs
-    /// at the `1e-5` default; correct at `≤ 1e-8`). This is applied **only for LTBS**:
-    /// blanket-tightening the covariance step for every model over-converges some
-    /// ill-conditioned inner Hessians (e.g. IOV block-Ω) into an indefinite
-    /// covariance, which is why the fit default stays loose. Set `cov_inner_tol`
-    /// explicitly to opt a non-LTBS model in (e.g. the #654 M3 + IOV case).
+    /// Covariance-step inner EBE-reconvergence tolerance that **closed-form,
+    /// non-IOV LTBS** models tighten to when `cov_inner_tol` is unset. The
+    /// covariance R-matrix reconverges EBEs under the `g = ln(f)` wrap, which
+    /// amplifies a loosely-converged EBE into the Hessian and inflates the standard
+    /// errors (empirically ~65% on warfarin θ SEs at the `1e-5` default; correct at
+    /// `≤ 1e-8`). This is applied **only for the closed-form, non-IOV LTBS** path
+    /// that actually runs the analytic `ln(f)` inner gradient: blanket-tightening the
+    /// covariance step over-converges some ill-conditioned inner Hessians (e.g. IOV
+    /// block-Ω) into an indefinite covariance, and ODE-LTBS shares `solve_ode_g` so
+    /// it has no such gap. Set `cov_inner_tol` explicitly to opt any other model in
+    /// (e.g. the #654 M3 + IOV case).
     pub const LTBS_COV_INNER_TOL: f64 = 1e-8;
 
-    /// Effective inner EBE-reconvergence tolerance for the covariance step:
-    /// an explicit `cov_inner_tol` when set; otherwise the fit's `inner_tol`,
-    /// tightened to at most [`LTBS_COV_INNER_TOL`](Self::LTBS_COV_INNER_TOL) for LTBS
-    /// models (non-LTBS models keep `inner_tol`, so their SEs are byte-identical).
-    pub fn effective_cov_inner_tol(&self, log_transform: bool) -> f64 {
+    /// Effective inner EBE-reconvergence tolerance for the covariance step: an
+    /// explicit `cov_inner_tol` when set; otherwise the fit's `inner_tol`, tightened
+    /// to at most [`LTBS_COV_INNER_TOL`](Self::LTBS_COV_INNER_TOL) only when
+    /// `ltbs_closed_form` (the closed-form, non-IOV LTBS path — see
+    /// [`CompiledModel::uses_closed_form_ltbs_inner`]). Every other model keeps
+    /// `inner_tol`, so its SEs are byte-identical.
+    pub fn effective_cov_inner_tol(&self, ltbs_closed_form: bool) -> f64 {
         self.cov_inner_tol.unwrap_or_else(|| {
-            if log_transform {
+            if ltbs_closed_form {
                 self.inner_tol.min(Self::LTBS_COV_INNER_TOL)
             } else {
                 self.inner_tol
@@ -4902,22 +4916,27 @@ impl FitOptions {
         })
     }
 
-    /// Ceiling the fit's inner EBE tolerance is tightened to for **LTBS** models.
-    /// The analytic `g = ln(f)` inner gradient makes the marginal surface slightly
-    /// noisier (the ~1e-9 provider-vs-`compute_predictions` gap), so at the loose
-    /// default the outer optimiser lands nondeterministically on flat Ω directions
-    /// and the standard errors of weakly-identified variances become process-
-    /// dependent. Converging the fit's inner loop to at least `1e-6` pins the flat
-    /// directions; the covariance step then reconverges tighter still
-    /// ([`effective_cov_inner_tol`](Self::effective_cov_inner_tol)).
+    /// Ceiling the fit's inner EBE tolerance is tightened to for **closed-form,
+    /// non-IOV LTBS** models. That path's analytic `g = ln(f)` inner gradient makes
+    /// the marginal surface slightly noisier (the ~1e-9 provider-vs-
+    /// `compute_predictions` gap), so at the loose default the outer optimiser lands
+    /// nondeterministically on flat Ω directions and the standard errors of
+    /// weakly-identified variances become process-dependent. Converging the fit's
+    /// inner loop to at least `1e-6` pins the flat directions; the covariance step
+    /// then reconverges tighter still ([`effective_cov_inner_tol`](Self::effective_cov_inner_tol)).
+    /// ODE-LTBS (shares `solve_ode_g`, no gap) and LTBS + IOV (FD inner) do not need
+    /// this and are left at `inner_tol`.
     pub const LTBS_FIT_INNER_TOL: f64 = 1e-6;
 
     /// Effective **fit** inner EBE tolerance for this model: the fit's `inner_tol`,
-    /// tightened to at most [`LTBS_FIT_INNER_TOL`](Self::LTBS_FIT_INNER_TOL) for LTBS
-    /// models (so their covariance SEs are reproducible). A fit already tighter keeps
-    /// its own tolerance; non-LTBS models are unaffected.
-    pub fn effective_inner_tol(&self, log_transform: bool) -> f64 {
-        if log_transform {
+    /// tightened to at most [`LTBS_FIT_INNER_TOL`](Self::LTBS_FIT_INNER_TOL) for the
+    /// closed-form, non-IOV LTBS path (`ltbs_closed_form`) **unless the user set
+    /// `inner_tol` explicitly** — an explicit tolerance (e.g. the documented
+    /// accuracy-for-speed `inner_tol = 1e-4`) is always honoured. A fit already
+    /// tighter than the ceiling keeps its own value; every other model is unaffected.
+    pub fn effective_inner_tol(&self, ltbs_closed_form: bool) -> f64 {
+        let user_set_inner_tol = self.user_set_keys.iter().any(|k| k == "inner_tol");
+        if ltbs_closed_form && !user_set_inner_tol {
             self.inner_tol.min(Self::LTBS_FIT_INNER_TOL)
         } else {
             self.inner_tol
@@ -5470,20 +5489,25 @@ mod tests {
         assert_relative_eq!(o.effective_cov_inner_tol(true), 1e-5);
     }
 
-    /// `effective_inner_tol` tightens the fit's inner tolerance to at most 1e-6 for
-    /// LTBS models (reproducible flat-direction SEs), leaves non-LTBS untouched, and
-    /// never loosens an already-tighter setting.
+    /// `effective_inner_tol` tightens the fit's inner tolerance to at most 1e-6 for the
+    /// closed-form non-IOV LTBS path (reproducible flat-direction SEs), leaves other
+    /// models untouched, never loosens an already-tighter setting, and — crucially —
+    /// honours an explicit user `inner_tol` (`user_set_keys`).
     #[test]
     fn effective_inner_tol_ltbs() {
         let mut o = FitOptions::default();
         o.inner_tol = 1e-5;
-        // Non-LTBS: unchanged.
+        // Non-(closed-form LTBS): unchanged.
         assert_relative_eq!(o.effective_inner_tol(false), 1e-5);
-        // LTBS: tightened to the 1e-6 ceiling.
+        // Closed-form LTBS with the default inner_tol: tightened to the 1e-6 ceiling.
         assert_relative_eq!(o.effective_inner_tol(true), 1e-6);
         // A fit already tighter than 1e-6 is kept.
         o.inner_tol = 1e-8;
         assert_relative_eq!(o.effective_inner_tol(true), 1e-8);
+        // An EXPLICIT user inner_tol (even looser) is honoured, not overridden (#665 review).
+        o.inner_tol = 1e-4;
+        o.user_set_keys.push("inner_tol".to_string());
+        assert_relative_eq!(o.effective_inner_tol(true), 1e-4);
     }
 
     /// Transit (`OneCptTransit`) descriptors: canonical name, the analytic 2-state

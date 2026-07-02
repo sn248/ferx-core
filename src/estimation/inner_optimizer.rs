@@ -1361,9 +1361,11 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         // Correlated residual error (`block_sigma`) is now served analytically by the
         // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
         // longer a bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
-        // Custom residual-error magnitude (#484): the magnitude's θ-dependence is
-        // not in the analytic kernels yet — route to FD (which is magnitude-aware).
-        || model.has_custom_ruv_magnitude()
+        // Custom residual-error magnitude (#484) alone stays analytic (#576/#486 —
+        // `residual_inner_obs` threads the η-independent per-obs multiplier). Only the
+        // *combination* with a correlated residual bails: the dense-R inner kernel does
+        // not carry the magnitude's θ-dependence, so route it to FD (magnitude-aware).
+        || (model.has_custom_ruv_magnitude() && !model.residual_correlations.is_empty())
         // `iiv_on_ruv`: residual-η is served analytically on both loops for the
         // closed-form path — plain (#474), IOV (#4b), and M3-BLOQ (#4c) — and for the ODE
         // path including the M3 + IOV triple (#486); the scaling and the censored/quantified
@@ -1449,12 +1451,12 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
             || model.is_sde()
             // Correlated residual (`block_sigma`, #627) now served analytically: the
             // dense-R inner gradient reuses the Dual1 walk's per-obs `∂f/∂η`, so no bail.
-            // Custom residual-error magnitude (#484): the magnitude's θ-dependence
-            // is not in the light Dual1 ODE kernel either, so the analytic inner
-            // gradient would omit the per-observation multiplier and mismatch the
-            // magnitude-aware objective — route to FD (which is magnitude-aware),
-            // matching the closed-form path's `analytic_inner_common_bail`.
-            || model.has_custom_ruv_magnitude()
+            // Custom residual-error magnitude (#484) alone stays analytic (#576/#486 —
+            // `residual_inner_obs` threads the η-independent per-obs multiplier through
+            // both the closed-form and Dual1 ODE inner paths). Only the *combination*
+            // with a correlated residual bails: the dense-R inner kernel does not carry
+            // the magnitude's θ-dependence — matching `analytic_inner_common_bail`.
+            || (model.has_custom_ruv_magnitude() && !model.residual_correlations.is_empty())
             || model.iiv_on_ruv_forces_fd()
         {
             return false;

@@ -397,12 +397,16 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
         // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with `iiv_on_ruv`
         // (whose residual-eta `c̃`-column coupling `d/R` would need its own direct-θ
         // chain, not yet assembled — see `prepare_stacked`), still routes to FD.
+        // Also combined with a **correlated** residual (`block_sigma`, #627): the dense
+        // assembly does not thread the magnitude's direct-θ channel, so the orthogonal
+        // combination stays on FD even though each is analytic on its own.
         // (An M3-censored row's `−logΦ(z)` direct-θ chain is a *per-subject* gap
         // `prepare_stacked` bails at runtime — see its own doc — not a model-level
         // one, so it is not gated here.)
         && (!model.has_custom_ruv_magnitude()
             || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
-                && model.residual_error_eta.is_none()))
+                && model.residual_error_eta.is_none()
+                && model.residual_correlations.is_empty()))
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))

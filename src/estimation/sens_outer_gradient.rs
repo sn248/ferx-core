@@ -1965,9 +1965,9 @@ pub fn subject_packed_gradient_foce(
             Some((rv, dv, _)) => (rv[j], dv[j]),
             None => {
                 let r = match mult_row {
-                    Some(mm) => {
-                        model.error_spec.variance_at_scaled(cmt, f0act, sigma, &[], mm)
-                    }
+                    Some(mm) => model
+                        .error_spec
+                        .variance_at_scaled(cmt, f0act, sigma, &[], mm),
                     None => model.error_spec.variance_at(cmt, f0act, sigma),
                 };
                 let d = match mult_row {

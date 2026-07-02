@@ -299,7 +299,7 @@ mod tests {
     /// plain LTBS. Guards the `hmc.rs` ↔ `analytic_eta_nll_gradient` contract against a
     /// silent regression as the provider's scope changes.
     #[test]
-    fn hmc_engages_for_expression_scale_and_declines_under_ltbs() {
+    fn hmc_engages_for_expression_scale_and_ltbs() {
         use crate::parser::model_parser::parse_model_string;
         use rand::rngs::StdRng;
         use rand::SeedableRng;
@@ -332,15 +332,17 @@ mod tests {
             "closed-form ExpressionScale must take the gradient-based HMC path (#486)"
         );
 
-        // LTBS + ExpressionScale: no consistent analytic gradient → MH fallback (`None`).
+        // LTBS + ExpressionScale now has a consistent analytic inner gradient (Tier-1
+        // follow-up to #665 — the η-quotient then the `ln f` jet), so HMC takes the
+        // gradient-based path instead of falling back to MH.
         model.log_transform = true;
         let mut rng = StdRng::seed_from_u64(1);
         let stepped_ltbs = hmc_step(
             &subject, &eta, nll, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
         );
         assert!(
-            stepped_ltbs.is_none(),
-            "LTBS + ExpressionScale must decline HMC and fall back to MH"
+            stepped_ltbs.is_some(),
+            "LTBS + ExpressionScale now takes the gradient-based HMC path"
         );
     }
 

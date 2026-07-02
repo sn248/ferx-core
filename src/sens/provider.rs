@@ -541,18 +541,15 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
         // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
         // now carries via a `Dual1`-differentiated direct-θ channel — bounded by the
         // same `Dual1<M>` dispatch table `ScaleDerivProgram`/`ExpressionScale` uses
-        // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with `iiv_on_ruv`
-        // (whose residual-eta `c̃`-column coupling `d/R` would need its own direct-θ
-        // chain, not yet assembled — see `prepare_stacked`), still routes to FD.
-        // Also combined with a **correlated** residual (`block_sigma`, #627): the dense
-        // assembly does not thread the magnitude's direct-θ channel, so the orthogonal
-        // combination stays on FD even though each is analytic on its own.
-        // (An M3-censored row's `−logΦ(z)` direct-θ chain is a *per-subject* gap
-        // `prepare_stacked` bails at runtime — see its own doc — not a model-level
-        // one, so it is not gated here.)
+        // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with a **correlated**
+        // residual (`block_sigma`, #627 — the dense assembly does not thread the
+        // magnitude's direct-θ channel), still routes to FD. `iiv_on_ruv` is now analytic
+        // combined with the magnitude (the residual-eta `c̃`-column coupling `d/R` gets its
+        // direct-θ terms in `theta_block`). (An M3-censored row's `−logΦ(z)` direct-θ chain
+        // is threaded per-subject too now; where it can't be — a subject with censored rows
+        // under the FOCEI magnitude path — `prepare_stacked` bails at runtime, not here.)
         && (!model.has_custom_ruv_magnitude()
             || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
-                && model.residual_error_eta.is_none()
                 && model.residual_correlations.is_empty()))
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
@@ -2586,16 +2583,11 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
         return None;
     }
-    // LTBS is served on the OUTER TV-cov gradient (`subject_sensitivities_tvcov` applies the
-    // post-walk `ln f`), but the TV-cov *inner* EBE gradient stays on finite differences for
-    // LTBS. Plain closed-form LTBS now takes the analytic inner gradient (with the covariance
-    // step reconverging at the tighter `cov_inner_tol`), but that validation does not cover
-    // the TV-cov event-driven inner walk, so this path stays on FD. Since `log_transform` is
-    // no longer a model-level `analytic_inner_common_bail`, this guard is now the active gate
-    // that routes TV-cov LTBS subjects to the FD inner (#486 / PR #665).
-    if model.log_transform {
-        return None;
-    }
+    // LTBS on the TV-cov inner walk is now analytic (#665 follow-up): the `g = ln(f)` jet
+    // is applied LAST below (after the init impulse and scale quotient), mirroring the outer
+    // TV-cov path (`subject_sensitivities_tvcov` → `apply_ltbs_transform_outer`). Reproduces
+    // production's scale-then-log order; the covariance step reconverges these EBEs at the
+    // tighter `cov_inner_tol` (closed-form non-IOV LTBS), so the SEs stay clean.
     // Analytic Form C readout (#650): served analytically on the event-walk when it
     // fits the structural `PkDual` slots (matches the outer gate); otherwise FD.
     if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {
@@ -2665,6 +2657,9 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     // of the outer path, matching the static inner path (#486). Subject-static scale from
     // `pk`/`∂p/∂η` at `t = 0`, applied to every observation (shared helper).
     apply_event_walk_expression_scale_inner(&mut out, model, subject, prog, theta, eta)?;
+    // LTBS `g = ln(f)` LAST — after the init impulse and scale quotient — mirroring the
+    // outer TV-cov path (#665 follow-up). Shared inner helper; no-op when not LTBS.
+    apply_ltbs_transform_inner(&mut out, model.log_transform);
     Some(out)
 }
 
@@ -3003,17 +2998,13 @@ fn subject_eta_grad_impl(
     // `apply_expression_scale`. `scaling_supported` (checked inside
     // `analytical_supported`) already bounded the scale program to the dispatch table.
     //
-    // EXCEPT LTBS + η-dependent `ExpressionScale`: route that combination to the FD inner
-    // Jacobian (#534 review #5). Plain LTBS (no scale, or constant `ScalarScale`) now takes
-    // the analytic inner gradient — the `g = ln(f)` jet below is exact and the covariance
-    // step reconverges its EBEs at the tighter `cov_inner_tol`, so the ~1e-9 provider-vs-
-    // `compute_predictions` offset no longer corrupts the Hessian. But the analytic
-    // scale+log Jacobian for the η-dependent-scale combination is not covered by that
-    // validation, so keep it on FD (matches the ODE path's `!log_transform` gate for
-    // `ExpressionScale`). The analytic *outer* gradient still serves LTBS + `ExpressionScale`.
-    if model.log_transform && matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
-        return None;
-    }
+    // LTBS + η-dependent `ExpressionScale` is now analytic on the inner loop too (#665
+    // follow-up): the `ExpressionScale` η-quotient is applied below, then the `g = ln(f)`
+    // jet LAST — reproducing production's scale-then-log order `ln(f/s)`, mirroring the
+    // outer path (`apply_expression_scale_outer` → `apply_ltbs_transform_outer`). The
+    // covariance step reconverges these EBEs at the tighter `cov_inner_tol` (LTBS is a
+    // closed-form non-IOV path here), so the ~1e-9 provider-vs-`compute_predictions`
+    // offset does not corrupt the Hessian.
 
     let n_eta = model.n_eta;
     let oral = matches!(
@@ -3138,27 +3129,9 @@ fn subject_eta_grad_impl(
             n_eta,
         );
     }
-    // LTBS: `g = ln(f)`, so `∂g/∂η = ∂f/∂η / f`. Applied after scaling. The value
-    // half goes through the shared `pk::ltbs_log_g` — the same floor-then-log the f64
-    // predictor and the ODE dual walk use — so the analytical gradient can't silently
-    // drift from production either (#451 review #5). The gradient still keys on the
-    // strict `> LTBS_FLOOR` boundary: below the floor the transform clamps to a
-    // constant, so the gradient vanishes.
-    if model.log_transform {
-        for o in out.iter_mut() {
-            if o.f > crate::pk::LTBS_FLOOR {
-                let inv = 1.0 / o.f;
-                for g in o.df_deta.iter_mut() {
-                    *g *= inv;
-                }
-            } else {
-                for g in o.df_deta.iter_mut() {
-                    *g = 0.0;
-                }
-            }
-            o.f = crate::pk::ltbs_log_g(o.f);
-        }
-    }
+    // LTBS: `g = ln(f)`, applied LAST (after any scale quotient) via the shared inner
+    // helper — same floor-then-log as the f64 predictor / ODE dual walk (#451 review #5).
+    apply_ltbs_transform_inner(&mut out, model.log_transform);
     Some(out)
 }
 
@@ -4337,6 +4310,32 @@ fn apply_ltbs_transform_outer(sens: &mut SubjectSens, log_transform: bool) {
     }
 }
 
+/// Inner (η-gradient) counterpart of [`apply_ltbs_transform_outer`]: applies the
+/// `g = ln(f)` jet to a `Dual1` inner gradient in place — `∂g/∂η = ∂f/∂η / f`, with the
+/// same floor-then-log as the f64 predictor (`pk::ltbs_log_g`). Below `LTBS_FLOOR` the
+/// transform clamps to a constant so the gradient vanishes. Applied LAST, after any scale
+/// quotient (so `g = ln(f/s)` matches production's scale-then-log order). Shared by the
+/// plain (`subject_eta_grad_impl`) and TV-cov (`subject_eta_grad_tvcov_with_schedule`)
+/// inner paths; a no-op when `log_transform` is false.
+fn apply_ltbs_transform_inner(out: &mut [ObsGrad], log_transform: bool) {
+    if !log_transform {
+        return;
+    }
+    for o in out.iter_mut() {
+        if o.f > crate::pk::LTBS_FLOOR {
+            let inv = 1.0 / o.f;
+            for g in o.df_deta.iter_mut() {
+                *g *= inv;
+            }
+        } else {
+            for g in o.df_deta.iter_mut() {
+                *g = 0.0;
+            }
+        }
+        o.f = crate::pk::ltbs_log_g(o.f);
+    }
+}
+
 /// Per-observation value/grad/Hessian chain at a right-sized dual width `N`
 /// (= number of differentiated PK parameters). `seed_dim[s]` is the compact dual
 /// axis for PK slot `s` (`None` = constant); `pd` rows are in compact-axis order,
@@ -5414,16 +5413,22 @@ mod tests {
             );
             // Outer analytic vs FD of the log-scale production predictor.
             check_full_provider_vs_fd(m, s, theta, eta);
-            // The full outer provider is served; the light inner provider declines
-            // LTBS (inner EBE gradient stays FD for covariance stability).
-            assert!(
-                subject_sensitivities(m, s, theta, eta).is_some(),
-                "outer TIME + LTBS analytic"
-            );
-            assert!(
-                subject_eta_grad(m, s, theta, eta).is_none(),
-                "inner TIME + LTBS must route to FD"
-            );
+            // Inner TIME + LTBS is now analytic too (Tier-1 follow-up — the event-driven
+            // walk applies the `ln f` jet): inner η-gradient must equal the outer η-block.
+            let full = subject_sensitivities(m, s, theta, eta).expect("outer");
+            let light = subject_eta_grad(m, s, theta, eta).expect("inner TIME + LTBS");
+            assert_eq!(full.obs.len(), light.len());
+            for (fo, lo) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+                for k in 0..m.n_eta {
+                    approx::assert_relative_eq!(
+                        fo.df_deta[k],
+                        lo.df_deta[k],
+                        max_relative = 1e-10,
+                        epsilon = 1e-12
+                    );
+                }
+            }
         }
     }
 
@@ -7926,16 +7931,23 @@ mod tests {
             );
             // Outer analytic vs FD of the log-scale production predictor.
             check_full_provider_vs_fd(&model, &subject, &theta, &eta);
-            // The full outer provider is served; the light inner provider declines LTBS
-            // (inner EBE gradient stays FD for covariance stability).
-            assert!(
-                subject_sensitivities(&model, &subject, &theta, &eta).is_some(),
-                "outer LTBS + TV-cov analytic"
-            );
-            assert!(
-                subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
-                "inner LTBS + TV-cov must route to FD"
-            );
+            // Inner LTBS + TV-cov is now analytic too (Tier-1 follow-up): the light inner
+            // provider's η-gradient must equal the full outer provider's df_deta η-block.
+            let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+            let light =
+                subject_eta_grad(&model, &subject, &theta, &eta).expect("inner LTBS + TV-cov");
+            assert_eq!(full.obs.len(), light.len());
+            for (fo, lo) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+                for k in 0..model.n_eta {
+                    approx::assert_relative_eq!(
+                        fo.df_deta[k],
+                        lo.df_deta[k],
+                        max_relative = 1e-10,
+                        epsilon = 1e-12
+                    );
+                }
+            }
         }
     }
 
@@ -8363,36 +8375,44 @@ mod tests {
         }
     }
 
-    /// LTBS combined with an η-dependent `ExpressionScale` routes the **inner** gradient to
-    /// FD (#534 review #5): the analytic outer still serves it, but the light provider
-    /// declines so the covariance H-matrix Jacobian (`subject_eta_jacobian`, gated only on
-    /// `Some`/`None`) isn't built from an analytic scale+log jet paired with the
-    /// FD-converged LTBS EBE. Matches the ODE path's `!log_transform` gate for scaling.
+    /// LTBS combined with an η-dependent `ExpressionScale obs_scale` now takes the analytic
+    /// **inner** gradient too (Tier-1 follow-up to #665): the η-quotient is applied, then the
+    /// `g = ln(f)` jet LAST (reproducing `ln(f/s)`), so the inner η-gradient must equal the
+    /// full outer provider's `df_deta` η-block.
     #[test]
-    fn ltbs_plus_expression_scale_inner_falls_back_to_fd() {
+    fn ltbs_plus_expression_scale_inner_matches_outer() {
         let src = WARFARIN.replace(
             "[error_model]\n  DV ~ proportional(PROP_ERR)",
-            "[error_model]\n  DV ~ proportional(PROP_ERR)\n[scaling]\n  obs_scale = 1000 / V",
+            "[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  log(DV) ~ additive(PROP_ERR)",
         );
-        let mut model = parse_model_string(&src).expect("parse");
-        model.log_transform = true;
+        let model = parse_model_string(&src).expect("parse");
+        assert!(model.log_transform, "fixture must be LTBS");
+        assert!(
+            matches!(model.scaling, ScalingSpec::ExpressionScale { .. }),
+            "fixture must carry an η-dependent ExpressionScale obs_scale"
+        );
         let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
         let theta = [0.2, 10.0, 1.5];
         let eta = [0.15, -0.10, 0.25];
-        // Inner declines → FD H-matrix, matching the model-level gate.
         assert!(
-            subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
-            "LTBS + ExpressionScale inner gradient must fall back to FD"
+            crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
+            "LTBS + ExpressionScale is now in analytic inner scope"
         );
-        assert!(
-            !crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
-            "LTBS + ExpressionScale keeps the model out of analytic inner scope"
-        );
-        // The analytic OUTER gradient still serves LTBS + ExpressionScale.
-        assert!(
-            subject_sensitivities(&model, &subject, &theta, &eta).is_some(),
-            "analytic outer gradient still serves LTBS + ExpressionScale"
-        );
+        let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+        let light = subject_eta_grad(&model, &subject, &theta, &eta)
+            .expect("inner analytic gradient serves LTBS + ExpressionScale");
+        assert_eq!(full.obs.len(), light.len());
+        for (fo, lo) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    fo.df_deta[k],
+                    lo.df_deta[k],
+                    max_relative = 1e-10,
+                    epsilon = 1e-12
+                );
+            }
+        }
     }
 
     // ── Time-varying covariate analytic sensitivities ─────────────────

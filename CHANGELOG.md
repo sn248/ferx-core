@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Log-transform-both-sides (LTBS) analytic *inner* EBE gradient now covers the remaining
+  closed-form combinations** (#486): plain LTBS landed in #665; this extends the same
+  `g = ln(f)` inner jet to LTBS combined with an η-dependent `ExpressionScale obs_scale`, with
+  **time-varying covariates** (the event-driven inner walk), and with a `TIME`-built-in
+  structural parameter. The inner η-gradient matches the outer to ~1e-10, and gradient-based
+  HMC now engages for these models. LTBS × IOV still uses the finite-difference inner gradient.
+- **Custom / time-varying residual-error magnitude combined with `iiv_on_ruv`** now gets an
+  exact analytic FOCEI outer (θ/Ω/σ) gradient instead of finite differences (#486): the
+  residual-eta `c̃`-column coupling `d/R` gains its magnitude direct-θ terms, mirroring the
+  σ-parameter block. Validated against reconverged finite differences of the FOCEI objective.
 - **Covariate-selected residual error models (`if/else` in `[error_model]`)** (#658).
   The `[error_model]` block can now select a residual error model per observation
   by an arbitrary covariate condition — e.g. a free-vs-total assay switched by a

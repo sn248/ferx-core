@@ -1376,13 +1376,10 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
         || model.is_sde()
-        // LTBS + η-dependent `ExpressionScale`: plain LTBS takes the analytic inner
-        // gradient now, but the analytic scale+log Jacobian for this combination is not
-        // validated against the reconverged EBE, so keep it a model-level FD bail (mirrors
-        // the per-call decline in `subject_eta_grad`). Plain LTBS and constant `ScalarScale`
-        // are unaffected.
-        || (model.log_transform
-            && matches!(model.scaling, ScalingSpec::ExpressionScale { .. }))
+        // LTBS is served analytically on the inner loop now — plain, × `ExpressionScale`
+        // (the η-quotient then the `ln f` jet, `subject_eta_grad`), and × TV-cov (the
+        // event-driven inner walk applies the same jet LAST). LTBS × IOV still declines,
+        // but via `iov_analytical_supported`'s own `!log_transform` gate, not here.
         // Correlated residual error (`block_sigma`) is now served analytically by the
         // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
         // longer a blanket bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
@@ -1504,15 +1501,11 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // (#486), so it must consult `tvcov_analytical_supported` too — otherwise a TIME
     // model that the walk declines (e.g. TIME + `[initial_conditions]`) would report
     // an analytic inner here while `subject_eta_grad` returns `None`, splitting the
-    // inner route from the outer.
-    //
-    // LTBS declines on the event-driven inner walk (`subject_eta_grad_tvcov` returns
-    // `None` for `log_transform`; only the *plain* closed-form inner carries the
-    // `ln(f)` jet), so an event-walk subject under LTBS runs FD. Report FD here to
-    // match — otherwise the reported inner route would drift from what `find_ebe`
-    // runs for the whole-population TV-cov + LTBS case (#381 review #9 / #665 review).
+    // inner route from the outer. LTBS now takes the analytic inner gradient on the
+    // event-driven walk too (`subject_eta_grad_tvcov` applies the `ln f` jet LAST), so
+    // no `!log_transform` carve-out is needed here.
     if crate::sens::provider::subject_routes_to_event_walk(model, subject) {
-        return crate::sens::provider::tvcov_analytical_supported(model) && !model.log_transform;
+        return crate::sens::provider::tvcov_analytical_supported(model);
     }
     true
 }
@@ -3746,13 +3739,11 @@ mod iov_tests {
         assert!(fd_fallback_warning(&model, &mk_pop(vec![analytic]), theta).is_none());
     }
 
-    /// Regression (#665 review #1): a TV-cov + LTBS model reports the inner route as
-    /// FD (not analytic) and, when the *whole* population falls back, still emits the
-    /// FD-fallback warning — the reported route must not drift from what `find_ebe`
-    /// runs. The event-driven inner walk declines LTBS, so every TV-cov subject runs
-    /// FD even though the model-level `gradient_method_inner` reports analytic.
+    /// Tier-1 follow-up to #665: a TV-cov + LTBS subject now takes the **analytic** inner
+    /// gradient (the event-driven inner walk applies the `ln f` jet LAST), so the reported
+    /// route is Analytic, `subject_eta_grad` returns `Some`, and no FD-fallback warning fires.
     #[test]
-    fn tvcov_ltbs_reports_fd_inner_and_warns() {
+    fn tvcov_ltbs_reports_analytic_inner() {
         use crate::parser::model_parser::parse_model_string;
         let src = r#"
 [parameters]
@@ -3787,7 +3778,7 @@ mod iov_tests {
             obs_cmts: vec![1; 5],
             covariates: HashMap::new(),
             dose_covariates: Vec::new(),
-            // Time-varying WT → routes to the event-driven walk, which declines LTBS.
+            // Time-varying WT → routes to the event-driven walk, which now serves LTBS.
             obs_covariates: vec![wt(70.0), wt(72.0), wt(80.0), wt(85.0), wt(90.0)],
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
@@ -3801,14 +3792,23 @@ mod iov_tests {
         };
         let subject = tvcov_subj();
         assert!(subject.has_tv_covariates(), "fixture must be TV-cov");
-        // The per-subject route (and hence the startup banner) is FD, not analytic.
+        // TV-cov + LTBS now takes the analytic inner gradient.
         assert_eq!(
             resolve_gradient_method(&model, &subject),
-            InnerGradientMethod::Fd,
-            "TV-cov + LTBS inner gradient must route to FD"
+            InnerGradientMethod::Analytic,
+            "TV-cov + LTBS inner gradient is analytic now"
         );
-        // Whole population on FD, yet the model-level report claims analytic — the
-        // warning must still fire so the mislabel is corrected.
+        assert!(
+            crate::sens::provider::subject_eta_grad(
+                &model,
+                &subject,
+                &model.default_params.theta,
+                &[0.0; 3]
+            )
+            .is_some(),
+            "TV-cov + LTBS inner provider must serve the subject"
+        );
+        // Whole population analytic → no FD-fallback warning.
         let population = Population {
             subjects: vec![tvcov_subj(), tvcov_subj()],
             covariate_names: vec!["WT".into()],
@@ -3817,9 +3817,10 @@ mod iov_tests {
             exclusions: None,
             warnings: vec![],
         };
-        let w = fd_fallback_warning(&model, &population, &model.default_params.theta)
-            .expect("all-FD-under-analytic-label population must warn");
-        assert!(w.contains("2 of 2"), "got: {w}");
+        assert!(
+            fd_fallback_warning(&model, &population, &model.default_params.theta).is_none(),
+            "analytic TV-cov + LTBS population must not warn"
+        );
     }
 
     #[test]

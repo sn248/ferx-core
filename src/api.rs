@@ -5640,6 +5640,12 @@ pub fn simulate_with_options(
     #[cfg(feature = "survival")]
     validate_ode_tte_simulatable(model, population, opts.horizon)?;
 
+    // Parity with `fit()`: a referenced covariate absent from the data would
+    // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
+    // would route every row to branch 0, applying the wrong residual variance
+    // with no diagnostic). Reject it here the same way `fit()` does (#658).
+    first_error(&check_covariates(model, population))?;
+
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
     // this API must get the same guard: a NaN window makes every `t_event < window`
@@ -6459,6 +6465,9 @@ pub fn simulate_adaptive_from_spec(
     // here rather than allowed to silently produce nothing.
     let compiled = crate::sim::adaptive_control::compile_adaptive(model, spec)
         .map_err(|e| format!("simulate_adaptive_from_spec: {e}"))?;
+    // Parity with `fit()`: model-referenced covariates (e.g. a `Selected` error
+    // model's selector) must be present too, not just the `observe` signal (#658).
+    first_error(&check_covariates(model, population))?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
     // Apply the same loud check fits use for model covariates (`check_covariates`).
@@ -6548,6 +6557,11 @@ pub fn simulate_with_uncertainty(
     // inner chokepoint would otherwise enforce the same contract as a panic).
     #[cfg(feature = "survival")]
     validate_ode_tte_simulatable(model, population, None)?;
+
+    // Parity with `fit()`: reject a referenced covariate absent from the data
+    // rather than silently reading it as 0.0 (a `Selected` error-model selector
+    // would otherwise route every row to branch 0). See #658.
+    first_error(&check_covariates(model, population))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),

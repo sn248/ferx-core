@@ -2313,6 +2313,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                         .into(),
                 );
             }
+            // Covariate-selected error models (#658) are multi-endpoint: the EKF
+            // `p_obs` measurement-noise closure (`stats/likelihood.rs`) binds a
+            // single representative `error_model` (branch 0) and cannot switch per
+            // row, so a `Selected` spec would silently score every observation with
+            // branch 0's sigma. The `debug_assert!` there is a release no-op — reject
+            // at parse instead. (Per-CMT/Form-C is already rejected via the ObsCmt
+            // readout guard above; this closes the remaining multi-endpoint case.)
+            if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
+                return Err(
+                    "covariate-selected `[error_model]` (`if (COV …) { … } else { … }`) is not \
+                     supported on SDE / [diffusion] models — the EKF measurement-noise path uses \
+                     a single error model and cannot switch per observation. Use a single-endpoint \
+                     error model, or drop the [diffusion] block."
+                        .into(),
+                );
+            }
         }
     }
 

@@ -14,7 +14,10 @@
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, ErrorSpec, Population};
-use ferx_core::{fit, predict, simulate_with_seed, EstimationMethod, FitOptions};
+use ferx_core::{
+    fit, predict, simulate_with_options, simulate_with_seed, EstimationMethod, FitOptions,
+    SimulateOptions,
+};
 use std::collections::HashMap;
 
 mod common;
@@ -135,6 +138,82 @@ fn missing_selector_covariate_is_rejected() {
     assert!(
         err.contains("FREE"),
         "error should name the missing covariate FREE: {err}"
+    );
+}
+
+/// `simulate` must enforce the same selector-covariate presence check as `fit()`
+/// (#658 review): a missing selector covariate would otherwise silently read as 0.0
+/// and route every row to branch 0, applying the wrong residual variance with no
+/// diagnostic. `simulate_with_options` (the path the R wrapper uses) returns an
+/// `Err` naming the missing covariate.
+#[test]
+fn simulate_missing_selector_covariate_is_rejected() {
+    let model = parse_model_string(FREE_TOTAL).expect("model parses");
+    let mut pop = free_total_pop(1);
+    // Drop FREE from the data entirely.
+    pop.covariate_names.clear();
+    for s in pop.subjects.iter_mut() {
+        s.obs_covariates.clear();
+        s.covariates.clear();
+    }
+    let err = simulate_with_options(
+        &model,
+        &pop,
+        &model.default_params,
+        1,
+        &SimulateOptions::default(),
+    )
+    .expect_err("simulate must reject a missing selector covariate");
+    assert!(
+        err.contains("FREE"),
+        "error should name the missing covariate FREE: {err}"
+    );
+}
+
+/// A covariate-selected error model cannot be combined with an SDE `[diffusion]`
+/// block (#658 review): the EKF measurement-noise path binds a single
+/// representative error model and cannot switch per observation, so the
+/// combination is rejected at parse time rather than silently scoring every row
+/// against branch 0 in a release build.
+#[test]
+fn selected_error_model_with_sde_is_rejected_at_parse() {
+    let sde_selected = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_TOTAL   ~ 0.05 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[diffusion]
+  central ~ 0.5
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+    let err = parse_model_string(sde_selected)
+        .err()
+        .expect("covariate-selected error on an SDE model must be rejected");
+    assert!(
+        err.contains("SDE") || err.to_lowercase().contains("diffusion"),
+        "error should cite the SDE restriction: {err}"
     );
 }
 

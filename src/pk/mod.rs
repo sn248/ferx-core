@@ -190,9 +190,16 @@ pub fn apply_analytic_readout(
         }
         let cov = subject.obs_cov(i);
         let obs_cmt = subject.obs_cmts.get(i).copied().unwrap_or(0);
-        *pred = ar
-            .readout
-            .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt);
+        // A readout referencing the `TIME` builtin resolves `Op::PushTime` from the
+        // model-time thread-local; set it to this observation's time so the readout
+        // evaluates `TIME` at the observation (the analytic providers set the matching
+        // guard around their readout eval, keeping FD parity). A no-op for a readout
+        // that does not reference `TIME`.
+        let t = subject.obs_times.get(i).copied().unwrap_or(0.0);
+        *pred = crate::parser::model_parser::with_model_time(t, || {
+            ar.readout
+                .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt)
+        });
     }
 }
 

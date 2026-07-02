@@ -334,11 +334,15 @@ mod tests {
 
         // LTBS + ExpressionScale now has a consistent analytic inner gradient (Tier-1
         // follow-up to #665 — the η-quotient then the `ln f` jet), so HMC takes the
-        // gradient-based path instead of falling back to MH.
+        // gradient-based path instead of falling back to MH. Recompute `nll` for the LTBS
+        // objective so the leapfrog energy and gradient evaluate the *same* model (else a
+        // broken LTBS objective could be masked by a stale non-LTBS `nll`).
         model.log_transform = true;
+        let nll_ltbs =
+            crate::stats::likelihood::individual_nll(&model, &subject, theta, &eta, &omega, &sigma);
         let mut rng = StdRng::seed_from_u64(1);
         let stepped_ltbs = hmc_step(
-            &subject, &eta, nll, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
+            &subject, &eta, nll_ltbs, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
         );
         assert!(
             stepped_ltbs.is_some(),

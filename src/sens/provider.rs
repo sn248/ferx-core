@@ -8337,6 +8337,43 @@ mod tests {
         }
     }
 
+    /// Unit-covers `apply_ltbs_transform_inner` directly: the `g = ln(f)`, `∂g/∂η = ∂f/∂η/f`
+    /// normal branch; the below-`LTBS_FLOOR` clamp (grads zeroed, value floored); and the
+    /// no-op when `log_transform` is false.
+    #[test]
+    fn apply_ltbs_transform_inner_branches() {
+        let mut out = vec![
+            ObsGrad {
+                f: 2.0,
+                df_deta: vec![4.0, -2.0],
+            },
+            ObsGrad {
+                f: crate::pk::LTBS_FLOOR * 0.5, // below the floor → clamp
+                df_deta: vec![9.0, 9.0],
+            },
+        ];
+        apply_ltbs_transform_inner(&mut out, true);
+        // Row 0: f > FLOOR → g = ln f, df_deta /= f.
+        approx::assert_relative_eq!(out[0].f, 2.0_f64.ln(), epsilon = 1e-12);
+        approx::assert_relative_eq!(out[0].df_deta[0], 2.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(out[0].df_deta[1], -1.0, epsilon = 1e-12);
+        // Row 1: below floor → grads zeroed, value = floored log.
+        assert_eq!(out[1].df_deta, vec![0.0, 0.0]);
+        approx::assert_relative_eq!(
+            out[1].f,
+            crate::pk::ltbs_log_g(crate::pk::LTBS_FLOOR * 0.5),
+            epsilon = 1e-12
+        );
+        // No-op when `log_transform` is false.
+        let mut out2 = vec![ObsGrad {
+            f: 3.0,
+            df_deta: vec![1.0, 2.0],
+        }];
+        apply_ltbs_transform_inner(&mut out2, false);
+        approx::assert_relative_eq!(out2[0].f, 3.0, epsilon = 1e-12);
+        assert_eq!(out2[0].df_deta, vec![1.0, 2.0]);
+    }
+
     /// Plain closed-form LTBS now takes the analytic **inner** gradient (PR #665): the
     /// light provider applies the same `g = ln(f)` jet as the outer, so its η-gradient must
     /// equal the full outer provider's `df_deta` η-block. (The covariance step reconverges

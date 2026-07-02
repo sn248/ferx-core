@@ -722,13 +722,17 @@ fn prepare_stacked(
         None
     };
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
-    let has_censored = subject.cens.iter().any(|&c| c != 0);
-    // Custom magnitude now threads its direct-θ chain through `iiv_on_ruv` too (the
-    // residual-eta `c̃`-column `d/R` gets its `∂/∂θ` terms in `theta_block`). A magnitude
-    // combined with an M3-censored row still bails this *subject* to FD — the censored
-    // `−logΦ(z)` kernel's direct-θ chain is handled separately below; until that lands the
-    // Gaussian magnitude branch would be wrong for a censored row.
-    if mult.is_some() && m3 && has_censored {
+    // Custom magnitude threads its direct-θ chain through `iiv_on_ruv` (the residual-eta
+    // `c̃`-column `d/R` gets its `∂/∂θ` terms in `theta_block`) — but only validated on the
+    // **non-IOV** path. `prepare_stacked` is shared with the IOV callers
+    // (`subject_packed_gradient_iov` / `subject_theta_gradient_iov`), and the κ-augmented
+    // stacked residual-eta assembly (`m_vec[rr]`, `prep.w[j][rr]`) is not covered, so bail
+    // magnitude × `iiv_on_ruv` under IOV to per-subject FD. Magnitude combined with an
+    // M3-censored row also bails (the censored `−logΦ(z)` kernel's direct-θ chain is
+    // unbuilt); the `cens` scan stays behind `mult && m3` so non-magnitude subjects pay nothing.
+    if mult.is_some()
+        && ((ruv.is_some() && model.n_kappa > 0) || (m3 && subject.cens.iter().any(|&c| c != 0)))
+    {
         return None;
     }
 
@@ -1338,9 +1342,11 @@ fn sigma_block(
     // it constant via the `_scaled` variance functions — otherwise `∂R/∂σ` would
     // be taken against the *unscaled* variance and disagree with the magnitude-
     // aware `r`/`d` this block otherwise consumes from `prep.et`. `prepare_stacked`
-    // already declines a subject that combines an active magnitude with `iiv_on_ruv`
-    // or an M3-censored row, so the residual-eta and censored branches below never
-    // see a non-empty `mult` row. Reused from `Prep` (computed once in
+    // now admits magnitude × `iiv_on_ruv` on the **non-IOV** path, so the residual-eta
+    // branch below *does* run with a non-empty `mult` row — and handles it correctly
+    // because `r_sig`/`g_sig` are taken of the `_scaled` (magnitude-aware) variance.
+    // Still declined (never seen here): magnitude × `iiv_on_ruv` under IOV, and magnitude
+    // × an M3-censored row. Reused from `Prep` (computed once in
     // `prepare_stacked`) rather than recomputed here — `ruv_obs_mult` re-walks
     // every magnitude expression per observation, so recomputing it doubled that
     // cost for every magnitude-active subject on every outer-gradient evaluation
@@ -1928,10 +1934,11 @@ pub fn subject_packed_gradient_foce(
     // into the Sheiner–Beal marginal — its *value* scales `R⁰` (`variance_at_scaled`
     // below) and its `∂/∂θ` enters the θ-block's `∂R⁰/∂θ` term directly (not only
     // through `f`). Magnitude + an M3-censored row keeps FD (the censored tail's
-    // direct-θ chain is unbuilt — mirrors the FOCEI carve-out in `prepare_stacked`);
-    // magnitude + `iiv_on_ruv` is excluded model-level (`analytic_outer_gradient_
-    // available` requires `residual_error_eta.is_none()` when a magnitude is active),
-    // so `R⁰` here carries no `iiv_on_ruv` `exp(2·η_ruv)` scaling (`ruv_scale ≡ 1`).
+    // direct-θ chain is unbuilt — mirrors the FOCEI carve-out in `prepare_stacked`).
+    // `iiv_on_ruv` never reaches this FOCE (non-interaction) path — it is FOCEI-only
+    // (`api.rs` rejects `iiv_on_ruv` under non-interaction), so `residual_error_eta` is
+    // `None` here and `R⁰` carries no `exp(2·η_ruv)` scaling (`ruv_scale ≡ 1`). (The
+    // model-level magnitude × `iiv_on_ruv` gate was relaxed for the FOCEI path.)
     // `block_sigma` and custom magnitude are mutually exclusive per subject.
     let mult = model.ruv_obs_mult(subject, &params.theta);
     if mult.is_some() && m3 {
@@ -2507,9 +2514,10 @@ pub fn subject_packed_gradient_foce_iov(
 
     // Custom / time-varying residual-magnitude (#484/#576/#486): thread `mult(θ)`
     // into the stacked-`[η_bsv,κ]` Sheiner–Beal marginal — same shape as the non-IOV
-    // sibling `subject_packed_gradient_foce`. Magnitude + M3-censored keeps FD;
-    // magnitude + `iiv_on_ruv` is excluded model-level (`ruv_scale ≡ 1` here — IOV
-    // forces `ruv = None` and the analytic gate requires `residual_error_eta.is_none()`).
+    // sibling `subject_packed_gradient_foce`. Magnitude + M3-censored keeps FD.
+    // `iiv_on_ruv` never reaches this FOCE-IOV path — it is FOCEI-only (`api.rs` rejects
+    // it under non-interaction), so `residual_error_eta` is `None` and `ruv_scale ≡ 1`.
+    // (The FOCEI magnitude × `iiv_on_ruv` gate was relaxed for non-IOV only.)
     let mult = model.ruv_obs_mult(subject, &params.theta);
     if mult.is_some() && m3 {
         return None;

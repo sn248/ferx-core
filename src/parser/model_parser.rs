@@ -975,22 +975,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the rest of this function — including ODE detection below — sees a normal
     // ODE model with no special-casing.
     apply_ode_template(&mut extracted)?;
-    // Build the `one_cpt_transit` ODE-equivalent sub-model (#486): the transit closed form
-    // assumes constant parameters over each absorption window, so it cannot serve a subject
-    // whose parameters switch mid-profile (a `TIME`-dependent parameter or time-varying
-    // covariates). For a plain-form transit model we compile its exact ODE `transit()`
-    // equivalent here and stash it on the model; the runtime dispatch
-    // (`effective_model_for`) routes only the subjects that need it to this fallback, so a
-    // plain transit fit keeps its fast, exact closed form. Non-transit / out-of-scope forms
-    // yield `None`. Parsing the equivalent source recurses one level (it is a normal ODE
-    // model with no `pk one_cpt_transit`, so it does not re-enter this branch).
-    let transit_ode_equivalent: Option<Box<CompiledModel>> =
-        match transit_ode_equivalent_source(&extracted) {
-            Some(src) => Some(Box::new(parse_model_string(&src).map_err(|e| {
-                format!("internal error building one_cpt_transit ODE equivalent: {e}")
-            })?)),
-            None => None,
-        };
+    // Prepare the `one_cpt_transit` ODE-equivalent (#486): the transit closed form assumes
+    // constant parameters over each absorption window, so it cannot serve a subject whose
+    // parameters switch mid-profile (a `TIME`-dependent parameter or time-varying covariates).
+    // For a plain-form transit model we reconstruct its exact ODE `transit()` equivalent
+    // *source* here and stash it on the model; `CompiledModel::effective_for` compiles it
+    // lazily and routes only the subjects that need it to this fallback, so a plain transit
+    // fit whose subjects never need it keeps its fast, exact closed form at zero extra cost.
+    // Non-transit / out-of-scope forms yield `None`. (The equivalent is a normal ODE model
+    // with no `pk one_cpt_transit`, so building it later does not re-enter this branch.)
+    let transit_ode_equivalent: Option<crate::types::TransitOdeEquivalent> =
+        transit_ode_equivalent_source(&extracted).map(crate::types::TransitOdeEquivalent::new);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -6139,7 +6134,7 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
 /// those per-event through the event-driven walk (analytically for `TIME` since #664). The
 /// parser compiles this source into a sub-model stored on
 /// [`CompiledModel::transit_ode_equivalent`]; the runtime dispatch
-/// ([`crate::sens::provider::effective_model_for`]) uses it only for the subjects that need
+/// ([`CompiledModel::effective_for`]) uses it only for the subjects that need
 /// it, so a plain transit fit keeps its fast, exact closed form (#486).
 ///
 /// The equivalent shares the model's `[parameters]`/`[individual_parameters]`/… blocks
@@ -14313,7 +14308,8 @@ mod tests {
         let eq = model
             .transit_ode_equivalent
             .as_ref()
-            .expect("transit + TIME must carry an ODE equivalent");
+            .expect("transit + TIME must carry an ODE equivalent")
+            .get_or_build();
         let ode = eq
             .ode_spec
             .as_ref()

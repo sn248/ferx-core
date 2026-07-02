@@ -8374,7 +8374,7 @@ mod tests {
         assert!(
             std::ptr::eq(
                 m.effective_for(&tv),
-                m.transit_ode_equivalent.as_deref().unwrap()
+                m.transit_ode_equivalent.as_ref().unwrap().get_or_build()
             ),
             "TV-cov transit subject must be served by the ODE equivalent"
         );

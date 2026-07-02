@@ -586,7 +586,9 @@ section of the SDLC for the versioning policy).
   scope (a `lagtime=`/`f=` mapping, a custom `[scaling]`, or an `[initial_conditions]` block)
   carry no equivalent and are still rejected up front (`fit()` errors; `predict()`/
   `simulate()` panic) rather than mis-predict — write the ODE `transit()` model directly for
-  those.
+  those. Follow-up: the sdtab compartment/state (`[derived]`) columns for such a subject now
+  come from the ODE equivalent too (previously they were `NaN` because the states path did
+  not route to the equivalent, even though IPRED did).
 - **Finite / modeled-duration infusions combined with a time-varying covariate that
   changes across the infusion's end** now get an exact analytic second-order gradient
   (#486). The rate-off boundary sits between records, so the RHS Jacobian jumps there;

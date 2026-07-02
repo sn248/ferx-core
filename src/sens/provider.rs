@@ -4910,6 +4910,153 @@ mod tests {
         }
     }
 
+    /// #486 (PR #665 review): a `TIME`-built-in structural parameter combined with
+    /// **LTBS** (`log(DV) ~ additive(...)`). Removing the `log_transform` bail from
+    /// [`tvcov_analytical_supported`] flips this combination from FD to the analytic
+    /// per-event walk, and `analytical_supported` short-circuits every
+    /// `uses_time_builtin` model to that gate — so the outer FOCE/FOCEI population
+    /// gradient is now served by the event-driven walk plus the post-walk `ln(f)`
+    /// transform ([`apply_ltbs_transform_outer`]). The other LTBS + TV-cov coverage
+    /// (`ltbs_tvcov_outer_matches_production`) uses a real time-varying covariate;
+    /// this test pins the *TIME-built-in* route, where the piecewise parameter is
+    /// seeded per event by [`ModelTimeGuard`] rather than by a covariate snapshot,
+    /// so the log transform must compose with that per-event seeding. Covers the
+    /// same three fixture shapes as [`time_builtin_provider_matches_fd_of_production`]
+    /// (IV switch, continuous `TVCL + c·TIME`, and a switch under an
+    /// `ExpressionScale obs_scale` to exercise scale-then-log `ln(f/s)`), each on the
+    /// no-TV path (routed purely by `uses_time_builtin`).
+    #[test]
+    fn ltbs_time_builtin_outer_matches_fd_of_production() {
+        // (a) 1-cpt IV: CL switches at TIME = 45, LTBS error.
+        const ONECPT_IV_TIME_LTBS: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD_ERR ~ 0.04 (sd)
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  log(DV) ~ additive(ADD_ERR)
+"#;
+        // (b) 1-cpt oral: CL varies continuously with TIME, LTBS error.
+        const ONECPT_ORAL_TIME_LTBS: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma ADD_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = (TVCL + 0.05 * TIME) * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  log(DV) ~ additive(ADD_ERR)
+"#;
+        // (c) 1-cpt oral: TIME switch on CL under an `ExpressionScale obs_scale`,
+        // LTBS error — exercises the scale-then-log order `ln(f/s)` on the TIME route.
+        const ONECPT_ORAL_TIME_SCALED_LTBS: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVCL_LATE(0.6, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma ADD_ERR ~ 0.04 (sd)
+[individual_parameters]
+  if (TIME > 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  log(DV) ~ additive(ADD_ERR)
+"#;
+        let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        // Observations straddle the switch so both arms of the `if` drive at least
+        // one prediction (the switch is data-driven, so it is fixed under the η/θ
+        // perturbation — the prediction is smooth in η/θ within each arm).
+        let straddle = [10.0, 30.0, 50.0, 70.0, 90.0];
+
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(ONECPT_IV_TIME_LTBS).expect("parse 1cpt iv TIME LTBS");
+                let s = subject_with_doses_and_resets(vec![bolus(0.0)], &straddle, Vec::new());
+                (m, s, vec![10.0, 6.0, 50.0], vec![0.15, -0.10])
+            },
+            {
+                let m =
+                    parse_model_string(ONECPT_ORAL_TIME_LTBS).expect("parse 1cpt oral TIME LTBS");
+                let s = subject_with_doses_and_resets(
+                    vec![bolus(0.0)],
+                    &[1.0, 4.0, 10.0, 24.0, 48.0],
+                    Vec::new(),
+                );
+                (m, s, vec![1.0, 10.0, 1.5], vec![0.15, -0.10, 0.20])
+            },
+            {
+                let m = parse_model_string(ONECPT_ORAL_TIME_SCALED_LTBS)
+                    .expect("parse 1cpt oral TIME scaled LTBS");
+                let s = subject_with_doses_and_resets(
+                    vec![bolus(0.0)],
+                    &[1.0, 4.0, 10.0, 24.0, 48.0],
+                    Vec::new(),
+                );
+                (m, s, vec![1.0, 0.6, 10.0, 1.5], vec![0.15, -0.10, 0.20])
+            },
+        ];
+
+        for (m, s, theta, eta) in &cases {
+            assert!(
+                crate::parser::model_parser::compiled_model_uses_time_builtin(m),
+                "fixture must read the TIME built-in"
+            );
+            assert!(m.log_transform, "fixture must be LTBS");
+            assert!(
+                !s.has_tv_covariates(),
+                "fixture must stay on the no-TV path (routed purely by uses_time_builtin)"
+            );
+            assert!(
+                tvcov_analytical_supported(m),
+                "TIME + LTBS must be on the analytic OUTER path via the per-event walk (#486)"
+            );
+            // Outer analytic vs FD of the log-scale production predictor.
+            check_full_provider_vs_fd(m, s, theta, eta);
+            // The full outer provider is served; the light inner provider declines
+            // LTBS (inner EBE gradient stays FD for covariance stability).
+            assert!(
+                subject_sensitivities(m, s, theta, eta).is_some(),
+                "outer TIME + LTBS analytic"
+            );
+            assert!(
+                subject_eta_grad(m, s, theta, eta).is_none(),
+                "inner TIME + LTBS must route to FD"
+            );
+        }
+    }
+
     /// #486: the light `Dual1` inner η-gradient must equal the full `Dual2` outer
     /// `df_deta` (η-block) for a `TIME`-built-in subject — both run the same
     /// event-driven walk, and the outer is FD-validated by

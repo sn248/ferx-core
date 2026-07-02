@@ -928,6 +928,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the rest of this function — including ODE detection below — sees a normal
     // ODE model with no special-casing.
     apply_ode_template(&mut extracted)?;
+    // `pk one_cpt_transit(...)` + a `TIME`-dependent parameter desugaring (#486): the
+    // transit closed form assumes constant parameters over each absorption window, so it
+    // cannot honour a mid-profile `TIME` switch. Rewrite the plain form to its validated
+    // ODE `transit()` equivalent (which carries per-event `TIME` analytically since #664)
+    // BEFORE ODE detection below, so the rest of this function sees a normal ODE model.
+    apply_transit_time_ode_desugar(&mut extracted)?;
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -5952,6 +5958,90 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
         .entry("scaling".to_string())
         .or_insert_with(|| vec![format!("obs_scale = {}", generated.obs_scale)]);
 
+    Ok(())
+}
+
+/// True when any `[individual_parameters]` line references the `TIME`/`time` built-in.
+/// Comments are stripped and the match is word-boundary; both spellings are reserved
+/// built-ins (a user cannot name a variable `TIME`/`time`), so this is exact — the same
+/// pair the `pk(...=TIME)` desugar keys on.
+fn indiv_lines_reference_time(lines: &[String]) -> bool {
+    let re = Regex::new(r"\b(?:TIME|time)\b").unwrap();
+    lines.iter().any(|l| {
+        let code = l.split('#').next().unwrap_or("");
+        re.is_match(code)
+    })
+}
+
+/// Desugar a closed-form `pk one_cpt_transit(cl, v, n, mtt)` model that reads the `TIME`
+/// built-in into its exact ODE `transit()` equivalent (#486).
+///
+/// The transit closed form assumes constant parameters over each absorption window, so it
+/// cannot honour a `TIME`-dependent parameter switch — the predictor would freeze `TIME`
+/// at the first record (see `check_transit_support`). The ODE twin
+/// `d/dt(central) = transit(n, mtt) − (CL/V)·central` with `obs_scale = V` is the exact
+/// numerical equivalent (validated in `tests/transit_analytic_equivalence.rs`) and carries
+/// the per-event `TIME` through the event-driven walk analytically (since #664). Rewriting
+/// the blocks here makes transit + `TIME` work instead of being rejected.
+///
+/// Scoped to the plain `cl/v/n/mtt` form with no `lagtime=`/`f=` mapping and no user
+/// `[odes]`/`[scaling]` block. Anything else is left as the closed form (and, with `TIME`,
+/// still rejected up front) — extending the desugar to those is a follow-up. Mirrors
+/// [`apply_ode_template`]'s block-rewrite shape and runs right after it.
+fn apply_transit_time_ode_desugar(extracted: &mut ExtractedBlocks) -> Result<(), String> {
+    let transit_re = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let args_str = match extracted.unnamed.get("structural_model") {
+        Some(lines) => match lines.iter().find_map(|l| transit_re.captures(l.trim())) {
+            Some(caps) => caps[1].to_string(),
+            None => return Ok(()),
+        },
+        None => return Ok(()),
+    };
+    // Only rewrite when a `TIME`/`time` switch is actually present — otherwise the plain
+    // closed form is exact and faster, so keep it.
+    let uses_time = extracted
+        .unnamed
+        .get("individual_parameters")
+        .is_some_and(|lines| indiv_lines_reference_time(lines));
+    if !uses_time {
+        return Ok(());
+    }
+    // Bounded first cut: the plain cl/v/n/mtt form composes cleanly with the ODE twin's
+    // automatic lagtime/F handling and central-volume scale. A `lagtime=`/`f=` mapping or a
+    // user-written `[odes]`/`[scaling]` block stays on the closed form (rejected up front by
+    // `check_transit_support` when it reads `TIME`).
+    let roles = parse_role_pairs(&args_str, "pk one_cpt_transit")?;
+    let allowed = ["cl", "v", "n", "mtt"];
+    if roles.keys().any(|k| !allowed.contains(&k.as_str()))
+        || extracted.unnamed.contains_key("odes")
+        || extracted.unnamed.contains_key("scaling")
+    {
+        return Ok(());
+    }
+    let (cl, v, n, mtt) = match (
+        roles.get("cl"),
+        roles.get("v"),
+        roles.get("n"),
+        roles.get("mtt"),
+    ) {
+        (Some(cl), Some(v), Some(n), Some(mtt)) => (cl, v, n, mtt),
+        // Incomplete mapping — leave it to the normal `pk one_cpt_transit` parser to
+        // produce its usual, more specific error.
+        _ => return Ok(()),
+    };
+    extracted.unnamed.insert(
+        "structural_model".to_string(),
+        vec!["ode(obs_cmt=central, states=[central])".to_string()],
+    );
+    extracted.unnamed.insert(
+        "odes".to_string(),
+        vec![format!(
+            "d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central"
+        )],
+    );
+    extracted
+        .unnamed
+        .insert("scaling".to_string(), vec![format!("obs_scale = {v}")]);
     Ok(())
 }
 
@@ -13866,6 +13956,83 @@ mod tests {
         );
         let err = parse_err(&src);
         assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn transit_time_desugars_to_ode_equivalent() {
+        // Plain `pk one_cpt_transit(...)` + a TIME switch is rewritten to the exact ODE
+        // transit() twin (which carries per-event TIME analytically, #664) instead of being
+        // rejected — the closed form can't honour a mid-profile parameter switch (#486).
+        const TRANSIT_TIME: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVCL_LATE(7.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  if (TIME > 12.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V   = TVV
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+        let model = parse_model_string(TRANSIT_TIME).expect("parse transit+TIME");
+        let ode = model
+            .ode_spec
+            .as_ref()
+            .expect("transit + TIME must desugar to an ODE model");
+        assert_ne!(
+            model.pk_model,
+            PkModel::OneCptTransit,
+            "desugared model is no longer the closed-form transit"
+        );
+        assert_eq!(ode.state_names, vec!["central"]);
+        assert_eq!(ode.input_rate.len(), 1, "exactly one transit forcing");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "the TIME switch survives the rewrite"
+        );
+
+        // A transit model WITHOUT a TIME switch keeps the fast, exact closed form.
+        const TRANSIT_PLAIN: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+        let plain = parse_model_string(TRANSIT_PLAIN).expect("parse plain transit");
+        assert_eq!(
+            plain.pk_model,
+            PkModel::OneCptTransit,
+            "no TIME switch → keep the closed-form transit"
+        );
+        assert!(plain.ode_spec.is_none());
     }
 
     #[test]

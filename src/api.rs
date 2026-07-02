@@ -8959,21 +8959,22 @@ mod simulate_with_uncertainty_tests {
         }
     }
 
-    /// `one_cpt_transit` + a `TIME`-dependent structural parameter must be rejected up front
-    /// (like transit + time-varying covariates / IOV / SS / infusion). The transit closed
-    /// form assumes constant parameters over each absorption window; the predictor can only
-    /// evaluate them at the first-record snapshot, so it would silently freeze `TIME` at 0 and
-    /// ignore the switch. `check_transit_support` must return an error rather than mis-predict.
+    /// A `one_cpt_transit` + `TIME` model that the ODE desugar does NOT cover — here because
+    /// of a `lagtime=` mapping (the desugar is scoped to the plain `cl/v/n/mtt` form) — stays
+    /// on the closed form and must be rejected up front rather than silently freezing `TIME`
+    /// at the first record. (The plain form is instead rewritten to the ODE `transit()`
+    /// equivalent and works; see the parser test `transit_time_desugars_to_ode_equivalent`.)
     #[test]
-    fn transit_with_time_builtin_is_rejected() {
+    fn transit_with_time_and_lagtime_is_rejected() {
         use crate::parser::model_parser::parse_model_string;
-        const TRANSIT_TIME: &str = r#"
+        const TRANSIT_TIME_LAG: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
   theta TVCL_LATE(7.0, 0.1, 100.0)
   theta TVV(50.0, 5.0, 500.0)
   theta TVMTT(1.0, 0.05, 24.0)
   theta TVN(3.0, 0.0, 30.0)
+  theta TVLAG(0.3, 0.0, 5.0)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.15 (sd)
 [individual_parameters]
@@ -8985,21 +8986,26 @@ mod simulate_with_uncertainty_tests {
   V   = TVV
   MTT = TVMTT
   NTR = TVN
+  LAGTIME = TVLAG
 [structural_model]
-  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
   method = focei
 "#;
-        let model = parse_model_string(TRANSIT_TIME).expect("parse transit+TIME");
-        assert_eq!(model.pk_model, crate::types::PkModel::OneCptTransit);
+        let model = parse_model_string(TRANSIT_TIME_LAG).expect("parse transit+TIME+lag");
+        assert_eq!(
+            model.pk_model,
+            crate::types::PkModel::OneCptTransit,
+            "the lagtime= form is outside the desugar scope, so it stays closed-form"
+        );
         assert!(
             crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
             "fixture must use the TIME built-in"
         );
         let msg = check_transit_support(&model, &tiny_population())
-            .expect("transit + TIME must be rejected up front");
+            .expect("transit + TIME (lagtime form) must be rejected up front");
         assert!(
             msg.contains("TIME"),
             "rejection message must name the TIME limitation: {msg}"

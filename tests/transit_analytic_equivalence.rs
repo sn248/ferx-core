@@ -143,6 +143,75 @@ fn transit_multidose_matches_ode() {
     );
 }
 
+/// A transit model with a mid-profile `TIME` switch on CL. The closed-form shorthand
+/// `pk one_cpt_transit(...)` cannot honour it, so it is desugared to the ODE `transit()`
+/// twin (#486). Written by hand as that same ODE, the two must predict identically — the
+/// desugar produces exactly the twin, and the observation times straddle the switch (t=6)
+/// so the `TIME` dependence is actually exercised.
+#[test]
+fn transit_time_desugar_matches_hand_written_ode() {
+    let header = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVCL_LATE(0.30, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(1.5, 0.05, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  if (TIME > 6.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+";
+    let shorthand = format!(
+        "{header}\n[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let hand_ode = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let sh = parse_full_model(&shorthand)
+        .expect("shorthand transit+TIME parses")
+        .model;
+    let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
+    assert!(
+        sh.ode_spec.is_some(),
+        "transit + TIME shorthand must desugar to an ODE model"
+    );
+
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
+    );
+    let ps = predict(&sh, &pop, &sh.default_params);
+    let ph = predict(&hd, &pop, &hd.default_params);
+    assert_eq!(ps.len(), ph.len());
+    assert!(!ps.is_empty());
+    for (x, y) in ps.iter().zip(ph.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= 1e-9 + 1e-9 * x.pred.abs(),
+            "t={:.3}: desugared {:.6} vs hand ODE {:.6}",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+    assert!(
+        ps.iter().any(|p| p.time > 6.0) && ps.iter().any(|p| p.time < 6.0),
+        "observations must straddle the TIME switch"
+    );
+}
+
 #[test]
 fn transit_with_lagtime_matches_ode() {
     let pop = population(

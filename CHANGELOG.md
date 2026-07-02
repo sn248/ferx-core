@@ -540,13 +540,16 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
-- **A `one_cpt_transit` model with a `TIME`-dependent structural parameter** is now
-  rejected up front (`fit()` returns an error; `predict()`/`simulate()` panic) instead of
-  silently freezing `TIME` at the first record and mis-predicting (#486). This closes the
-  gap in the existing transit guard, which already rejected transit combined with IOV,
-  time-varying covariates, steady-state, or infusion doses — all the same limitation (the
-  transit closed form assumes constant parameters over each absorption window). Use an ODE
-  `transit()` model for a time-dependent disposition.
+- **A `one_cpt_transit` model with a `TIME`-dependent structural parameter now works.**
+  The transit closed form assumes constant parameters over each absorption window, so it
+  cannot honour a mid-profile `TIME` switch (it would silently freeze `TIME` at the first
+  record). The plain `cl/v/n/mtt` form is now transparently compiled to its exact ODE
+  `transit()` equivalent — `d/dt(central) = transit(n, mtt) − (CL/V)·central`, `obs_scale =
+  V` — which carries the per-event `TIME` analytically (#486, building on #664). Validated
+  to predict identically to the hand-written ODE twin. Forms outside the desugar's scope (a
+  `lagtime=`/`f=` mapping, or a custom `[scaling]` block) stay on the closed form and are
+  now rejected up front (`fit()` errors; `predict()`/`simulate()` panic) rather than
+  silently mis-predict — write the ODE `transit()` model directly for those.
 - **A `one_cpt_transit` absorption model with time-varying covariates (or a `TIME`
   switch)** no longer produces a silently wrong (all-zero) FOCE/FOCEI gradient (#486).
   Such a subject was routed to the event-driven analytic walk, which cannot

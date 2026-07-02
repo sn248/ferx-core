@@ -3303,6 +3303,12 @@ pub(crate) fn compute_covariance(
     // parallelises over perturbed POINTS, not subjects; nested parallelism is
     // what #256 removed. `find_ebe` is deterministic per subject, so the
     // per-subject EBEs are bit-identical to the parallel loop.
+    // The covariance step reconverges EBEs at its own tolerance (`cov_inner_tol`),
+    // decoupled from the fit's `inner_tol`: the second-difference-of-OFV R-matrix is
+    // far more sensitive to EBE precision than the fit, so a sensitive covariance can
+    // be reconverged tighter without slowing every outer iteration. Defaults to
+    // `inner_tol` (byte-identical). See `FitOptions::effective_cov_inner_tol`.
+    let cov_inner_tol = options.effective_cov_inner_tol();
     let reconverge_point = |xv: &[f64]| -> (
         ModelParameters,
         Vec<DVector<f64>>,
@@ -3320,7 +3326,7 @@ pub(crate) fn compute_covariance(
                 &population.subjects[i],
                 &params,
                 options.inner_maxiter,
-                options.inner_tol,
+                cov_inner_tol,
                 Some(eta_hats[i].as_slice()),
                 Some(&mu_k),
             );

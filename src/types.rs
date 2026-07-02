@@ -4052,6 +4052,21 @@ pub struct FitOptions {
     pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// Inner EBE-reconvergence tolerance used **only by the covariance step**
+    /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
+    /// covariance R-matrix is a second-difference of the reconverged OFV, and that
+    /// reconvergence is far more sensitive to EBE precision than the fit itself —
+    /// on a flat / weakly-identified surface an EBE converged only to a loose
+    /// `inner_tol` can leave enough residual noise to perturb the standard errors
+    /// (e.g. the heavily-censored M3 + IOV case in #654, where the fit tolerance
+    /// had to be tightened to stabilise the covariance step). This knob lets the
+    /// fit stay fast at a loose `inner_tol` while the covariance step reconverges
+    /// tighter — set e.g. `cov_inner_tol = 1e-10` for a sensitive covariance
+    /// without slowing every outer iteration.
+    ///
+    /// `None` (default) uses `inner_tol`, so covariance SEs are byte-identical to
+    /// before this option existed. See [`FitOptions::effective_cov_inner_tol`].
+    pub cov_inner_tol: Option<f64>,
     /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
     /// `ferx_fit(settings = list(ode_reltol = ...))`). Default `1e-4`. Only
     /// affects ODE models. The default reproduces analytical closed forms in
@@ -4517,6 +4532,7 @@ impl Default for FitOptions {
             // only held for well-conditioned fits. Override via `inner_tol = ...`
             // in `[fit_options]` (loosen for speed; tighten with care).
             inner_tol: 1e-5,
+            cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model
             // via `[fit_options] ode_reltol = ...` (see FitOptions::ode_reltol).
@@ -4859,6 +4875,13 @@ impl FitOptions {
         } else {
             self.methods.clone()
         }
+    }
+
+    /// Effective inner EBE-reconvergence tolerance for the covariance step:
+    /// an explicit `cov_inner_tol` when set, otherwise the fit's `inner_tol`
+    /// (so covariance SEs are byte-identical to before this option existed).
+    pub fn effective_cov_inner_tol(&self) -> f64 {
+        self.cov_inner_tol.unwrap_or(self.inner_tol)
     }
 
     /// Check `user_set_keys` against the selected method chain. Returns one
@@ -5384,6 +5407,21 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// `effective_cov_inner_tol` resolves the covariance-step reconvergence tolerance:
+    /// an explicit `cov_inner_tol` wins; otherwise it equals the fit's `inner_tol`
+    /// (byte-identical to before the option existed).
+    #[test]
+    fn effective_cov_inner_tol_resolution() {
+        let mut o = FitOptions::default();
+        o.inner_tol = 1e-5;
+        o.cov_inner_tol = None;
+        // Default: equals the fit tol.
+        assert_relative_eq!(o.effective_cov_inner_tol(), 1e-5);
+        // Explicit override wins.
+        o.cov_inner_tol = Some(1e-10);
+        assert_relative_eq!(o.effective_cov_inner_tol(), 1e-10);
+    }
 
     /// Transit (`OneCptTransit`) descriptors: canonical name, the analytic 2-state
     /// `[depot, central]` layout, and no modeled-duration infusions (#386).

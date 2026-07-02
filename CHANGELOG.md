@@ -53,6 +53,14 @@ section of the SDLC for the versioning policy).
   `obs_scale`. The inner EBE gradient stays on finite differences for LTBS (covariance-Hessian
   stability), matching the dose-superposition path. Validated against FD of the log-scale
   production predictor.
+- **New `[fit_options] cov_inner_tol`** — the inner EBE-reconvergence tolerance used **only by
+  the covariance step**, decoupled from the fit's `inner_tol`. The covariance R-matrix is a
+  second-difference of the reconverged OFV and is far more sensitive to EBE precision than the
+  fit itself, so on a flat / weakly-identified surface an EBE converged only to a loose
+  `inner_tol` can perturb the standard errors (e.g. the heavily-censored M3 + IOV case in #654).
+  This lets the fit stay fast at a loose `inner_tol` while the covariance step reconverges
+  tighter — set e.g. `cov_inner_tol = 1e-10` for a sensitive covariance without slowing every
+  outer iteration. Defaults to `inner_tol`, so existing covariance SEs are unchanged.
 - **Built-in absorption forcings (`zero_order(dur)`, `first_order`, and `mixed`) combined
   with inter-occasion variability (IOV)** now get exact analytic FOCE/FOCEI sensitivities on
   the ODE path instead of finite differences (#486), closing the last zero-order gap. The IOV

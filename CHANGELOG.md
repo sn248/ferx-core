@@ -82,6 +82,35 @@ section of the SDLC for the versioning policy).
   still set `optimizer = slsqp`.
 
 ### Added
+- **Log-transform-both-sides (LTBS) combined with time-varying covariates** now gets an exact
+  analytic FOCE/FOCEI **outer** (θ/Ω/σ) gradient on the closed-form (analytical 1-/2-/3-cpt)
+  models instead of finite differences (#486). The event-driven TV-cov walk applies the same
+  post-walk `g = ln(f)` jet transform the dose-superposition path already used — last, after
+  any `ScalarScale`/`ExpressionScale` quotient, reproducing production's scale-then-log order
+  `ln(f/s)` — so LTBS composes with a time-varying-covariate and an `ExpressionScale`
+  `obs_scale`. Validated against FD of the log-scale production predictor.
+- **Plain closed-form LTBS now also gets an exact analytic *inner* EBE gradient** (#486), not
+  just the outer gradient — the light inner provider applies the same `g = ln(f)` jet.
+  Previously all LTBS models used a finite-difference inner gradient. Because the analytic inner
+  gradient makes the marginal surface slightly noisier (the `ln` wrap amplifies the ~1e-9
+  provider-vs-predictor gap), a **closed-form, non-IOV** LTBS fit converges the inner EBE loop to
+  at least `1e-6` (up from the `1e-5` default, unless you set `inner_tol` explicitly) so the fit
+  lands reproducibly on flat Ω directions and the covariance SEs of weakly-identified variances
+  are stable; the covariance step then reconverges tighter still (see the next entry). LTBS
+  combined with time-varying covariates, IOV, ODE, or an η-dependent `ExpressionScale` still uses
+  the FD inner gradient (those inner kernels do not yet carry the transform, or already agree
+  with the objective as ODE-LTBS does). Validated: the analytic inner η-gradient matches the
+  outer, and warfarin LTBS covariance SEs match NONMEM `$COV MATRIX=R`.
+- **New `[fit_options] cov_inner_tol`** — the inner EBE-reconvergence tolerance used **only by
+  the covariance step**, decoupled from the fit's `inner_tol`. The covariance R-matrix is a
+  second-difference of the reconverged OFV and is more sensitive to EBE precision than the fit
+  itself, so a sensitive/flat covariance can be reconverged tighter without slowing every outer
+  iteration (e.g. the heavily-censored M3 + IOV case in #654 — set `cov_inner_tol = 1e-11`).
+  Unset (default) uses `inner_tol` for ordinary models — SEs are byte-identical to before — and
+  `min(inner_tol, 1e-8)` for **closed-form, non-IOV LTBS** models, whose `g = ln(f)` covariance
+  Hessian needs the tighter reconvergence. (The covariance step is *not* tightened blanket-wide:
+  over-converging some ill-conditioned inner Hessians, e.g. IOV block-Ω, drives the covariance
+  indefinite.)
 - **A `TIME`-built-in structural parameter combined with a built-in absorption input-rate
   forcing or a non-zero ODE `init(...)` baseline** now gets exact analytic FOCE/FOCEI
   sensitivities instead of finite differences (#486). The event-driven walk that threads the

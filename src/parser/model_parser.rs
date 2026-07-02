@@ -4702,6 +4702,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "cov_inner_tol" => opts.cov_inner_tol = Some(parse_f64("cov_inner_tol")?),
         "outer_xtol" => {
             let v = parse_f64("outer_xtol")?;
             if v <= 0.0 || !v.is_finite() {
@@ -19365,6 +19366,20 @@ mod tests {
 
         assert!(apply_fit_option(&mut opts, "inner_maxiter", "oops").is_err());
         assert!(apply_fit_option(&mut opts, "inner_tol", "not_a_num").is_err());
+    }
+
+    #[test]
+    fn test_apply_fit_option_cov_inner_tol() {
+        let mut opts = FitOptions::default();
+        // Default is None (falls back to inner_tol via effective_cov_inner_tol).
+        assert_eq!(FitOptions::default().cov_inner_tol, None);
+        assert_eq!(
+            apply_fit_option(&mut opts, "cov_inner_tol", "1e-9"),
+            Ok(true)
+        );
+        assert_eq!(opts.cov_inner_tol, Some(1e-9));
+        assert!(opts.user_set_keys.iter().any(|k| k == "cov_inner_tol"));
+        assert!(apply_fit_option(&mut opts, "cov_inner_tol", "not_a_num").is_err());
     }
 
     #[test]

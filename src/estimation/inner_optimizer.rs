@@ -284,12 +284,20 @@ pub(crate) fn fd_fallback_warning(
         .iter()
         .filter(|s| crate::sens::provider::subject_eta_grad(model, s, theta, &zeros).is_none())
         .count();
-    if n_fd > 0 && n_fd < n_total {
+    // Warn on a mixed population (some subjects fall back per-point), and also when
+    // the *whole* population falls back while the model-level report claims analytic
+    // — e.g. TV-cov + LTBS, where `analytic_inner_grad_supported_model` (and hence
+    // `build_info::gradient_method_inner`) reports analytic but every subject's inner
+    // EBE gradient actually runs FD. Without this, that mislabel would go uncorrected
+    // (#381 review #9 / #665 review). A model that already reports FD and runs FD
+    // everywhere needs no warning.
+    let model_reports_analytic = analytic_inner_grad_supported_model(model);
+    if n_fd > 0 && (n_fd < n_total || model_reports_analytic) {
         Some(format!(
             "{n_fd} of {n_total} subjects use finite-difference inner gradients \
              (outside the analytic provider's scope, e.g. steady-state + reset, \
-             time-varying covariates, or modeled-duration doses); their results \
-             are correct but slower."
+             time-varying covariates + LTBS, or modeled-duration doses); their \
+             results are correct but slower."
         ))
     } else {
         None
@@ -1334,12 +1342,22 @@ pub fn profile_report() {
 /// The model-level inner-gradient bails that are independent of which analytic inner
 /// provider (non-IOV analytical, non-IOV ODE `Dual1`, or IOV) will serve the model.
 /// Returns `true` when the model must use the **FD** inner gradient regardless: the
-/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, LTBS, or
+/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, or
 /// IIV on residual error (`iiv_on_ruv`, whose `exp(2·η_ruv)` variance scaling none of
 /// the `Dual2`/`Dual1` kernels carry).
 /// Every analytic inner path consults this so none of them can run on a model that one
 /// of these reasons routes to FD — including the IOV inner loop, which previously dropped
 /// these exclusions (#466 review #1/#3).
+///
+/// LTBS is **no longer** a blanket common bail. The plain closed-form inner provider applies
+/// the `g = ln(f)` jet transform (`subject_eta_grad` → `run_obs_eta`), so it serves plain LTBS
+/// analytically; the covariance step reconverges those EBEs at the tighter `cov_inner_tol`
+/// ([`FitOptions::effective_cov_inner_tol`]) so the `ln`-amplified EBE noise no longer corrupts
+/// the SEs. LTBS + η-dependent `ExpressionScale` stays a (narrower) common bail — its analytic
+/// scale+log Jacobian is unvalidated. The other LTBS inner paths the analytic kernels don't yet
+/// carry decline through their own gates — TV-cov (`subject_eta_grad_tvcov`) and closed-form IOV
+/// (`iov_analytical_supported`) — so removing the blanket bail only enables the validated plain
+/// path.
 ///
 /// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
 /// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
@@ -1358,10 +1376,16 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
         || model.is_sde()
-        || model.log_transform
+        // LTBS + η-dependent `ExpressionScale`: plain LTBS takes the analytic inner
+        // gradient now, but the analytic scale+log Jacobian for this combination is not
+        // validated against the reconverged EBE, so keep it a model-level FD bail (mirrors
+        // the per-call decline in `subject_eta_grad`). Plain LTBS and constant `ScalarScale`
+        // are unaffected.
+        || (model.log_transform
+            && matches!(model.scaling, ScalingSpec::ExpressionScale { .. }))
         // Correlated residual error (`block_sigma`) is now served analytically by the
         // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
-        // longer a bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
+        // longer a blanket bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
         // Custom residual-error magnitude (#484) alone stays analytic (#576/#486 —
         // `residual_inner_obs` threads the η-independent per-obs multiplier). Only the
         // *combination* with a correlated residual bails: the dense-R inner kernel does
@@ -1398,12 +1422,14 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
 /// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
 pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
-    // Escape hatch, explicit `gradient = fd`, SDE, LTBS, and the `iiv_on_ruv` cases that
+    // Escape hatch, explicit `gradient = fd`, SDE, and the `iiv_on_ruv` cases that
     // force FD all revert the inner EBE gradient to FD (see `analytic_inner_common_bail`
-    // for the per-reason rationale). LTBS still gets the analytic *outer* gradient; only
-    // the inner finder reverts. (An eta-dependent `ExpressionScale` obs_scale is now
-    // served analytically on *both* loops — #534/#486 — so it is no longer a bail here;
-    // see `analytic_inner_common_bail`.)
+    // for the per-reason rationale). LTBS is now served analytically on the plain
+    // closed-form inner too (the `g = ln(f)` jet in `subject_eta_grad`), with the
+    // covariance step reconverging at the tighter `cov_inner_tol`; the LTBS paths the
+    // kernels don't carry (TV-cov, IOV, `ExpressionScale`) still decline via their own
+    // gates. An eta-dependent `ExpressionScale` obs_scale is served on *both* loops
+    // (#534/#486) so it is not a bail here either.
     if analytic_inner_common_bail(model) {
         return false;
     }
@@ -1433,20 +1459,21 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     //     `analytic_eta_nll_gradient_with_schedule` (provider-agnostic), so the
     //     light Dual1 ODE walk serves these models too. M3 BLOQ + `iiv_on_ruv`
     //     keeps FD (the censored residual-eta second derivatives are not assembled).
-    //   - LTBS: unlike the closed-form path (whose provider closed forms agree with
-    //     `compute_predictions` only to ~1e-9, amplified into the covariance Hessian
-    //     under the `g = ln(f)` wrap), the ODE `Dual1` walk shares `solve_ode_g`
-    //     with the objective, so the analytic-EBE *is* the objective's own minimum —
-    //     the gradient matches FD of `individual_nll` and the analytic/FD EBEs agree
-    //     to integrator tolerance, leaving the covariance Hessian clean. Validated
-    //     by `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd`
-    //     (#474). So ODE-LTBS takes the analytic inner gradient.
+    //   - LTBS: the ODE `Dual1` walk shares `solve_ode_g` with the objective, so the
+    //     analytic-EBE *is* the objective's own minimum — the gradient matches FD of
+    //     `individual_nll` and the analytic/FD EBEs agree to integrator tolerance,
+    //     leaving the covariance Hessian clean. Validated by
+    //     `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd` (#474). The
+    //     closed-form inner now serves LTBS too: its provider closed forms agree with
+    //     `compute_predictions` only to ~1e-9, which the `g = ln(f)` wrap amplifies into
+    //     the covariance Hessian, so it relies on the covariance step reconverging at the
+    //     tighter `cov_inner_tol` rather than on shared code (see
+    //     `FitOptions::effective_cov_inner_tol`).
     if model.ode_spec.is_some() {
-        // The ODE inner path deliberately does NOT bail on LTBS or `ExpressionScale`
-        // (unlike the closed-form `analytic_inner_common_bail`): the `Dual1` ODE walk
-        // shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic inner
-        // gradient (#474). Only the escape hatch / `gradient = fd` / SDE / `iiv_on_ruv`
-        // -forces-FD cases revert here.
+        // The ODE inner path does NOT bail on LTBS or `ExpressionScale`: the `Dual1` ODE
+        // walk shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic
+        // inner gradient (#474). Only the escape hatch / `gradient = fd` / SDE /
+        // `iiv_on_ruv`-forces-FD cases revert here.
         if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
@@ -1478,8 +1505,14 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // model that the walk declines (e.g. TIME + `[initial_conditions]`) would report
     // an analytic inner here while `subject_eta_grad` returns `None`, splitting the
     // inner route from the outer.
+    //
+    // LTBS declines on the event-driven inner walk (`subject_eta_grad_tvcov` returns
+    // `None` for `log_transform`; only the *plain* closed-form inner carries the
+    // `ln(f)` jet), so an event-walk subject under LTBS runs FD. Report FD here to
+    // match — otherwise the reported inner route would drift from what `find_ebe`
+    // runs for the whole-population TV-cov + LTBS case (#381 review #9 / #665 review).
     if crate::sens::provider::subject_routes_to_event_walk(model, subject) {
-        return crate::sens::provider::tvcov_analytical_supported(model);
+        return crate::sens::provider::tvcov_analytical_supported(model) && !model.log_transform;
     }
     true
 }
@@ -3713,6 +3746,82 @@ mod iov_tests {
         assert!(fd_fallback_warning(&model, &mk_pop(vec![analytic]), theta).is_none());
     }
 
+    /// Regression (#665 review #1): a TV-cov + LTBS model reports the inner route as
+    /// FD (not analytic) and, when the *whole* population falls back, still emits the
+    /// FD-fallback warning — the reported route must not drift from what `find_ebe`
+    /// runs. The event-driven inner walk declines LTBS, so every TV-cov subject runs
+    /// FD even though the model-level `gradient_method_inner` reports analytic.
+    #[test]
+    fn tvcov_ltbs_reports_fd_inner_and_warns() {
+        use crate::parser::model_parser::parse_model_string;
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma ADD_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[covariates]
+  WT continuous
+[error_model]
+  log(DV) ~ additive(ADD_ERR)
+"#;
+        let model = parse_model_string(src).expect("parse TV-cov LTBS");
+        assert!(model.log_transform);
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let tvcov_subj = || Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 4.0, 8.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0, 3.0],
+            obs_cmts: vec![1; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            // Time-varying WT → routes to the event-driven walk, which declines LTBS.
+            obs_covariates: vec![wt(70.0), wt(72.0), wt(80.0), wt(85.0), wt(90.0)],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: vec![1; 5],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let subject = tvcov_subj();
+        assert!(subject.has_tv_covariates(), "fixture must be TV-cov");
+        // The per-subject route (and hence the startup banner) is FD, not analytic.
+        assert_eq!(
+            resolve_gradient_method(&model, &subject),
+            InnerGradientMethod::Fd,
+            "TV-cov + LTBS inner gradient must route to FD"
+        );
+        // Whole population on FD, yet the model-level report claims analytic — the
+        // warning must still fire so the mislabel is corrected.
+        let population = Population {
+            subjects: vec![tvcov_subj(), tvcov_subj()],
+            covariate_names: vec!["WT".into()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let w = fd_fallback_warning(&model, &population, &model.default_params.theta)
+            .expect("all-FD-under-analytic-label population must warn");
+        assert!(w.contains("2 of 2"), "got: {w}");
+    }
+
     #[test]
     fn iov_fd_fallback_warning_reports_subject_reason() {
         // Covariate-free ODE IOV model the provider serves analytically, so the FD
@@ -5243,9 +5352,20 @@ mod iov_tests {
         assert!(!model.iiv_on_ruv_forces_fd());
         model.bloq_method = crate::types::BloqMethod::Drop;
         model.residual_error_eta = None;
-        // LTBS forces FD.
+        // LTBS is no longer a blanket common bail (plain closed-form LTBS takes the
+        // analytic inner gradient as of PR #665). This ODE-IOV model still routes to the
+        // FD inner under LTBS, but now via the IOV support gate rather than the common
+        // bail: both `ode_iov_supported` and `iov_analytical_supported` require
+        // `!log_transform`, so `iov_sens_supported` is false for an LTBS IOV model.
         model.log_transform = true;
-        assert!(analytic_inner_common_bail(&model));
+        assert!(
+            !analytic_inner_common_bail(&model),
+            "LTBS is no longer a blanket common bail (#665)"
+        );
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&model),
+            "LTBS IOV routes to FD via the IOV support gate"
+        );
         model.log_transform = false;
 
         // The *outer* IOV gate (`iov_sens_supported`) for this **ODE** model now admits

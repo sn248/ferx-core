@@ -3324,6 +3324,25 @@ fn fit_inner(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // LTBS needs the inner EBE loop converged tighter than the default for
+    // reproducible standard errors (see `FitOptions::effective_inner_tol` /
+    // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
+    // the covariance step (which reconverges tighter still via `effective_cov_inner_tol`)
+    // work from the same tightened tolerance. `min` never loosens an explicit
+    // user setting; non-LTBS models are untouched (same `options` reference).
+    let ltbs_opts;
+    let options = {
+        let eff = options.effective_inner_tol(model.uses_closed_form_ltbs_inner());
+        if eff < options.inner_tol {
+            ltbs_opts = FitOptions {
+                inner_tol: eff,
+                ..options.clone()
+            };
+            &ltbs_opts
+        } else {
+            options
+        }
+    };
     let fit_start = Instant::now();
     let chain = options.method_chain();
     let n_stages = chain.len();

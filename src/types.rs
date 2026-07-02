@@ -2093,6 +2093,71 @@ pub struct AnalyticalInit {
     pub amount_deriv: Option<crate::parser::model_parser::ScaleDerivProgram>,
 }
 
+/// A full Form C output readout (`[scaling] y = <expr>`) lifted onto an
+/// **analytical** PK model (issue #650).
+///
+/// Analytical closed forms return the built-in central-compartment
+/// *concentration*. A Form C readout **replaces** that concentration with an
+/// arbitrary expression that may reference compartment **amounts** by name
+/// (`central` always; `depot` for oral models — peripheral amounts are rejected
+/// at parse, mirroring `[initial_conditions]`), individual parameters, thetas,
+/// etas, covariates, and `if/else`. This is the analytic analogue of the ODE
+/// Form C readout stored on [`crate::ode::OdeSpec::readout`]; analytical models
+/// have `ode_spec == None`, so the readout lives here instead.
+///
+/// The predictor reconstructs the compartment-amount vector (central =
+/// concentration × `V`; depot = superposed `F·D·exp(-ka·t)`) in `state_names`
+/// order and feeds it, plus individual params / covariates, to the shared
+/// `PkNum`-generic evaluator [`crate::parser::model_parser::OdeOutputProgram::eval_output_g`]
+/// — the same one the ODE provider uses — so FOCE/FOCEI sensitivities stay
+/// analytic over `Dual2`/`Dual1` (no finite-difference fallback on the
+/// supported paths).
+///
+/// `#[non_exhaustive]`: constructed only inside the crate (the parser).
+#[non_exhaustive]
+pub struct AnalyticReadout {
+    /// The compiled readout: `OdeReadout::Single` for uniform `y = <expr>`,
+    /// `OdeReadout::PerCmt` for per-CMT `y[CMT=N] = <expr>`. Reuses the ODE
+    /// readout enum and its f64 `OdeOutputFn` closure(s).
+    pub readout: crate::ode::OdeReadout,
+    /// Sensitivity program for the uniform `Single` readout (issue #650), so the
+    /// analytic provider can differentiate it over `Dual2`/`Dual1`. `None` for
+    /// per-CMT (each `PerCmtReadout` carries its own program) and for readouts
+    /// that are not dual-evaluable (those fall back to FD, matching ODE).
+    pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
+    /// Canonical compartment names in `state[]` order — `["central"]` for IV
+    /// models, `["depot", "central"]` for oral. Parallel to the amount vector
+    /// the predictor builds and to the readout program's `n_states` layout.
+    pub state_names: Vec<String>,
+}
+
+impl AnalyticReadout {
+    /// Whether the readout reads the oral **depot** amount (state slot 0 in the
+    /// `["depot", "central"]` layout).
+    ///
+    /// The depot amount is reconstructed by dose superposition, which is invalid
+    /// across EVID=3/4 resets — a reset zeros the compartments and the closed
+    /// form has no way to restart the accumulation. So `fit`/`predict` reject a
+    /// depot-referencing readout on a subject that carries a reset, rather than
+    /// silently feeding a zero depot into the readout (issue #650 review). A
+    /// readout that only reads `central` is unaffected (the central concentration
+    /// is already reset-correct).
+    pub(crate) fn references_depot(&self) -> bool {
+        if self.state_names.first().map(String::as_str) != Some("depot") {
+            return false;
+        }
+        match &self.readout {
+            crate::ode::OdeReadout::ObsCmt(_) => false,
+            crate::ode::OdeReadout::Single(_) => {
+                self.program.as_ref().is_some_and(|p| p.references_state(0))
+            }
+            crate::ode::OdeReadout::PerCmt(map) => map
+                .values()
+                .any(|r| r.program.as_ref().is_some_and(|p| p.references_state(0))),
+        }
+    }
+}
+
 /// How the structural model's raw output is mapped to the observed `DV`.
 ///
 /// Set by the `[scaling]` block in `.ferx` model files. The convention is
@@ -2695,6 +2760,13 @@ pub struct CompiledModel {
     /// `F`-bypassed bolus impulse onto the dose-driven prediction; see
     /// [`AnalyticalInit`] and `pk::add_analytical_init`.
     pub analytical_init: Vec<AnalyticalInit>,
+    /// Full Form C output readout (`[scaling] y = <expr>`) for **analytical** PK
+    /// models (issue #650). `None` for the common case (built-in concentration
+    /// readout), for Forms A/B (`obs_scale`, stored in [`Self::scaling`]), and
+    /// for ODE models (whose Form C readout lives on `ode_spec.readout`). When
+    /// `Some`, the readout replaces the built-in concentration prediction; see
+    /// [`AnalyticReadout`].
+    pub analytic_readout: Option<AnalyticReadout>,
     /// Custom residual-error magnitude (#484). `None` for the common case where
     /// every sigma is a bare parameter (the legacy variance path). `Some` when
     /// the `[error_model]` makes a sigma's magnitude an expression of TIME /
@@ -5260,6 +5332,7 @@ pub(crate) mod test_helpers {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -5347,6 +5420,7 @@ pub(crate) mod test_helpers {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
 

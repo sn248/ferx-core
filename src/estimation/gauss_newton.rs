@@ -2017,6 +2017,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -2986,6 +2987,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
 
@@ -3272,6 +3274,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }

@@ -125,6 +125,9 @@ pub(crate) fn model_preds(
         );
         pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
+    // Analytic Form C readout (#650): replaces the built-in concentration. No-op
+    // for ODE models (handled inside `compute_predictions_ode`) and when unset.
+    pk::apply_analytic_readout(model, subject, theta, eta, &mut preds);
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
     pk::apply_log_transform(model, &mut preds);
     preds
@@ -1188,6 +1191,39 @@ pub(crate) fn check_transit_support(
     None
 }
 
+/// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
+/// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
+///
+/// The depot amount is reconstructed by dose superposition (`apply_analytic_readout`),
+/// which is invalid across a reset — the closed form cannot restart the accumulation,
+/// so the readout would silently see a zero depot after the reset and mis-predict.
+/// Rather than return a subtly wrong `PRED`/OFV, fail loudly and point at an ODE
+/// model (which integrates the depot state across resets). A `central`-only readout
+/// is unaffected. Returns `None` for the common no-readout / IV / central-only case.
+pub(crate) fn check_analytic_readout_support(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    let ar = model.analytic_readout.as_ref()?;
+    if !ar.references_depot() {
+        return None;
+    }
+    for subject in &population.subjects {
+        if subject.has_resets() {
+            return Some(format!(
+                "[scaling] y: an analytic Form C readout that references the oral `depot` \
+                 amount is not supported on a subject with an EVID=3/4 reset (subject {}): \
+                 the depot amount is reconstructed by dose superposition, which is invalid \
+                 across a reset. Reference only the `central` amount, or use an ODE model \
+                 (`ode(states=[depot, central])`) which integrates the depot across resets. \
+                 See issue #650.",
+                subject.id
+            ));
+        }
+    }
+    None
+}
+
 /// Panic on an unsupported `one_cpt_transit` model/data combination, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
@@ -1196,6 +1232,19 @@ pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Populat
         panic!(
             "predict()/simulate() received a model/data combination one_cpt_transit cannot \
              honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
+/// Panic on a depot-referencing analytic Form C readout + reset subject, for the
+/// `Vec`-returning `predict()`/`simulate()` paths (mirrors
+/// [`assert_transit_support`]). `fit()` returns this as an `Err`.
+pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_analytic_readout_support(model, population) {
+        panic!(
+            "predict()/simulate() received a model/data combination the analytic Form C \
+             readout cannot honour: {msg}\n(fit() reports this as an error rather than \
+             panicking.)"
         );
     }
 }
@@ -2016,6 +2065,12 @@ pub fn fit(
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     if let Some(e) = check_transit_support(model, population) {
+        return Err(e);
+    }
+    // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
+    // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
+    // would silently read a zero depot. Fail loudly instead.
+    if let Some(e) = check_analytic_readout_support(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -6573,6 +6628,7 @@ pub fn predict(
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_analytic_readout_support(model, population);
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
@@ -6899,6 +6955,7 @@ mod iov_integration {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -8940,6 +8997,7 @@ mod simulate_with_uncertainty_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -9757,6 +9815,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
 
@@ -10088,6 +10147,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         };
 
@@ -10247,6 +10307,7 @@ mod tests_derived_session_clock {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
         }
     }
@@ -10566,6 +10627,7 @@ mod tests_derived_iov_kappa {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,

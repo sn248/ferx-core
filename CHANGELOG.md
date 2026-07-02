@@ -19,6 +19,24 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Full `[scaling] y = <expr>` output readouts (Form C) on analytical PK models** (#650).
+  A closed-form (`pk one_cpt_iv(...)`, …) model can now replace the built-in
+  concentration output with an arbitrary readout expression — enabling flexible
+  multi-DV residual errors such as a free-vs-total protein-binding correction
+  (`y = if (FREE == 0) central/V + BMAX*(central/V)/(KD + central/V) else central/V`),
+  previously expressible only on ODE models. The readout may reference the central
+  compartment **amount** (`central`, and the oral `depot`), individual parameters —
+  **including non-structural ones** like a binding `BMAX`/`KD` — thetas, etas, covariates
+  (read per-observation, so a per-row flag switches the readout), and `if/else`. FOCEI/FOCE
+  gradients flow through it **analytically** (outer and inner) on both the static
+  dose-superposition path and the time-varying-covariate / oral-infusion event-walk path —
+  so a free-vs-total readout gated on a per-row `FREE` flag stays analytic. IOV subjects, a
+  readout referencing the oral depot amount, per-CMT readouts, and direct θ/η references
+  fall back to finite-difference gradients (the prediction stays exact, and the parser
+  emits a warning). Peripheral compartment amounts are rejected (use an ODE model). See
+  [Scaling → Form C](https://ferx-nlme.github.io/ferx-core/model-file/scaling.html).
+
 ### Changed
 - **M3 BLOQ censored rows now enter the FOCEI Laplace determinant `log|H̃|`** for a
   consistent likelihood (#486). Previously censored rows contributed to the data term and

@@ -20917,12 +20917,10 @@ if (WT > 70) {
         );
     }
 
-    #[test]
-    fn test_selected_error_model_accepts_block_sigma() {
-        // #669: block_sigma correlated residuals now parse together with a
-        // covariate-selected [error_model]. The off-diagonal couples the two
-        // branches' sigmas, and `build_residual_correlations` records it.
-        let src = r"
+    /// Shared free/total covariate-selected model with the two branch sigmas in
+    /// one `block_sigma` (#669). Used by the accept-parse and the cross-branch
+    /// R-matrix tests so the two can't drift.
+    const SELECTED_BLOCK_SIGMA_MODEL: &str = r"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
   theta TVV(50.0, 5.0, 500.0)
@@ -20946,7 +20944,13 @@ if (WT > 70) {
 [covariates]
   FREE continuous
 ";
-        let model = parse_full_model(src).unwrap().model;
+
+    #[test]
+    fn test_selected_error_model_accepts_block_sigma() {
+        // #669: block_sigma correlated residuals now parse together with a
+        // covariate-selected [error_model]. The off-diagonal couples the two
+        // branches' sigmas, and `build_residual_correlations` records it.
+        let model = parse_full_model(SELECTED_BLOCK_SIGMA_MODEL).unwrap().model;
         assert!(matches!(model.error_spec, ErrorSpec::Selected { .. }));
         // One off-diagonal correlation between the two branch sigmas (idx 0,1).
         assert_eq!(model.residual_correlations.len(), 1);
@@ -21004,34 +21008,7 @@ if (WT > 70) {
         // unbound). The dense R off-diagonal must carry the block_sigma
         // cross-branch covariance rho·σ_i·σ_j scaled by each row's proportional
         // loading (f·σ_i)(f·σ_j) — identical to the total/unbound PerCmt case.
-        let model = parse_full_model(
-            r"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 5.0, 500.0)
-  omega ETA_CL ~ 0.09
-  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.01, 0.005, 0.09]
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  if (FREE == 0) {
-    DV ~ proportional(PROP_TOTAL)
-  } else {
-    DV ~ proportional(PROP_UNBOUND)
-  }
-
-[covariates]
-  FREE continuous
-",
-        )
-        .unwrap()
-        .model;
+        let model = parse_full_model(SELECTED_BLOCK_SIGMA_MODEL).unwrap().model;
 
         let subject = crate::types::Subject {
             id: "S1".to_string(),

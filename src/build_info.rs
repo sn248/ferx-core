@@ -183,10 +183,10 @@ mod tests {
 
     #[test]
     fn inner_plain_ltbs_returns_analytic() {
-        // Plain closed-form LTBS now takes the analytic inner gradient (PR #665); the
-        // covariance step reconverges its EBEs at the tighter `cov_inner_tol`. (LTBS +
-        // η-dependent `ExpressionScale` still reports FD — see the provider test
-        // `ltbs_plus_expression_scale_inner_falls_back_to_fd`.)
+        // Closed-form LTBS takes the analytic inner gradient (PR #665; the Tier-1 follow-up
+        // extends it to × `ExpressionScale` and × TV-cov). The covariance step reconverges
+        // its EBEs at the tighter `cov_inner_tol`. LTBS × IOV still routes to FD (via
+        // `iov_analytical_supported`'s own gate).
         let mut m = test_helpers::analytical_model(GradientMethod::Auto);
         m.log_transform = true;
         assert_eq!(

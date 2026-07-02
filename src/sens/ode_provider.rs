@@ -8440,6 +8440,123 @@ mod tests {
         check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
+    /// #486 (route-completeness): the **three-way** composition of a `TIME`-switched CL,
+    /// a built-in `first_order` absorption **input-rate forcing**, AND an estimated
+    /// compartment-indexed **lagtime** (`ALAG1`). Each pair is covered elsewhere
+    /// (`ode_time_builtin_with_first_order_matches_production` = TIME + `R_in`;
+    /// `ode_provider_first_order_with_alag_matches_production` = `R_in` + lag), but the
+    /// gate removed in this PR newly admits all three at once, so the per-event `TIME`
+    /// PK-param seeding (#637), the `R_in` forcing (#643), and the lagged rate-on
+    /// saltation `Δr = dose·ka` at the moving arrival `t_dose + lag` must compose. If they
+    /// did not, `ode_subject_sensitivities` would return `Some` with a silently wrong
+    /// gradient (no FD fallback), so value/∂η/∂θ + the 2nd-order blocks are checked against
+    /// FD of production and the inner `Dual1` against the outer `Dual2`.
+    #[test]
+    fn ode_time_builtin_with_first_order_and_lagtime_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_KA ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V     = TVV
+  KA    = TVKA * exp(ETA_KA)
+  ALAG1 = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+first_order+lagtime");
+        assert!(model.has_lagtime());
+        assert!(
+            ode_analytical_supported(&model),
+            "TIME + input-rate + lagtime must be analytic now (#486)"
+        );
+        // Obs deliberately straddle both the `TIME = 5` switch and the `t_dose + TVLAG`
+        // arrival, while avoiding landing exactly on `t_dose + TVLAG` (a central-FD kink
+        // in `lag`, see `ode_provider_first_order_with_alag_matches_production`).
+        let subject = bolus_subject(&[0.1, 0.2, 0.4, 3.0, 8.0, 16.0, 30.0]);
+        assert!(!ode_subject_supported(&model, &subject));
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0, 1.0, 0.3];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// #486 (newly-analytic composed cell): `TIME`-switched CL + a non-zero `init(...)`
+    /// baseline + a **steady-state** dose. Unlike SS + input-rate (declined above), SS +
+    /// `init` IS supported by production: `equilibrate_ss_state` seeds the SS trough from
+    /// zero and overwrites the state at the SS dose (discarding `init` there), while `init`
+    /// still governs the **pre-SS-dose** segments — so the walk must reproduce both the
+    /// decaying-`init` pre-dose predictions (crossing the `TIME` switch) and the post-dose
+    /// steady state. This composition was FD before this PR (the removed gate) and is
+    /// **computed** by the walk now, so it is the one genuinely-new cell that could be
+    /// silently wrong; value/∂η/∂θ + 2nd-order must match FD of production.
+    #[test]
+    fn ode_time_builtin_with_init_and_ss_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = 1000.0 / V
+  d/dt(central) = -(CL/V)*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+init+SS");
+        assert!(model.ode_spec.as_ref().unwrap().init_fn.is_some());
+        assert!(ode_analytical_supported(&model));
+        // Pre-SS-dose obs (2, 4) decay the `init` baseline and straddle TIME = 5; the SS
+        // bolus lands at t = 8 (II = 12), and later obs (10, 14, 20) read the steady state.
+        let mut subject = bolus_subject(&[2.0, 4.0, 10.0, 14.0, 20.0]);
+        subject.doses = vec![DoseEvent::new(8.0, 100.0, 1, 0.0, true, 12.0)];
+        assert!(subject.doses[0].ss && subject.has_periodic_ss_dose());
+        assert!(!ode_subject_supported(&model, &subject));
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
     /// #486: an η-dependent `ExpressionScale` `obs_scale = 1000/V` on the **ODE
     /// event-driven walk** — for a `TIME` switch AND a time-varying covariate. The walk
     /// now applies the subject-static scale quotient (`apply_expression_scale_outer`)

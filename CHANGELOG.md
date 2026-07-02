@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Log-transform-both-sides (LTBS) combined with IOV now gets an analytic *outer* (θ/Ω/σ)
+  gradient** (#486): the closed-form IOV sensitivity walk applies the `ln(f)` jet after its
+  in-walk scale quotient, reproducing production's scale-then-log order `ln(f/s)`, so LTBS × IOV
+  models (including with an `ExpressionScale obs_scale`) no longer fall back to finite
+  differences on the population gradient. Validated against reconverged finite differences of
+  the FOCEI-IOV objective. The inner EBE gradient still uses finite differences for LTBS × IOV.
+- **Custom / time-varying residual-error magnitude combined with `iiv_on_ruv` is now analytic
+  under IOV too** (#486): #673 covered the non-IOV case; the stacked `[η_bsv, κ]` residual-eta
+  assembly is dimension-generic, so occasion (κ) random effects compose with the magnitude
+  direct-θ terms with no extra work. Validated against reconverged finite differences.
 - **Log-transform-both-sides (LTBS) analytic *inner* EBE gradient now covers the remaining
   closed-form combinations** (#486): plain LTBS landed in #665; this extends the same
   `g = ln(f)` inner jet to LTBS combined with an η-dependent `ExpressionScale obs_scale`, with

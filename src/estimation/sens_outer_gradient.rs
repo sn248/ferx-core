@@ -735,16 +735,14 @@ fn prepare_stacked(
     };
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     // Custom magnitude threads its direct-θ chain through `iiv_on_ruv` (the residual-eta
-    // `c̃`-column `d/R` gets its `∂/∂θ` terms in `theta_block`) — but only validated on the
-    // **non-IOV** path. `prepare_stacked` is shared with the IOV callers
-    // (`subject_packed_gradient_iov` / `subject_theta_gradient_iov`), and the κ-augmented
-    // stacked residual-eta assembly (`m_vec[rr]`, `prep.w[j][rr]`) is not covered, so bail
-    // magnitude × `iiv_on_ruv` under IOV to per-subject FD. Magnitude combined with an
-    // M3-censored row also bails (the censored `−logΦ(z)` kernel's direct-θ chain is
-    // unbuilt); the `cens` scan stays behind `mult && m3` so non-magnitude subjects pay nothing.
-    if mult.is_some()
-        && ((ruv.is_some() && model.n_kappa > 0) || (m3 && subject.cens.iter().any(|&c| c != 0)))
-    {
+    // `c̃`-column `d/R` gets its `∂/∂θ` terms in `theta_block`). The stacked residual-eta
+    // assembly below (`m_vec[rr]`, `prep.w[j][rr]`) loops over every stacked axis, so it is
+    // dimension-generic across the κ (occasion) block too — magnitude × `iiv_on_ruv` is
+    // analytic under IOV as well as non-IOV (#486; FD-validated by
+    // `magnitude_iiv_on_ruv_iov_packed_matches_fd`). Magnitude combined with an M3-censored
+    // row still bails (the censored `−logΦ(z)` kernel's direct-θ chain is unbuilt); the
+    // `cens` scan stays behind `mult && m3` so non-magnitude subjects pay nothing.
+    if mult.is_some() && m3 && subject.cens.iter().any(|&c| c != 0) {
         return None;
     }
 
@@ -6787,6 +6785,141 @@ mod tests {
         }
     }
 
+    /// [`WARFARIN_IOV`] with a `log_additive` (LTBS) error model — plain closed-form
+    /// LTBS × IOV. #665 served LTBS on the non-IOV outer gradient (post-walk `ln(f)`
+    /// jet); this fixture drives its IOV twin.
+    const WARFARIN_IOV_LTBS: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.02
+  sigma ADD_ERR ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ log_additive(ADD_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+    /// As [`WARFARIN_IOV_LTBS`] but also carrying an η-dependent `ExpressionScale`
+    /// `obs_scale = V` — pins the composition `ln(f / s)` under IOV (the in-walk scale
+    /// quotient followed by the post-walk `ln` jet must reproduce production's
+    /// scale-then-log order in `predict_iov`).
+    const WARFARIN_IOV_LTBS_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.02
+  sigma ADD_ERR ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ log_additive(ADD_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+    /// Shared check for closed-form LTBS × IOV on the **outer** packed gradient (#486):
+    /// the analytic gradient (`subject_packed_gradient_iov` over the `Dual2` walk with the
+    /// post-walk `ln(f)` jet in `subject_sensitivities_iov`) must match Richardson
+    /// reconverged-FD of the FOCEI-IOV marginal, every packed θ/Ω_bsv/σ/Ω_iov coordinate.
+    /// Also pins the routing: the OUTER loop is analytic while the INNER EBE gradient stays
+    /// on FD (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause). The
+    /// subject is synthesised with the model itself, so its observations sit on the model's
+    /// (log) output scale — the same convention the non-IOV LTBS outer tests use.
+    fn check_ltbs_iov_outer_matches_fd(model: &CompiledModel, theta: &[f64]) {
+        use crate::estimation::parameterization::pack_params;
+        assert!(model.log_transform, "fixture must be LTBS");
+        assert!(model.n_kappa > 0, "fixture must carry IOV");
+        assert!(
+            crate::sens::provider::iov_analytical_supported(model),
+            "LTBS × IOV must route to the analytic closed-form OUTER path (#486)"
+        );
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            model
+        ));
+        assert!(
+            crate::estimation::inner_optimizer::analytic_inner_common_bail(model),
+            "LTBS × IOV inner EBE gradient must stay on FD"
+        );
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+        let subject = iov_subject_outer(model, theta);
+        let template = params.clone();
+        let x = pack_params(&params);
+        let (stacked, _e, _k, _h) = precise_ebe_iov(model, &subject, &params);
+        let analytic = subject_packed_gradient_iov(model, &subject, &template, &x, &stacked)
+            .expect("LTBS × IOV outer packed gradient supported");
+        assert!(
+            analytic.iter().all(|v| v.is_finite()),
+            "packed gradient must be finite"
+        );
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov(model, &subject, &p)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "ltbs+iov x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[i],
+                fd,
+                (analytic[i] - fd).abs() / fd.abs().max(1e-9)
+            );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+        }
+    }
+
+    #[test]
+    fn ltbs_iov_outer_packed_matches_fd() {
+        let model = parse_model_string(WARFARIN_IOV_LTBS).expect("parse LTBS IOV");
+        check_ltbs_iov_outer_matches_fd(&model, &[0.22, 11.0, 1.4]);
+    }
+
+    #[test]
+    fn ltbs_expr_scale_iov_outer_packed_matches_fd() {
+        let model = parse_model_string(WARFARIN_IOV_LTBS_EXPRSCALE).expect("parse LTBS+scale IOV");
+        assert!(
+            matches!(
+                model.scaling,
+                crate::types::ScalingSpec::ExpressionScale { .. }
+            ),
+            "fixture must carry an expression obs_scale"
+        );
+        check_ltbs_iov_outer_matches_fd(&model, &[0.22, 11.0, 1.4]);
+    }
+
     /// Two-occasion IOV subject with M3-censored rows (#580): the same geometry as
     /// [`iov_subject_outer`], but occasion 2's two tail observations are flagged
     /// `CENS = 1` (left-censored at their synthesized value ≈ 0.85·f, so the
@@ -8409,6 +8542,95 @@ mod tests {
                 analytic[i],
                 fd,
                 (analytic[i] - fd).abs() / fd.abs().max(1e-12)
+            );
+            approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
+        }
+    }
+
+    /// [`WARFARIN_IOV_RUV`] + a TIME-varying proportional σ magnitude — the triple
+    /// custom-magnitude × `iiv_on_ruv` × IOV on the **FOCEI** packed gradient
+    /// (`subject_packed_gradient_iov` → `prepare_stacked`). #673 gated this to non-IOV
+    /// pending validation of the κ-augmented residual-eta assembly; the stacked
+    /// `[η_bsv, κ]` residual-eta terms are dimension-generic, so #486 admits it — this
+    /// pins the gate flip against reconverged-FD of the (magnitude-aware) FOCEI-IOV
+    /// marginal across every packed θ/Ω_bsv/σ/Ω_iov coordinate.
+    const WARFARIN_IOV_RUV_MAG_IIV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta RUV_LATE(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+    #[test]
+    fn magnitude_iiv_on_ruv_iov_packed_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        let model = parse_model_string(WARFARIN_IOV_RUV_MAG_IIV).expect("parse");
+        assert!(model.has_custom_ruv_magnitude());
+        assert_eq!(model.residual_error_eta, Some(3), "ETA_RUV is the 4th eta");
+        assert!(model.n_kappa > 0, "fixture must carry IOV");
+        assert!(
+            crate::sens::provider::iov_analytical_supported(&model),
+            "magnitude × iiv_on_ruv × IOV must route to the analytic closed-form path"
+        );
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "the outer gate must admit magnitude × iiv_on_ruv × IOV"
+        );
+        let theta = vec![0.22, 11.0, 1.4, 1.6];
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let subject = iov_ruv_subject(&model, &theta);
+        let template = params.clone();
+        let x = pack_params(&params);
+        let (stacked, _e, _k, _h) = precise_ebe_iov(&model, &subject, &params);
+        let analytic = subject_packed_gradient_iov(&model, &subject, &template, &x, &stacked)
+            .expect("magnitude × iiv_on_ruv × IOV packed gradient supported");
+        assert!(
+            analytic.iter().all(|v| v.is_finite()),
+            "packed gradient must be finite"
+        );
+        // FD of the (magnitude-aware) FOCEI-IOV marginal, reconverging the joint
+        // `[η_bsv, κ]` EBE per point (`precise_ebe_iov` uses `variance_at_scaled`).
+        let f = |xx: &[f64]| -> f64 {
+            let p = unpack_params(xx, &template);
+            marginal_nll_iov(&model, &subject, &p)
+        };
+        for i in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[i].abs());
+            let fd_at = |hh: f64| -> f64 {
+                let mut xp = x.clone();
+                xp[i] += hh;
+                let mut xm = x.clone();
+                xm[i] -= hh;
+                (f(&xp) - f(&xm)) / (2.0 * hh)
+            };
+            let f1 = fd_at(h);
+            let f2 = fd_at(h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
+            eprintln!(
+                "mag+iov+ruv x[{i}]: analytic={:.8}  fd={:.8}  rel={:.2e}",
+                analytic[i],
+                fd,
+                (analytic[i] - fd).abs() / fd.abs().max(1e-9)
             );
             approx::assert_relative_eq!(analytic[i], fd, max_relative = 3e-3, epsilon = 2e-5);
         }

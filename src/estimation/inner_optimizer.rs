@@ -1378,8 +1378,13 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         || model.is_sde()
         // LTBS is served analytically on the inner loop now — plain, × `ExpressionScale`
         // (the η-quotient then the `ln f` jet, `subject_eta_grad`), and × TV-cov (the
-        // event-driven inner walk applies the same jet LAST). LTBS × IOV still declines,
-        // but via `iov_analytical_supported`'s own `!log_transform` gate, not here.
+        // event-driven inner walk applies the same jet LAST). LTBS × IOV, however, stays on
+        // the FD inner: the closed-form OUTER IOV gradient now serves LTBS (the `ln(f)` jet in
+        // `subject_sensitivities_iov`, #486), so `iov_analytical_supported` admits
+        // `log_transform` — but `run_obs_iov_eta` (the Dual1 inner walk) carries no `ln` jet,
+        // so decline the inner here to keep the EBE reconvergence on FD (the IOV twin of how
+        // plain/TV-cov LTBS is served on the inner but IOV is not).
+        || (model.log_transform && model.n_kappa > 0)
         // Correlated residual error (`block_sigma`) is now served analytically by the
         // dense-R inner gradient (`dense_residual_inner_gradient`, #627), so it is no
         // longer a blanket bail. (An eta-dependent `ExpressionScale` is NOT a bail either.)
@@ -5353,19 +5358,20 @@ mod iov_tests {
         assert!(!model.iiv_on_ruv_forces_fd());
         model.bloq_method = crate::types::BloqMethod::Drop;
         model.residual_error_eta = None;
-        // LTBS is no longer a blanket common bail (plain closed-form LTBS takes the
-        // analytic inner gradient as of PR #665). This ODE-IOV model still routes to the
-        // FD inner under LTBS, but now via the IOV support gate rather than the common
-        // bail: both `ode_iov_supported` and `iov_analytical_supported` require
-        // `!log_transform`, so `iov_sens_supported` is false for an LTBS IOV model.
+        // LTBS × IOV now takes the FD *inner* gradient via `analytic_inner_common_bail`'s
+        // `log_transform && n_kappa > 0` clause (#486): the closed-form OUTER IOV gradient
+        // serves LTBS (so `iov_analytical_supported` admits `log_transform`), but the Dual1
+        // inner walk carries no `ln` jet, so the inner stays on FD. This model is ODE-based,
+        // so its *outer* IOV gate (`ode_iov_supported`) still declines LTBS independently —
+        // `iov_sens_supported` is false here for a different reason (the ODE path).
         model.log_transform = true;
         assert!(
-            !analytic_inner_common_bail(&model),
-            "LTBS is no longer a blanket common bail (#665)"
+            analytic_inner_common_bail(&model),
+            "LTBS × IOV declines the analytic inner via the common bail (#486)"
         );
         assert!(
             !crate::sens::provider::iov_sens_supported(&model),
-            "LTBS IOV routes to FD via the IOV support gate"
+            "ODE IOV + LTBS still routes to FD via the ODE IOV support gate"
         );
         model.log_transform = false;
 
@@ -5406,8 +5412,9 @@ mod iov_tests {
 
         // The CLOSED-FORM IOV path (`iov_analytical_supported`) now admits an η-dependent
         // `ExpressionScale` `obs_scale` too (#486): the closed-form event-driven walk applies
-        // the same per-occasion-group post-walk quotient as the ODE path. LTBS still declines
-        // — pinned in `sens::provider::tests::iov_analytical_expr_scale_supported_and_gated`.
+        // the same per-occasion-group post-walk quotient as the ODE path. LTBS is served on
+        // the OUTER gradient now (#486) — pinned in
+        // `sens::provider::tests::iov_analytical_expr_scale_supported_and_gated`.
         let iov_scaled_cf = parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
@@ -5422,9 +5429,16 @@ mod iov_tests {
         );
         let mut iov_scaled_cf_ltbs = iov_scaled_cf;
         iov_scaled_cf_ltbs.log_transform = true;
+        // Closed-form IOV + obs_scale + LTBS: the OUTER gradient is served now (#486 — the
+        // `ln(f)` jet applied after the in-walk scale quotient), so `iov_sens_supported` is
+        // true; the inner EBE gradient still declines via `analytic_inner_common_bail`.
         assert!(
-            !crate::sens::provider::iov_sens_supported(&iov_scaled_cf_ltbs),
-            "closed-form IOV + obs_scale + LTBS still routes to FD"
+            crate::sens::provider::iov_sens_supported(&iov_scaled_cf_ltbs),
+            "closed-form IOV + obs_scale + LTBS is served on the OUTER gradient (#486)"
+        );
+        assert!(
+            analytic_inner_common_bail(&iov_scaled_cf_ltbs),
+            "closed-form IOV + obs_scale + LTBS still declines the analytic inner"
         );
     }
 

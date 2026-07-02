@@ -540,25 +540,20 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
-- **A `one_cpt_transit` model with a `TIME`-dependent structural parameter now works.**
-  The transit closed form assumes constant parameters over each absorption window, so it
-  cannot honour a mid-profile `TIME` switch (it would silently freeze `TIME` at the first
-  record). The plain `cl/v/n/mtt` form is now transparently compiled to its exact ODE
-  `transit()` equivalent — `d/dt(central) = transit(n, mtt) − (CL/V)·central`, `obs_scale =
-  V` — which carries the per-event `TIME` analytically (#486, building on #664). Validated
-  to predict identically to the hand-written ODE twin. Forms outside the desugar's scope (a
-  `lagtime=`/`f=` mapping, or a custom `[scaling]` block) stay on the closed form and are
-  now rejected up front (`fit()` errors; `predict()`/`simulate()` panic) rather than
-  silently mis-predict — write the ODE `transit()` model directly for those.
-- **A `one_cpt_transit` absorption model with time-varying covariates (or a `TIME`
-  switch)** no longer produces a silently wrong (all-zero) FOCE/FOCEI gradient (#486).
-  Such a subject was routed to the event-driven analytic walk, which cannot
-  state-propagate the transit chain (its continuous-`N` Gamma absorption is a closed-form
-  convolution, not a finite linear state) and returned zero predictions and sensitivities.
-  The gradient router now mirrors the production predictor's dispatch — event-driven only
-  for models it can propagate, otherwise the static dose-superposition path — so transit
-  stays analytic via superposition and matches the production prediction exactly (verified
-  against finite differences of `compute_predictions_with_tv`).
+- **A `one_cpt_transit` model with a `TIME`-dependent structural parameter or time-varying
+  covariates now works** (#486). The transit closed form assumes constant parameters over
+  each absorption window, so it cannot serve a subject whose parameters switch mid-profile;
+  previously such a model was rejected (`TIME` / TV covariates) or, on one internal path,
+  produced a silently wrong all-zero gradient. For a plain `cl/v/n/mtt` transit model the
+  parser now builds its exact ODE `transit()` equivalent — `d/dt(central) = transit(n, mtt)
+  − (CL/V)·central`, `obs_scale = V`, validated to predict identically to the hand-written
+  ODE twin — and the prediction / gradient dispatch routes only the subjects the closed form
+  cannot serve (a `TIME` switch, or time-varying covariates) to it, keeping the fast, exact
+  closed form for every constant-parameter subject. Transit forms outside the equivalent's
+  scope (a `lagtime=`/`f=` mapping, a custom `[scaling]`, or an `[initial_conditions]` block)
+  carry no equivalent and are still rejected up front (`fit()` errors; `predict()`/
+  `simulate()` panic) rather than mis-predict — write the ODE `transit()` model directly for
+  those.
 - **Finite / modeled-duration infusions combined with a time-varying covariate that
   changes across the infusion's end** now get an exact analytic second-order gradient
   (#486). The rate-off boundary sits between records, so the RHS Jacobian jumps there;

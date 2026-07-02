@@ -973,6 +973,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 

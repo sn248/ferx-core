@@ -3352,6 +3352,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         // Subject: 2 PK obs + 1 FREM obs
@@ -3942,6 +3943,7 @@ mod iov_tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -5824,6 +5826,7 @@ mod iov_tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
         let subject = Subject {
             id: "1".into(),
@@ -5880,6 +5883,7 @@ mod iov_tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,
             pk_model: PkModel::OneCptIv,

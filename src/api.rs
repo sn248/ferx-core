@@ -1157,27 +1157,36 @@ pub(crate) fn check_transit_support(
                 .to_string(),
         );
     }
-    // A `TIME`-built-in structural parameter makes the disposition switch mid-profile —
-    // the same limitation that rules out time-varying covariates below: the transit closed
-    // form assumes constant parameters over each absorption window, and the predictor can
-    // only evaluate them at the first-record snapshot (it freezes `TIME` at 0), silently
-    // ignoring the switch. Reject it up front (consistent with the TV-covariate guard)
-    // rather than mis-predict; an ODE transit model carries a time-dependent RHS exactly.
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+    // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
+    // transit closed form assumes constant parameters over each absorption window, so it
+    // cannot serve it. The plain `cl/v/n/mtt` form carries a `transit_ode_equivalent`
+    // (built at parse time), which the runtime dispatch routes such subjects to, so it is
+    // NOT rejected. Only a form outside the desugar's scope (a `lagtime=`/`f=` mapping or a
+    // custom `[scaling]` — no equivalent) is rejected here rather than mis-predict.
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        && model.transit_ode_equivalent.is_none()
+    {
         return Some(
-            "one_cpt_transit does not support a TIME-dependent structural parameter: the \
-             transit closed form assumes constant parameters over each absorption window, so \
-             the predictor would freeze TIME at the first record and silently ignore the \
-             switch. Use an ODE transit model (transit() forcing in [odes])."
+            "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
+             not support a TIME-dependent structural parameter: the transit closed form \
+             assumes constant parameters over each absorption window, and this form is \
+             outside the automatic ODE-equivalent rewrite. Write the model as an ODE \
+             transit() forcing in [odes] directly."
                 .to_string(),
         );
     }
     for subject in &population.subjects {
-        if subject.has_tv_covariates() {
+        // Time-varying covariates make the disposition switch mid-absorption, which the
+        // closed form cannot serve. The plain form's `transit_ode_equivalent` handles it
+        // (the runtime dispatch routes TV-cov subjects there), so reject only the
+        // out-of-scope forms that carry no equivalent.
+        if subject.has_tv_covariates() && model.transit_ode_equivalent.is_none() {
             return Some(format!(
-                "one_cpt_transit does not support within-subject time-varying covariates \
-                 (subject {}): the transit closed form assumes constant parameters over each \
-                 absorption window. Use an ODE transit model.",
+                "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
+                 not support within-subject time-varying covariates (subject {}): the transit \
+                 closed form assumes constant parameters over each absorption window, and this \
+                 form is outside the automatic ODE-equivalent rewrite. Write the model as an \
+                 ODE transit() forcing in [odes] directly.",
                 subject.id
             ));
         }
@@ -6915,6 +6924,7 @@ mod iov_integration {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -8956,6 +8966,7 @@ mod simulate_with_uncertainty_tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -9826,6 +9837,7 @@ mod tests_sdtab_tv_cov {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -10157,6 +10169,7 @@ mod tests_sdtab_tv_cov {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -10316,6 +10329,7 @@ mod tests_derived_session_clock {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -10635,6 +10649,7 @@ mod tests_derived_iov_kappa {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

@@ -184,9 +184,11 @@ fn transit_time_desugar_matches_hand_written_ode() {
         .expect("shorthand transit+TIME parses")
         .model;
     let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
+    // The shorthand stays a closed-form transit model but carries the ODE equivalent that
+    // predict()/the gradient route TIME/TV-cov subjects to.
     assert!(
-        sh.ode_spec.is_some(),
-        "transit + TIME shorthand must desugar to an ODE model"
+        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        "transit + TIME shorthand carries an ODE equivalent (primary stays closed-form)"
     );
 
     let pop = population(
@@ -335,22 +337,28 @@ fn transit_iov_rejected() {
     );
 }
 
+/// A plain `one_cpt_transit` model with time-varying covariates now **works**: the closed
+/// form can't serve a subject whose parameters switch mid-absorption, so the runtime dispatch
+/// routes it to the model's exact ODE `transit()` equivalent (built at parse time). It is no
+/// longer rejected. (A transit form outside the equivalent's scope — a `lagtime=`/`f=`
+/// mapping, custom scaling, or an init block — carries no equivalent and is still rejected.)
 #[test]
-fn transit_tv_covariate_rejected() {
+fn transit_tv_covariate_now_served_by_ode_equivalent() {
     let (an_src, _) = build_pair(false, false);
     let model = parse_full_model(&an_src).expect("parses").model;
+    assert!(
+        model.transit_ode_equivalent.is_some(),
+        "plain transit carries an ODE equivalent"
+    );
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
     // Give the subject time-varying covariates (non-empty per-observation maps).
     pop.subjects[0].obs_covariates = vec![
         std::collections::HashMap::from([("WT".to_string(), 70.0)]),
         std::collections::HashMap::from([("WT".to_string(), 72.0)]),
     ];
-    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("transit + time-varying covariates should be rejected");
-    assert!(
-        e.contains("time-varying"),
-        "expected a TV-covariate rejection message, got: {e}"
-    );
+    assert!(pop.subjects[0].has_tv_covariates());
+    fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect("transit + time-varying covariates now fits via the ODE equivalent");
 }
 
 /// `ode_template one_cpt_transit(...)` desugars to the `transit()` forcing ODE

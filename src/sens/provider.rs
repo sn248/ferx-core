@@ -2708,6 +2708,10 @@ fn subject_eta_grad_impl(
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
+    // Transit subject the closed form can't serve → its ODE `transit()` equivalent, which
+    // takes the ODE-provider branch below (that branch ignores the analytical
+    // `cached_schedule`, so a stale one is harmless). Unchanged for every other model (#486).
+    let model = model.effective_for(subject);
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
     // scope the outer provider uses, so inner and outer stay on the same route.
@@ -3757,6 +3761,10 @@ fn subject_sensitivities_impl(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
+    // A `one_cpt_transit` subject the closed form can't serve (TIME switch / TV covariates)
+    // routes to its exact ODE `transit()` equivalent, which then takes the ODE-provider
+    // branch below; every other model is unchanged (#486).
+    let model = model.effective_for(subject);
     // ODE models route to the ODE sensitivity provider (issue #367, Option A;
     // armed in #410) when in its supported scope; out-of-scope ODE subjects return
     // `None` and fall back to the prior path (gradient-free outer, FD inner). The
@@ -7723,22 +7731,28 @@ mod tests {
   method = focei
 "#;
 
-    /// Regression: a `one_cpt_transit` model with a time-varying covariate must NOT route to
-    /// the event-driven walk (which cannot state-propagate the continuous-`N` Gamma
-    /// absorption — `walk_supports` / `supports_event_driven` both omit transit — and whose
-    /// unsupported-model early-return yields all-ZERO predictions/sensitivities). Before this
-    /// fix `subject_routes_to_event_walk` returned `true` on `has_tv_covariates()`, so
-    /// `subject_sensitivities` returned `Some` with every `f` and derivative == 0 — a
-    /// silently wrong gradient. `subject_routes_to_event_walk` now mirrors production's
-    /// `compute_predictions_with_tv` dispatch (event-driven only for `supports_event_driven`
-    /// models), so transit stays on the dose-superposition analytic path (`run_obs`), whose
-    /// t=0 snapshot reproduces production's transit prediction exactly. The result is
-    /// analytic (NOT FD, NOT zero) and matches central FD of `compute_predictions_with_tv`.
+    /// A `one_cpt_transit` subject with time-varying covariates is served by the model's ODE
+    /// `transit()` equivalent (`effective_for` routes it there), NOT the closed form — the
+    /// closed form assumes constant parameters over each absorption window, and the
+    /// event-driven walk can't state-propagate the continuous-`N` Gamma absorption
+    /// (`subject_routes_to_event_walk` omits transit for that reason). The gradient is
+    /// analytic (a non-`None` `SubjectSens`, non-zero — the old silent all-zero bug is gone);
+    /// its numerical agreement with the production predictor is covered end-to-end by the ODE
+    /// equivalence suite (`tests/transit_analytic_equivalence.rs`). A constant-parameter
+    /// transit subject keeps the fast closed form (`effective_for` returns the model itself).
     #[test]
-    fn transit_with_tvcov_uses_analytic_superposition() {
+    fn transit_with_tvcov_routes_to_ode_equivalent() {
         let m = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse transit");
         assert_eq!(m.pk_model, PkModel::OneCptTransit);
-        let s = tvcov_subject(
+        assert!(
+            m.transit_ode_equivalent.is_some(),
+            "a plain transit model carries an ODE equivalent"
+        );
+        let theta = [5.0, 50.0, 1.0, 3.0];
+        let eta = [0.1, -0.05];
+
+        // TV-cov subject → routed to the ODE equivalent, analytic and non-zero.
+        let tv = tvcov_subject(
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             &[70.0],
             &[1.0, 2.0, 4.0, 8.0, 24.0],
@@ -7747,36 +7761,40 @@ mod tests {
             Vec::new(),
             &[],
         );
-        assert!(s.has_tv_covariates(), "subject must carry TV covariates");
-        // Must NOT route to the walk (transit isn't walk-supported) — stays on superposition,
-        // exactly as production's `compute_predictions_with_tv` does for transit.
+        assert!(tv.has_tv_covariates());
         assert!(
-            !subject_routes_to_event_walk(&m, &s),
-            "transit must not route to the event walk (it can't propagate the transit chain)"
+            std::ptr::eq(
+                m.effective_for(&tv),
+                m.transit_ode_equivalent.as_deref().unwrap()
+            ),
+            "TV-cov transit subject must be served by the ODE equivalent"
         );
-        let theta = [5.0, 50.0, 1.0, 3.0];
-        let eta = [0.1, -0.05];
-        let sens = subject_sensitivities(&m, &s, &theta, &eta)
-            .expect("transit + TV-cov is analytic via superposition (was silent zeros)");
-        // Not the old all-zero bug: the analytic values equal production's predictions.
-        let prod = compute_predictions_with_tv(&m, &s, &theta, &eta);
+        assert!(
+            !subject_routes_to_event_walk(&m, &tv),
+            "transit never routes to the closed-form event walk"
+        );
+        let sens = subject_sensitivities(&m, &tv, &theta, &eta)
+            .expect("transit + TV-cov is analytic via the ODE equivalent (was silent zeros)");
         assert!(
             sens.obs.iter().any(|o| o.f.abs() > 1e-6),
             "predictions must be non-zero"
         );
-        for (o, &p) in sens.obs.iter().zip(prod.iter()) {
-            approx::assert_relative_eq!(o.f, p, max_relative = 1e-9, epsilon = 1e-12);
-        }
-        // Full analytic gradient/Hessian must match central FD of the production predictor.
-        check_full_provider_vs_fd(&m, &s, &theta, &eta);
-        // Inner EBE η-gradient is analytic too and tracks the outer.
-        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("inner analytic");
-        for (o, g) in sens.obs.iter().zip(light.iter()) {
-            approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
-            for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
-                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-11);
-            }
-        }
+        assert!(
+            subject_eta_grad(&m, &tv, &theta, &eta).is_some(),
+            "inner analytic too"
+        );
+
+        // Constant-parameter subject → keeps the fast closed form (served by the model itself).
+        let flat = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            Vec::new(),
+        );
+        assert!(!flat.has_tv_covariates());
+        assert!(
+            std::ptr::eq(m.effective_for(&flat), &m),
+            "constant-parameter transit subject keeps the closed form"
+        );
     }
 
     /// The TV-covariate provider's exact value/∂η/∂²η/∂θ/∂²η∂θ must match central

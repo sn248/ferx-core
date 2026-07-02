@@ -4836,6 +4836,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -5042,6 +5043,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
         check_gradient(&model, &make_population(3), 2);
     }
@@ -5460,6 +5462,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,

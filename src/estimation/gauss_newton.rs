@@ -2018,6 +2018,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -2987,6 +2988,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         let template = &model.default_params;
@@ -3273,6 +3275,7 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 

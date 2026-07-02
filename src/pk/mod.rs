@@ -1362,6 +1362,12 @@ pub fn compute_predictions_with_states(
     theta: &[f64],
     eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
+    // A `one_cpt_transit` subject the closed form can't serve (TIME switch / TV covariates)
+    // routes to its ODE `transit()` equivalent — so the compartment/state columns come from
+    // the ODE integration (the `ode_spec` branch below) instead of the analytical
+    // superposition path, which has no valid states for those subjects and would otherwise
+    // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
+    let model = model.effective_for(subject);
     let uses_time = model_uses_time_builtin(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.

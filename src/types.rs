@@ -2777,12 +2777,45 @@ pub struct CompiledModel {
     /// runtime fallback when the closed form cannot serve a particular subject. Currently
     /// only `one_cpt_transit`: the closed form assumes constant parameters over each
     /// absorption window, so a mid-profile `TIME` switch or time-varying covariates route to
-    /// this exact ODE `transit()` equivalent instead (kept a boxed full model so it reuses
-    /// the whole ODE prediction/sensitivity path unchanged). `None` when the model needs no
-    /// fallback (not transit, or a transit form outside the desugar's scope). See
-    /// [`crate::sens::provider::effective_model_for`] and the parser's
+    /// this exact ODE `transit()` equivalent instead (a full boxed sub-model, built lazily so
+    /// it reuses the whole ODE prediction/sensitivity path unchanged and costs nothing for a
+    /// transit fit whose subjects never need it). `None` when the model needs no fallback
+    /// (not transit, or a transit form outside the desugar's scope). See
+    /// [`CompiledModel::effective_for`] and the parser's
     /// `transit_ode_equivalent_source` (#486).
-    pub transit_ode_equivalent: Option<Box<CompiledModel>>,
+    pub transit_ode_equivalent: Option<TransitOdeEquivalent>,
+}
+
+/// A lazily-built ODE representation of an analytical model that carries one (currently only
+/// `one_cpt_transit`). Holds the equivalent's reconstructed `.ferx` source and compiles the
+/// boxed sub-model on first use, so a transit fit whose subjects never hit the fallback
+/// (constant-parameter, non-`TIME`) pays no extra parse or allocation. See
+/// [`CompiledModel::effective_for`] (#486).
+pub struct TransitOdeEquivalent {
+    source: String,
+    built: std::sync::OnceLock<Box<CompiledModel>>,
+}
+
+impl TransitOdeEquivalent {
+    pub(crate) fn new(source: String) -> Self {
+        Self {
+            source,
+            built: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Build (once, thread-safely) and return the ODE equivalent sub-model. The source is
+    /// reconstructed from already-validated model blocks, so parsing it is infallible in
+    /// practice; a failure is an internal reconstruction bug and panics loudly rather than
+    /// silently degrading the fit.
+    pub(crate) fn get_or_build(&self) -> &CompiledModel {
+        self.built.get_or_init(|| {
+            Box::new(
+                crate::parser::model_parser::parse_model_string(&self.source)
+                    .expect("internal: one_cpt_transit ODE equivalent failed to build"),
+            )
+        })
+    }
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -2855,7 +2888,7 @@ impl CompiledModel {
             if crate::parser::model_parser::compiled_model_uses_time_builtin(self)
                 || subject.has_tv_covariates()
             {
-                return eq;
+                return eq.get_or_build();
             }
         }
         self

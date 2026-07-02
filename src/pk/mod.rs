@@ -100,33 +100,6 @@ pub fn apply_scaling(
     }
 }
 
-/// Read one analytic Form C readout value (issue #650), mirroring the ODE
-/// `read_observable` dispatch (`ode/predictions.rs`). `state` holds compartment
-/// **amounts** in the readout's canonical order, `pk_flat` is the flat
-/// `PkParams.values` slice the readout's `indiv_to_pk` plan indexes, and `cov`
-/// is the per-observation covariate snapshot. Returns `NaN` for an `ObsCmt`
-/// readout (never produced for analytic Form C) and for a per-CMT map miss —
-/// the same loud-NaN guard the ODE path uses.
-#[inline]
-fn read_analytic_readout(
-    readout: &crate::ode::OdeReadout,
-    state: &[f64],
-    pk_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    cov: &std::collections::HashMap<String, f64>,
-    obs_cmt: usize,
-) -> f64 {
-    match readout {
-        crate::ode::OdeReadout::ObsCmt(_) => f64::NAN,
-        crate::ode::OdeReadout::Single(f) => f(state, pk_flat, theta, eta, cov),
-        crate::ode::OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
-            Some(r) => (r.out_fn)(state, pk_flat, theta, eta, cov),
-            None => f64::NAN,
-        },
-    }
-}
-
 /// Apply an analytic Form C output readout (`[scaling] y = <expr>`, issue #650),
 /// **replacing** the built-in central-compartment concentration in `preds` with
 /// the readout output, evaluated per observation.
@@ -137,11 +110,16 @@ fn read_analytic_readout(
 /// readout recovers the concentration exactly, and an additive binding term
 /// layers on top); the oral depot amount — only reconstructed when the readout's
 /// state layout includes it — comes from [`analytical_state_at_times`] (slot 0).
-/// Individual parameters resolve from a subject-static `pk_param_fn` snapshot,
-/// θ/η are threaded (already desugared into `__ferx_ro_*` indiv params at parse
-/// for the analytic sensitivity path), and covariates use the **per-observation**
-/// snapshot (`subject.obs_cov(i)`) so a per-row flag like `FREE` selects the
-/// right branch.
+/// Individual parameters resolve from a `pk_param_fn` snapshot; θ/η are threaded
+/// (already desugared into `__ferx_ro_*` indiv params at parse for the analytic
+/// sensitivity path), and covariates use the **per-observation** snapshot
+/// (`subject.obs_cov(i)`) so a per-row flag like `FREE` selects the right branch.
+/// On a time-varying-covariate subject (or a `TIME`-builtin model) the readout's
+/// individual parameters are re-evaluated **per observation** — matching NONMEM's
+/// per-record `$ERROR` and the per-observation snapshot the analytic sensitivity
+/// provider differentiates (`run_obs_tvcov`), so the prediction and its gradient
+/// linearise about the same point. Otherwise one subject-static snapshot drives
+/// every row.
 ///
 /// No-op unless `model.analytic_readout` is set (the common built-in-readout
 /// case). Called at the single post-prediction insertion point, in place of the
@@ -156,10 +134,6 @@ pub fn apply_analytic_readout(
     let Some(ar) = &model.analytic_readout else {
         return;
     };
-    // Subject-static individual parameters (the readout's `V`, binding constants,
-    // etc. resolve from here via the program's `indiv_to_pk` plan).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    let v = pk.v();
     let n_states = ar.state_names.len();
     if n_states == 0 {
         return;
@@ -168,13 +142,23 @@ pub fn apply_analytic_readout(
     // the central amount lands in the last slot and the depot (if any) in slot 0.
     let central_slot = n_states - 1;
     let need_depot = n_states > 1 && ar.state_names[0] == "depot";
+
+    // Re-evaluate the readout's individual parameters per observation whenever a
+    // covariate (or the `TIME` builtin) can move them between rows; otherwise a
+    // single subject-static snapshot suffices.
+    let per_obs = subject.has_tv_covariates()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let static_pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+
     // Depot amounts (oral, only when the readout references the depot). Reuse the
     // superposition state reconstruction; slot 0 carries the depot *amount*.
-    // Superposition is invalid across EVID=3/4 resets — there the depot term is
-    // left at 0 (the central term stays exact), matching the analytical-states
-    // reset convention.
-    let depot_amts: Option<Vec<f64>> = if need_depot && subject.reset_times.is_empty() {
-        let states = analytical_state_at_times(model.pk_model, subject, &pk, &subject.obs_times);
+    // Superposition is invalid across EVID=3/4 resets, so a depot-referencing
+    // readout on a reset subject is rejected up front by `fit`/`predict`
+    // (`reject_depot_readout_with_resets`); we never reach the debug-asserted
+    // `analytical_state_at_times` with a reset subject here.
+    let depot_amts: Option<Vec<f64>> = if need_depot {
+        let states =
+            analytical_state_at_times(model.pk_model, subject, &static_pk, &subject.obs_times);
         Some(
             states
                 .iter()
@@ -186,15 +170,29 @@ pub fn apply_analytic_readout(
     };
     let mut state = vec![0.0_f64; n_states];
     for (i, pred) in preds.iter_mut().enumerate() {
+        let obs_pk;
+        let pk_i: &PkParams = if per_obs {
+            obs_pk = (model.pk_param_fn)(
+                theta,
+                eta,
+                subject.obs_cov(i),
+                subject.obs_times.get(i).copied().unwrap_or(0.0),
+            );
+            &obs_pk
+        } else {
+            &static_pk
+        };
         // Central AMOUNT = concentration × V (concentration already carries the
         // init impulse and per-event/SS dynamics).
-        state[central_slot] = *pred * v;
+        state[central_slot] = *pred * pk_i.v();
         if let Some(d) = &depot_amts {
             state[0] = d.get(i).copied().unwrap_or(0.0);
         }
         let cov = subject.obs_cov(i);
         let obs_cmt = subject.obs_cmts.get(i).copied().unwrap_or(0);
-        *pred = read_analytic_readout(&ar.readout, &state, &pk.values, theta, eta, cov, obs_cmt);
+        *pred = ar
+            .readout
+            .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt);
     }
 }
 

@@ -316,6 +316,35 @@ fn readout_tvcov_supported(model: &CompiledModel) -> bool {
     }
 }
 
+/// Evaluate an analytic Form C readout jet at one observation (#650), generic over
+/// the [`PkNum`](crate::sens::num::PkNum) dual type.
+///
+/// Reconstructs the compartment-amount state the readout expects — the central
+/// amount is `conc × V` (`params[PK_IDX_V]`), any depot slot is left at zero
+/// (depot-referencing readouts route to FD, so the walks never reach here with
+/// one) — then runs the readout program. Shared by the four dual paths
+/// (`run_obs` / `run_obs_grad` static, `run_obs_tvcov` / `run_obs_grad_tvcov`
+/// event-walk) so the value and gradient jets cannot drift. `params` is the flat
+/// PK-slot dual vector; `ro_state` / `ro_vars` / `ro_stack` are caller-owned
+/// scratch, cleared here.
+#[inline]
+fn eval_readout_jet<T: crate::sens::num::PkNum>(
+    prog: &crate::parser::model_parser::OdeOutputProgram,
+    conc: T,
+    params: &[T],
+    cov: &std::collections::HashMap<String, f64>,
+    ro_state: &mut Vec<T>,
+    ro_vars: &mut Vec<T>,
+    ro_stack: &mut Vec<T>,
+) -> T {
+    let n_states = prog.n_states();
+    let central_slot = n_states.saturating_sub(1);
+    ro_state.clear();
+    ro_state.resize(n_states, T::from_f64(0.0));
+    ro_state[central_slot] = conc * params[PK_IDX_V];
+    prog.eval_output_g::<T>(ro_state, params, cov, ro_vars, ro_stack)
+}
+
 /// Whether the model's `[initial_conditions]` baseline (#521) is one the Dual2
 /// provider differentiates exactly (#524): every init carries a compiled
 /// `amount_deriv` program and the `(θ, η)` axis count fits the init dispatch
@@ -1827,6 +1856,14 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     if !scaling_supported(model) {
         return false;
     }
+    // An analytic Form C readout must also fit the event-walk's structural
+    // `PkDual` slots here (#650). Without this, a readout whose params spill past
+    // `PK_IDX_V3` would make `analytical_supported` (via the `uses_time` clause)
+    // report "analytic" while every event-walk subject silently falls back to FD —
+    // exactly the route/report drift #637 guards against.
+    if !readout_tvcov_supported(model) {
+        return false;
+    }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
             prog_covers_required_pk_slots(model, prog)
@@ -2229,7 +2266,6 @@ pub fn subject_sensitivities_tvcov(
 /// sensitivity walk over `Dual2<M>`, and reads `∂conc/∂(θ, η)` straight off into
 /// the standard `(n_eta, n_theta)` [`SubjectSens`].
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_obs_tvcov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
@@ -2389,30 +2425,26 @@ fn run_obs_tvcov<const M: usize>(
         let c: Dual2<M> = if let Some(ro) = readout {
             let pkd = &pk_at_obs[j];
             // Flat PK-slot dual vector for `eval_output_g`'s `indiv_to_pk` lookups;
-            // slots 0..=7 come from the walk's `PkDual`, 8..=10 are static
-            // constants (`readout_tvcov_supported` guarantees no param maps there).
-            let params: [Dual2<M>; N_PK] = [
-                pkd.cl,
-                pkd.v,
-                pkd.q,
-                pkd.v2,
-                pkd.ka,
-                pkd.f,
-                pkd.q3,
-                pkd.v3,
-                Dual2::<M>::constant(0.0),
-                Dual2::<M>::constant(0.0),
-                Dual2::<M>::constant(0.0),
-            ];
-            let n_states = ro.n_states();
-            let central_slot = n_states.saturating_sub(1);
-            ro_state.clear();
-            ro_state.resize(n_states, Dual2::<M>::constant(0.0));
-            ro_state[central_slot] = *c * pkd.v;
-            ro.eval_output_g::<Dual2<M>>(
-                &ro_state,
+            // the eight structural slots come from the walk's `PkDual`, every higher
+            // slot is a static constant (`readout_tvcov_supported` guarantees no
+            // readout param maps past `PK_IDX_V3`).
+            let params: [Dual2<M>; N_PK] = std::array::from_fn(|s| match s {
+                PK_IDX_CL => pkd.cl,
+                PK_IDX_V => pkd.v,
+                PK_IDX_Q => pkd.q,
+                PK_IDX_V2 => pkd.v2,
+                PK_IDX_KA => pkd.ka,
+                PK_IDX_F => pkd.f,
+                PK_IDX_Q3 => pkd.q3,
+                PK_IDX_V3 => pkd.v3,
+                _ => Dual2::<M>::constant(0.0),
+            });
+            eval_readout_jet::<Dual2<M>>(
+                ro,
+                *c,
                 &params,
                 subject.obs_cov(j),
+                &mut ro_state,
                 &mut ro_vars,
                 &mut ro_stack,
             )
@@ -2706,28 +2738,23 @@ fn run_obs_grad_tvcov<const N: usize>(
         // `∂y/∂η` composes from the per-obs PK duals and the readout expression.
         let c: Dual1<N> = if let Some(ro) = readout {
             let pkd = &pk_at_obs[j];
-            let params: [Dual1<N>; N_PK] = [
-                pkd.cl,
-                pkd.v,
-                pkd.q,
-                pkd.v2,
-                pkd.ka,
-                pkd.f,
-                pkd.q3,
-                pkd.v3,
-                Dual1::<N>::constant(0.0),
-                Dual1::<N>::constant(0.0),
-                Dual1::<N>::constant(0.0),
-            ];
-            let n_states = ro.n_states();
-            let central_slot = n_states.saturating_sub(1);
-            ro_state.clear();
-            ro_state.resize(n_states, Dual1::<N>::constant(0.0));
-            ro_state[central_slot] = *c * pkd.v;
-            ro.eval_output_g::<Dual1<N>>(
-                &ro_state,
+            let params: [Dual1<N>; N_PK] = std::array::from_fn(|s| match s {
+                PK_IDX_CL => pkd.cl,
+                PK_IDX_V => pkd.v,
+                PK_IDX_Q => pkd.q,
+                PK_IDX_V2 => pkd.v2,
+                PK_IDX_KA => pkd.ka,
+                PK_IDX_F => pkd.f,
+                PK_IDX_Q3 => pkd.q3,
+                PK_IDX_V3 => pkd.v3,
+                _ => Dual1::<N>::constant(0.0),
+            });
+            eval_readout_jet::<Dual1<N>>(
+                ro,
+                *c,
                 &params,
                 subject.obs_cov(j),
+                &mut ro_state,
                 &mut ro_vars,
                 &mut ro_stack,
             )
@@ -3179,15 +3206,12 @@ fn run_obs_grad<const N: usize>(
                 value: fval,
                 grad: g,
             };
-            let n_states = prog.n_states();
-            let central_slot = n_states.saturating_sub(1);
-            ro_state.clear();
-            ro_state.resize(n_states, Dual1::<N>::constant(0.0));
-            ro_state[central_slot] = conc * pkd[PK_IDX_V];
-            let y = prog.eval_output_g::<Dual1<N>>(
-                &ro_state,
+            let y = eval_readout_jet::<Dual1<N>>(
+                prog,
+                conc,
                 pkd,
                 subject.obs_cov(obs_i),
+                &mut ro_state,
                 &mut ro_vars,
                 &mut ro_stack,
             );
@@ -4381,15 +4405,12 @@ fn run_obs<const N: usize>(
                 grad: g,
                 hess: h,
             };
-            let n_states = prog.n_states();
-            let central_slot = n_states.saturating_sub(1);
-            ro_state.clear();
-            ro_state.resize(n_states, Dual2::<N>::constant(0.0));
-            ro_state[central_slot] = conc * pkd[PK_IDX_V];
-            let y = prog.eval_output_g::<Dual2<N>>(
-                &ro_state,
+            let y = eval_readout_jet::<Dual2<N>>(
+                prog,
+                conc,
                 pkd,
                 subject.obs_cov(obs_i),
+                &mut ro_state,
                 &mut ro_vars,
                 &mut ro_stack,
             );
@@ -7355,6 +7376,108 @@ mod tests {
         let s = oral_subject(&[1.0, 4.0]);
         let preds = compute_predictions_with_tv(&m, &s, &[0.2, 10.0, 1.5], &[0.0, 0.0, 0.0]);
         assert!(preds.iter().all(|p| p.is_finite()));
+    }
+
+    /// #650 review: a readout whose **non-structural** parameter depends on a
+    /// time-varying covariate (`BMAX = TVBMAX·WT/70`, WT per row) must be read
+    /// **per observation** by the f64 predictor, matching the per-observation
+    /// snapshot the event-walk provider differentiates. Before the fix the
+    /// predictor froze `BMAX` at the t=0 covariate while the analytic gradient used
+    /// the per-row value, so `check_full_provider_vs_fd` (analytic vs FD-of-predictor)
+    /// diverged. The `.expect` inside the harness also asserts the analytic path is
+    /// taken (BMAX→slot 2, KD→slot 3, both ≤ V3, so `readout_tvcov_supported`).
+    #[test]
+    fn form_c_tvcov_readout_param_matches_fd() {
+        const SRC: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX * (WT / 70)
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BMAX * (central / V) / (KD + central / V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(SRC).expect("parse tv-cov readout param");
+        let mut s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        // Per-row body weight → time-varying covariate → event-walk provider, and a
+        // readout parameter (BMAX) that actually moves between rows.
+        s.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 60.0)]),
+            HashMap::from([("WT".to_string(), 80.0)]),
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 95.0)]),
+        ];
+        assert!(s.has_tv_covariates(), "fixture must be a TV-cov subject");
+        assert!(readout_tvcov_supported(&m), "BMAX/KD fit the PkDual slots");
+        check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 3.0, 2.0], &[0.12, -0.08]);
+    }
+
+    /// #650 review: a readout that references the oral **depot** amount is rejected
+    /// on a subject carrying an EVID=3/4 reset (superposition can't restart the
+    /// depot across the reset), rather than silently reading a zero depot. A
+    /// `central`-only readout on the same reset subject is accepted (the central
+    /// concentration is already reset-correct).
+    #[test]
+    fn depot_readout_with_reset_is_rejected() {
+        let depot_src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V + depot / V\n[error_model]",
+        );
+        let depot_m = parse_model_string(&depot_src).expect("parse depot readout");
+        assert!(
+            depot_m
+                .analytic_readout
+                .as_ref()
+                .expect("analytic readout")
+                .references_depot(),
+            "readout must be detected as depot-referencing"
+        );
+        let reset_subj = subject_with_doses_and_resets(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[1.0, 4.0, 8.0],
+            vec![5.0],
+        );
+        let pop = crate::types::Population {
+            subjects: vec![reset_subj],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        assert!(
+            crate::api::check_analytic_readout_support(&depot_m, &pop).is_some(),
+            "depot readout + reset subject must be rejected"
+        );
+
+        // Central-only readout is fine on the very same reset subject.
+        let central_src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V\n[error_model]",
+        );
+        let central_m = parse_model_string(&central_src).expect("parse central readout");
+        assert!(
+            crate::api::check_analytic_readout_support(&central_m, &pop).is_none(),
+            "central-only readout must be accepted on a reset subject"
+        );
     }
 
     /// Regression for #455/#456: an analytical model whose `[individual_parameters]`

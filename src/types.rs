@@ -2131,6 +2131,33 @@ pub struct AnalyticReadout {
     pub state_names: Vec<String>,
 }
 
+impl AnalyticReadout {
+    /// Whether the readout reads the oral **depot** amount (state slot 0 in the
+    /// `["depot", "central"]` layout).
+    ///
+    /// The depot amount is reconstructed by dose superposition, which is invalid
+    /// across EVID=3/4 resets — a reset zeros the compartments and the closed
+    /// form has no way to restart the accumulation. So `fit`/`predict` reject a
+    /// depot-referencing readout on a subject that carries a reset, rather than
+    /// silently feeding a zero depot into the readout (issue #650 review). A
+    /// readout that only reads `central` is unaffected (the central concentration
+    /// is already reset-correct).
+    pub(crate) fn references_depot(&self) -> bool {
+        if self.state_names.first().map(String::as_str) != Some("depot") {
+            return false;
+        }
+        match &self.readout {
+            crate::ode::OdeReadout::ObsCmt(_) => false,
+            crate::ode::OdeReadout::Single(_) => {
+                self.program.as_ref().is_some_and(|p| p.references_state(0))
+            }
+            crate::ode::OdeReadout::PerCmt(map) => map
+                .values()
+                .any(|r| r.program.as_ref().is_some_and(|p| p.references_state(0))),
+        }
+    }
+}
+
 /// How the structural model's raw output is mapped to the observed `DV`.
 ///
 /// Set by the `[scaling]` block in `.ferx` model files. The convention is

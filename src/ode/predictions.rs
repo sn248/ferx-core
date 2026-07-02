@@ -941,6 +941,36 @@ pub struct PerCmtReadout {
     pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
 }
 
+impl OdeReadout {
+    /// Evaluate the readout at one observation given the compartment `state`
+    /// vector, the flat PK-parameter slice, θ/η, the covariate snapshot, and the
+    /// observation's 1-based CMT. Shared by the ODE predictor ([`read_observable`])
+    /// and the analytic Form C path (`pk::apply_analytic_readout`, #650) so the
+    /// two dispatch/NaN-guard conventions cannot drift. A `PerCmt` map miss (or an
+    /// out-of-range `ObsCmt`) yields `NaN` — the loud guard that propagates to a
+    /// NaN OFV rather than silently mis-reading, since parser + fit-time validation
+    /// already guarantee every observed CMT has an entry.
+    #[inline]
+    pub(crate) fn eval(
+        &self,
+        state: &[f64],
+        pk_params_flat: &[f64],
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        obs_cmt: usize,
+    ) -> f64 {
+        match self {
+            OdeReadout::ObsCmt(idx) => state[*idx],
+            OdeReadout::Single(out_fn) => out_fn(state, pk_params_flat, theta, eta, covariates),
+            OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
+                Some(r) => (r.out_fn)(state, pk_params_flat, theta, eta, covariates),
+                None => f64::NAN,
+            },
+        }
+    }
+}
+
 /// Read the observable value at observation `obs_idx`.
 ///
 /// `subject.obs_cmts[obs_idx]` selects the per-CMT readout when
@@ -955,19 +985,8 @@ fn read_observable(
     covariates: &HashMap<String, f64>,
     obs_cmt: usize,
 ) -> f64 {
-    match &ode.readout {
-        OdeReadout::ObsCmt(idx) => u[*idx],
-        OdeReadout::Single(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
-        OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
-            Some(r) => (r.out_fn)(u, pk_params_flat, theta, eta, covariates),
-            // Parser + fit-time validation guarantee every observed CMT
-            // has an entry. NaN here is a defensive guard against
-            // hand-constructed CompiledModels that bypassed validation —
-            // it propagates to NaN OFV so the bad config is loud, not
-            // silent.
-            None => f64::NAN,
-        },
-    }
+    ode.readout
+        .eval(u, pk_params_flat, theta, eta, covariates, obs_cmt)
 }
 
 /// ODE specification for a model

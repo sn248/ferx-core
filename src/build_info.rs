@@ -180,12 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn inner_ltbs_model_returns_fd() {
+    fn inner_plain_ltbs_returns_analytic() {
+        // Plain closed-form LTBS now takes the analytic inner gradient (PR #665); the
+        // covariance step reconverges its EBEs at the tighter `cov_inner_tol`. (LTBS +
+        // η-dependent `ExpressionScale` still reports FD — see the provider test
+        // `ltbs_plus_expression_scale_inner_falls_back_to_fd`.)
         let mut m = test_helpers::analytical_model(GradientMethod::Auto);
-        m.log_transform = true; // LTBS keeps the FD inner gradient
+        m.log_transform = true;
         assert_eq!(
             gradient_method_inner(&ci_build(), &m),
-            GradientMethodKind::FiniteDifferences
+            GradientMethodKind::Analytic
         );
     }
 

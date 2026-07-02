@@ -1333,12 +1333,22 @@ pub fn profile_report() {
 /// The model-level inner-gradient bails that are independent of which analytic inner
 /// provider (non-IOV analytical, non-IOV ODE `Dual1`, or IOV) will serve the model.
 /// Returns `true` when the model must use the **FD** inner gradient regardless: the
-/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, LTBS, or
+/// escape hatch / A-B toggle, an explicit `gradient = fd`, SDE diffusion, or
 /// IIV on residual error (`iiv_on_ruv`, whose `exp(2·η_ruv)` variance scaling none of
 /// the `Dual2`/`Dual1` kernels carry).
 /// Every analytic inner path consults this so none of them can run on a model that one
 /// of these reasons routes to FD — including the IOV inner loop, which previously dropped
 /// these exclusions (#466 review #1/#3).
+///
+/// LTBS is **no longer** a blanket common bail. The plain closed-form inner provider applies
+/// the `g = ln(f)` jet transform (`subject_eta_grad` → `run_obs_eta`), so it serves plain LTBS
+/// analytically; the covariance step reconverges those EBEs at the tighter `cov_inner_tol`
+/// ([`FitOptions::effective_cov_inner_tol`]) so the `ln`-amplified EBE noise no longer corrupts
+/// the SEs. LTBS + η-dependent `ExpressionScale` stays a (narrower) common bail — its analytic
+/// scale+log Jacobian is unvalidated. The other LTBS inner paths the analytic kernels don't yet
+/// carry decline through their own gates — TV-cov (`subject_eta_grad_tvcov`) and closed-form IOV
+/// (`iov_analytical_supported`) — so removing the blanket bail only enables the validated plain
+/// path.
 ///
 /// An eta-dependent `ExpressionScale` obs_scale is **not** a common bail: the non-IOV
 /// analytical inner provider now carries the η-only quotient rule (`subject_eta_grad`
@@ -1357,7 +1367,13 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     no_analytic_inner_forced()
         || matches!(model.gradient_method, GradientMethod::Fd)
         || model.is_sde()
-        || model.log_transform
+        // LTBS + η-dependent `ExpressionScale`: plain LTBS takes the analytic inner
+        // gradient now, but the analytic scale+log Jacobian for this combination is not
+        // validated against the reconverged EBE, so keep it a model-level FD bail (mirrors
+        // the per-call decline in `subject_eta_grad`). Plain LTBS and constant `ScalarScale`
+        // are unaffected.
+        || (model.log_transform
+            && matches!(model.scaling, ScalingSpec::ExpressionScale { .. }))
         // Correlated residual error (#main feature) is not carried by the analytic
         // inner kernels yet — route to FD. (An eta-dependent `ExpressionScale` is NOT a
         // bail here; see the doc above.)
@@ -1393,12 +1409,14 @@ pub(crate) fn subject_has_survival_records(subject: &Subject) -> bool {
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
 /// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
 pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
-    // Escape hatch, explicit `gradient = fd`, SDE, LTBS, and the `iiv_on_ruv` cases that
+    // Escape hatch, explicit `gradient = fd`, SDE, and the `iiv_on_ruv` cases that
     // force FD all revert the inner EBE gradient to FD (see `analytic_inner_common_bail`
-    // for the per-reason rationale). LTBS still gets the analytic *outer* gradient; only
-    // the inner finder reverts. (An eta-dependent `ExpressionScale` obs_scale is now
-    // served analytically on *both* loops — #534/#486 — so it is no longer a bail here;
-    // see `analytic_inner_common_bail`.)
+    // for the per-reason rationale). LTBS is now served analytically on the plain
+    // closed-form inner too (the `g = ln(f)` jet in `subject_eta_grad`), with the
+    // covariance step reconverging at the tighter `cov_inner_tol`; the LTBS paths the
+    // kernels don't carry (TV-cov, IOV, `ExpressionScale`) still decline via their own
+    // gates. An eta-dependent `ExpressionScale` obs_scale is served on *both* loops
+    // (#534/#486) so it is not a bail here either.
     if analytic_inner_common_bail(model) {
         return false;
     }
@@ -1428,20 +1446,21 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     //     `analytic_eta_nll_gradient_with_schedule` (provider-agnostic), so the
     //     light Dual1 ODE walk serves these models too. M3 BLOQ + `iiv_on_ruv`
     //     keeps FD (the censored residual-eta second derivatives are not assembled).
-    //   - LTBS: unlike the closed-form path (whose provider closed forms agree with
-    //     `compute_predictions` only to ~1e-9, amplified into the covariance Hessian
-    //     under the `g = ln(f)` wrap), the ODE `Dual1` walk shares `solve_ode_g`
-    //     with the objective, so the analytic-EBE *is* the objective's own minimum —
-    //     the gradient matches FD of `individual_nll` and the analytic/FD EBEs agree
-    //     to integrator tolerance, leaving the covariance Hessian clean. Validated
-    //     by `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd`
-    //     (#474). So ODE-LTBS takes the analytic inner gradient.
+    //   - LTBS: the ODE `Dual1` walk shares `solve_ode_g` with the objective, so the
+    //     analytic-EBE *is* the objective's own minimum — the gradient matches FD of
+    //     `individual_nll` and the analytic/FD EBEs agree to integrator tolerance,
+    //     leaving the covariance Hessian clean. Validated by
+    //     `ode_ltbs_inner_grad_matches_fd` / `ode_ltbs_inner_ebe_matches_fd` (#474). The
+    //     closed-form inner now serves LTBS too: its provider closed forms agree with
+    //     `compute_predictions` only to ~1e-9, which the `g = ln(f)` wrap amplifies into
+    //     the covariance Hessian, so it relies on the covariance step reconverging at the
+    //     tighter `cov_inner_tol` rather than on shared code (see
+    //     `FitOptions::effective_cov_inner_tol`).
     if model.ode_spec.is_some() {
-        // The ODE inner path deliberately does NOT bail on LTBS or `ExpressionScale`
-        // (unlike the closed-form `analytic_inner_common_bail`): the `Dual1` ODE walk
-        // shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic inner
-        // gradient (#474). Only the escape hatch / `gradient = fd` / SDE / `iiv_on_ruv`
-        // -forces-FD cases revert here.
+        // The ODE inner path does NOT bail on LTBS or `ExpressionScale`: the `Dual1` ODE
+        // walk shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic
+        // inner gradient (#474). Only the escape hatch / `gradient = fd` / SDE /
+        // `iiv_on_ruv`-forces-FD cases revert here.
         if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
@@ -5102,9 +5121,20 @@ mod iov_tests {
         assert!(!model.iiv_on_ruv_forces_fd());
         model.bloq_method = crate::types::BloqMethod::Drop;
         model.residual_error_eta = None;
-        // LTBS forces FD.
+        // LTBS is no longer a blanket common bail (plain closed-form LTBS takes the
+        // analytic inner gradient as of PR #665). This ODE-IOV model still routes to the
+        // FD inner under LTBS, but now via the IOV support gate rather than the common
+        // bail: both `ode_iov_supported` and `iov_analytical_supported` require
+        // `!log_transform`, so `iov_sens_supported` is false for an LTBS IOV model.
         model.log_transform = true;
-        assert!(analytic_inner_common_bail(&model));
+        assert!(
+            !analytic_inner_common_bail(&model),
+            "LTBS is no longer a blanket common bail (#665)"
+        );
+        assert!(
+            !crate::sens::provider::iov_sens_supported(&model),
+            "LTBS IOV routes to FD via the IOV support gate"
+        );
         model.log_transform = false;
 
         // The *outer* IOV gate (`iov_sens_supported`) for this **ODE** model now admits

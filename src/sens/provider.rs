@@ -2358,10 +2358,12 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
         return None;
     }
     // LTBS is served on the OUTER TV-cov gradient (`subject_sensitivities_tvcov` applies the
-    // post-walk `ln f`), but the inner EBE gradient deliberately stays on finite differences
-    // for LTBS (covariance-Hessian stability, `analytic_inner_common_bail`) — so this inner
-    // provider declines LTBS. In the estimation pipeline it is never reached for LTBS anyway
-    // (`analytic_inner_grad_supported` bails first); this guards direct callers (#486).
+    // post-walk `ln f`), but the TV-cov *inner* EBE gradient stays on finite differences for
+    // LTBS. Plain closed-form LTBS now takes the analytic inner gradient (with the covariance
+    // step reconverging at the tighter `cov_inner_tol`), but that validation does not cover
+    // the TV-cov event-driven inner walk, so this path stays on FD. Since `log_transform` is
+    // no longer a model-level `analytic_inner_common_bail`, this guard is now the active gate
+    // that routes TV-cov LTBS subjects to the FD inner (#486 / PR #665).
     if model.log_transform {
         return None;
     }
@@ -2733,16 +2735,13 @@ fn subject_eta_grad_impl(
     // `analytical_supported`) already bounded the scale program to the dispatch table.
     //
     // EXCEPT LTBS + η-dependent `ExpressionScale`: route that combination to the FD inner
-    // Jacobian (#534 review #5). The EBE itself already converges on FD for any LTBS model
-    // (`analytic_inner_common_bail` includes `log_transform`); `find_ebe` then builds the
-    // covariance H-matrix from this provider's Jacobian (`subject_eta_jacobian`, gated only
-    // on `Some`/`None`). Returning the analytic scale+log Jacobian here would pair it with
-    // that FD-converged EBE — and under the `g = ln(f)` wrap the closed-form EBE's ~1e-9
-    // offset is exactly what corrupts the covariance Hessian (the reason LTBS reverts the
-    // inner gradient at all). Declining restores the pre-#486 behaviour for this combo and
-    // matches the ODE path's `!log_transform` gate for `ExpressionScale`. (Plain LTBS and
-    // plain `ExpressionScale` are unaffected; the analytic *outer* gradient still serves
-    // LTBS + `ExpressionScale`.)
+    // Jacobian (#534 review #5). Plain LTBS (no scale, or constant `ScalarScale`) now takes
+    // the analytic inner gradient — the `g = ln(f)` jet below is exact and the covariance
+    // step reconverges its EBEs at the tighter `cov_inner_tol`, so the ~1e-9 provider-vs-
+    // `compute_predictions` offset no longer corrupts the Hessian. But the analytic
+    // scale+log Jacobian for the η-dependent-scale combination is not covered by that
+    // validation, so keep it on FD (matches the ODE path's `!log_transform` gate for
+    // `ExpressionScale`). The analytic *outer* gradient still serves LTBS + `ExpressionScale`.
     if model.log_transform && matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
         return None;
     }
@@ -7678,12 +7677,49 @@ mod tests {
         }
     }
 
+    /// Plain closed-form LTBS now takes the analytic **inner** gradient (PR #665): the
+    /// light provider applies the same `g = ln(f)` jet as the outer, so its η-gradient must
+    /// equal the full outer provider's `df_deta` η-block. (The covariance step reconverges
+    /// these EBEs at the tighter `cov_inner_tol` so the `ln`-amplified EBE offset does not
+    /// corrupt the SEs — see `FitOptions::effective_cov_inner_tol`.)
+    #[test]
+    fn ltbs_plain_inner_eta_grad_matches_outer() {
+        let src = WARFARIN.replace(
+            "[error_model]\n  DV ~ proportional(PROP_ERR)",
+            "[error_model]\n  log(DV) ~ additive(PROP_ERR)",
+        );
+        let model = parse_model_string(&src).expect("parse LTBS warfarin");
+        assert!(model.log_transform, "fixture must be LTBS");
+        let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = [0.2, 10.0, 1.5];
+        let eta = [0.15, -0.10, 0.25];
+        // Plain LTBS (no scale) is now in analytic inner scope.
+        assert!(
+            crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
+            "plain LTBS must now be served by the analytic inner gradient (PR #665)"
+        );
+        let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+        let light = subject_eta_grad(&model, &subject, &theta, &eta)
+            .expect("inner analytic gradient serves plain LTBS");
+        assert_eq!(full.obs.len(), light.len());
+        for (fo, lo) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    fo.df_deta[k],
+                    lo.df_deta[k],
+                    max_relative = 1e-10,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
     /// LTBS combined with an η-dependent `ExpressionScale` routes the **inner** gradient to
     /// FD (#534 review #5): the analytic outer still serves it, but the light provider
     /// declines so the covariance H-matrix Jacobian (`subject_eta_jacobian`, gated only on
     /// `Some`/`None`) isn't built from an analytic scale+log jet paired with the
-    /// FD-converged LTBS EBE. Restores the pre-#486 behaviour for this combo and matches the
-    /// ODE path's `!log_transform` gate.
+    /// FD-converged LTBS EBE. Matches the ODE path's `!log_transform` gate for scaling.
     #[test]
     fn ltbs_plus_expression_scale_inner_falls_back_to_fd() {
         let src = WARFARIN.replace(
@@ -7702,7 +7738,7 @@ mod tests {
         );
         assert!(
             !crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
-            "LTBS keeps the model out of analytic inner scope"
+            "LTBS + ExpressionScale keeps the model out of analytic inner scope"
         );
         // The analytic OUTER gradient still serves LTBS + ExpressionScale.
         assert!(

@@ -3305,10 +3305,10 @@ pub(crate) fn compute_covariance(
     // per-subject EBEs are bit-identical to the parallel loop.
     // The covariance step reconverges EBEs at its own tolerance (`cov_inner_tol`),
     // decoupled from the fit's `inner_tol`: the second-difference-of-OFV R-matrix is
-    // far more sensitive to EBE precision than the fit, so a sensitive covariance can
-    // be reconverged tighter without slowing every outer iteration. Defaults to
-    // `inner_tol` (byte-identical). See `FitOptions::effective_cov_inner_tol`.
-    let cov_inner_tol = options.effective_cov_inner_tol();
+    // far more sensitive to EBE precision than the fit, so LTBS tightens it by default
+    // (the `g = ln(f)` Hessian needs it) and any model can opt in. Defaults to
+    // `inner_tol` for non-LTBS (byte-identical). See `FitOptions::effective_cov_inner_tol`.
+    let cov_inner_tol = options.effective_cov_inner_tol(model.log_transform);
     let reconverge_point = |xv: &[f64]| -> (
         ModelParameters,
         Vec<DVector<f64>>,

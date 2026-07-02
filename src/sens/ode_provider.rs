@@ -252,20 +252,12 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
         return false;
     }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
-    // (`ode_subject_supported` declines it so it can't take the static superposition
-    // path). So being model-level "analytic" additionally requires that walk's model-level
-    // constraints — `init(...)` and built-in absorption input-rate forcing are handled only
-    // on the static walk (`integrate_tvcov_g` seeds compartments at zero and carries no
-    // `R_in`), so a TIME + `init(...)` or TIME + input-rate model has NO analytic walk and
-    // every subject falls back to FD. Decline here so `sens_supported` /
-    // `analytic_outer_gradient_available` (which call this with no per-subject check) report
-    // FD rather than claiming "analytic" for a 100%-FD population — the ODE twin of the
-    // closed-form `analytical_supported` fix (#637 round-2 review #1).
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-        && (ode.init_fn.is_some() || !ode.input_rate.is_empty())
-    {
-        return false;
-    }
+    // (`ode_subject_supported` declines it so it can't take the static superposition path).
+    // A `TIME`-built-in model routes to the event-driven walk (`integrate_tvcov_g`), which now
+    // carries BOTH a built-in absorption input-rate forcing (`R_in`, #643) and a seeded
+    // `init(...)` state (#662) alongside the per-event `TIME` seeding (#637) — so a
+    // TIME + input-rate or TIME + `init(...)` model IS analytic on that walk (#486). (The old
+    // decline here assumed the walk carried neither, which was true before #643/#662.)
     // Readout: the state directly (`ObsCmt`), a simple Form C output program
     // (`y = <expr>` over states/indiv params, e.g. `central / V1`), or a per-CMT
     // Form C (`y[CMT=N] = <expr>`) where every endpoint carries a simple program
@@ -749,27 +741,41 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // Built-in absorption input-rate forcing under IOV (#486). The shared
     // `integrate_tvcov_g` walk delivers each forcing per-occasion — its rate/window is
     // rebuilt from that dose's own occasion-seeded `pk_at_dose[k]` jet, so κ rides through
-    // exactly as η/θ do — so `zero_order(dur)` and `first_order` are analytic under IOV,
-    // and hence so is any composition of them: a `mixed` `FR·first_order + FR·zero_order`
-    // dose and a `parallel` two-`first_order` pathway (both encoded as multiple
-    // `ZeroOrder`/`FirstOrder` forcings), mirroring the non-IOV TV-cov walk (#653/#586).
-    // Only the smooth-density kinds (igd / transit / weibull) under IOV stay unaudited → FD;
-    // the SS × input-rate combination is declined per subject in `ode_iov_subject_supported`
-    // (the SS dual equilibration's zero-order/forcing handling is not yet validated under κ).
-    if ode.input_rate.iter().any(|f| {
-        !matches!(
-            f.kind,
-            crate::pk::absorption::InputRateKind::ZeroOrder
-                | crate::pk::absorption::InputRateKind::FirstOrder
-        )
-    }) {
+    // exactly as η/θ do. So EVERY kind the non-IOV gate carries is analytic under IOV too:
+    // the smooth densities `igd`/`transit`/`weibull`/`first_order` (pointwise `R_in`), the
+    // moving-window `zero_order`, and any composition (`mixed`, `parallel`). Mirror the
+    // non-IOV `ode_analytical_supported`'s kind-agnostic `supported_over_dual()` gate exactly,
+    // so the IOV input-rate scope tracks the non-IOV scope rather than an arbitrary
+    // `{ZeroOrder, FirstOrder}` subset (#486 IOV-scope parity). (The SS × input-rate
+    // combination is still declined per subject in `ode_iov_subject_supported` — the SS dual
+    // equilibration has no built-in-forcing channel; that is a real gap, not this decision.)
+    if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
-    // No constant `ScalarScale`/LTBS, no per-cmt/indexed F, no seeded initial state (the
-    // bolus walk seeds compartments at zero). Estimated **lagtime IS supported**: the IOV
-    // walk runs through `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the
-    // dose-time shift + event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
-    // (`ode_analytical_supported` excludes indexed `ALAGn`. The per-subject gate
+    // `Weibull` + estimated lagtime stays FD on every path (IOV included): its onset diverges
+    // for shape `β < 1` (an integrable spike, no finite rate-on saltation), exactly as the
+    // non-IOV gate declines it above. Every other kind composes with lagtime under IOV.
+    // Mirror the non-IOV `ode_analytical_supported` lagtime gate's exhaustive *whitelist*
+    // (not a `== Weibull` blacklist), so a future `InputRateKind` variant defaults to the FD
+    // fallback on both paths rather than being silently admitted here (#486 IOV-scope parity).
+    if model.has_lagtime()
+        && ode.input_rate.iter().any(|f| {
+            !matches!(
+                f.kind,
+                crate::pk::absorption::InputRateKind::Transit
+                    | crate::pk::absorption::InputRateKind::InverseGaussian
+                    | crate::pk::absorption::InputRateKind::FirstOrder
+                    | crate::pk::absorption::InputRateKind::ZeroOrder
+            )
+        })
+    {
+        return false;
+    }
+    // No constant `ScalarScale`/LTBS output transform. Estimated **lagtime IS supported**
+    // (bare and compartment-indexed `ALAG{cmt}`, see below): the IOV walk runs through
+    // `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the dose-time shift +
+    // event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
+    // (The per-subject gate
     // `ode_iov_subject_supported` now ADMITS finite-duration infusions, EVID 3/4 resets,
     // and EVID=2 pk-only breakpoints
     // — the shared `integrate_tvcov_g` walk carries the rate-boundary saltation and the
@@ -780,30 +786,31 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // supported (#575): like the non-IOV ODE static walk (#534) it is applied as a
     // post-walk quotient on the final `(θ, stacked-η)` jet — here per occasion group,
     // since the divisor depends on the group's κ through the PK params (see
-    // `apply_expression_scale_iov` / `run_subject_iov`). Constant `ScalarScale` and LTBS
-    // stay FD (their in-walk output transform isn't validated for the IOV path — separate
-    // gap). Allowlist, not denylist, so a future scaling variant can only narrow scope.
+    // `apply_expression_scale_iov` / `run_subject_iov`). A constant `ScalarScale k` divisor
+    // is supported too (#486 IOV-scope parity): unlike `ExpressionScale`, it is
+    // κ-independent, so `resolve_obs_readout`/`apply_output_transform` already divide the
+    // in-walk readout `p/k` over the stacked `(θ, η, κ)` dual — the exact same in-walk step
+    // the non-IOV walk uses (`ode_analytical_supported` admits it), needing no post-walk
+    // handling. LTBS still stays FD (the in-walk log can't compose with the per-group
+    // post-walk `ExpressionScale` quotient). Allowlist, not denylist, so a future scaling
+    // variant can only narrow scope.
     match &model.scaling {
-        // `None` only when NOT LTBS: the IOV walk applies the LTBS log in PK-param
-        // space *before* the η/θ/κ chain, so the production scale-then-log order
-        // can't be reproduced post-walk — LTBS (`log(DV) ~ additive`, no obs_scale)
-        // stays FD for IOV, matching the pre-#575 `|| model.log_transform` guard.
-        ScalingSpec::None if !model.log_transform => {}
+        // `None`/`ScalarScale` only when NOT LTBS: the IOV walk applies the LTBS log in
+        // PK-param space *before* the η/θ/κ chain, so the production scale-then-log order
+        // can't be reproduced post-walk — LTBS (`log(DV) ~ additive`) stays FD for IOV,
+        // matching the pre-#575 `|| model.log_transform` guard.
+        ScalingSpec::None | ScalingSpec::ScalarScale(_) if !model.log_transform => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
             if expression_scale_axes_admissible(p, model) => {}
         _ => return false,
     }
-    // Bare lagtime only — a compartment-indexed `ALAGn` gives per-dose differing shifts
-    // the single `PK_IDX_LAGTIME` walk cannot represent (same as indexed `F`).
-    if model
-        .active_dose_attr_map()
-        .has_indexed_attr(crate::types::DoseAttr::F)
-        || model
-            .active_dose_attr_map()
-            .has_indexed_attr(crate::types::DoseAttr::Lag)
-    {
-        return false;
-    }
+    // Compartment-indexed bioavailability `F{cmt}` and lagtime `ALAG{cmt}` ARE supported under
+    // IOV (#486 IOV-scope parity): the shared `integrate_tvcov_readout`/`integrate_tvcov_g`
+    // walk resolves each dose's own compartment slot — `f_bio_slot(ode, d.cmt)` and
+    // `dose_lag_slot = attr_map.lag_slot(d.cmt)` — exactly as the non-IOV
+    // `ode_analytical_supported` walk does (an indexed slot is an ordinary individual-parameter
+    // output seeded per occasion by `seed_pk_dual2_iov`). The old bail here assumed a single
+    // `PK_IDX_LAGTIME` slot the walk never actually used.
     // `init(...)` initial conditions are analytic on the ODE IOV walk too (#486): the IOV
     // outer/inner (`run_subject_iov` / `_eta`) run through the SAME `integrate_tvcov_readout`
     // the non-IOV walk uses, which seeds `init` via `tvcov_init_state` at the first-record
@@ -8347,6 +8354,222 @@ mod tests {
                 approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-9);
             }
         }
+    }
+
+    /// #486: a `TIME`-switched CL combined with a **built-in `first_order` absorption
+    /// forcing**. The event-driven walk carries both the per-event `TIME` seeding (#637) and
+    /// the `R_in` forcing (#643), so this composition is analytic — the old
+    /// `ode_analytical_supported` decline (which assumed the walk carried no `R_in`) was
+    /// stale. Value / ∂η / ∂θ + the 2nd-order blocks must match FD of production, and the
+    /// inner Dual1 must track the outer.
+    #[test]
+    fn ode_time_builtin_with_first_order_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+first_order");
+        assert!(
+            ode_analytical_supported(&model),
+            "TIME + input-rate forcing must be analytic now (#486)"
+        );
+        let subject = bolus_subject(&[1.0, 3.0, 8.0, 16.0, 30.0]); // straddle TIME = 5
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0, 1.0];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// #486: a `TIME`-switched CL combined with a non-zero **`init(...)` baseline**. The
+    /// event-driven walk seeds the `init` state (#662) and threads per-event `TIME` (#637)
+    /// together, so this composition is analytic — the old decline (assuming the walk seeded
+    /// compartments at zero) was stale. Value / ∂η / ∂θ + 2nd-order vs FD of production.
+    #[test]
+    fn ode_time_builtin_with_init_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(central) = -(CL/V)*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+init");
+        assert!(model.ode_spec.as_ref().unwrap().init_fn.is_some());
+        assert!(
+            ode_analytical_supported(&model),
+            "TIME + init(...) must be analytic now (#486)"
+        );
+        let mut subject = bolus_subject(&[1.0, 3.0, 8.0, 16.0, 30.0]); // straddle TIME = 5
+        subject.doses = vec![]; // the init baseline is the sole input
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// #486 (route-completeness): the **three-way** composition of a `TIME`-switched CL,
+    /// a built-in `first_order` absorption **input-rate forcing**, AND an estimated
+    /// compartment-indexed **lagtime** (`ALAG1`). Each pair is covered elsewhere
+    /// (`ode_time_builtin_with_first_order_matches_production` = TIME + `R_in`;
+    /// `ode_provider_first_order_with_alag_matches_production` = `R_in` + lag), but the
+    /// gate removed in this PR newly admits all three at once, so the per-event `TIME`
+    /// PK-param seeding (#637), the `R_in` forcing (#643), and the lagged rate-on
+    /// saltation `Δr = dose·ka` at the moving arrival `t_dose + lag` must compose. If they
+    /// did not, `ode_subject_sensitivities` would return `Some` with a silently wrong
+    /// gradient (no FD fallback), so value/∂η/∂θ + the 2nd-order blocks are checked against
+    /// FD of production and the inner `Dual1` against the outer `Dual2`.
+    #[test]
+    fn ode_time_builtin_with_first_order_and_lagtime_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_KA ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V     = TVV
+  KA    = TVKA * exp(ETA_KA)
+  ALAG1 = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+first_order+lagtime");
+        assert!(model.has_lagtime());
+        assert!(
+            ode_analytical_supported(&model),
+            "TIME + input-rate + lagtime must be analytic now (#486)"
+        );
+        // Obs deliberately straddle both the `TIME = 5` switch and the `t_dose + TVLAG`
+        // arrival, while avoiding landing exactly on `t_dose + TVLAG` (a central-FD kink
+        // in `lag`, see `ode_provider_first_order_with_alag_matches_production`).
+        let subject = bolus_subject(&[0.1, 0.2, 0.4, 3.0, 8.0, 16.0, 30.0]);
+        assert!(!ode_subject_supported(&model, &subject));
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0, 1.0, 0.3];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    }
+
+    /// #486 (newly-analytic composed cell): `TIME`-switched CL + a non-zero `init(...)`
+    /// baseline + a **steady-state** dose. Unlike SS + input-rate (declined above), SS +
+    /// `init` IS supported by production: `equilibrate_ss_state` seeds the SS trough from
+    /// zero and overwrites the state at the SS dose (discarding `init` there), while `init`
+    /// still governs the **pre-SS-dose** segments — so the walk must reproduce both the
+    /// decaying-`init` pre-dose predictions (crossing the `TIME` switch) and the post-dose
+    /// steady state. This composition was FD before this PR (the removed gate) and is
+    /// **computed** by the walk now, so it is the one genuinely-new cell that could be
+    /// silently wrong; value/∂η/∂θ + 2nd-order must match FD of production.
+    #[test]
+    fn ode_time_builtin_with_init_and_ss_matches_production() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 100.0)
+  theta TVCL_LATE(0.5, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 5.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = 1000.0 / V
+  d/dt(central) = -(CL/V)*central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+        let model = parse_model_string(M).expect("parse TIME+init+SS");
+        assert!(model.ode_spec.as_ref().unwrap().init_fn.is_some());
+        assert!(ode_analytical_supported(&model));
+        // Pre-SS-dose obs (2, 4) decay the `init` baseline and straddle TIME = 5; the SS
+        // bolus lands at t = 8 (II = 12), and later obs (10, 14, 20) read the steady state.
+        let mut subject = bolus_subject(&[2.0, 4.0, 10.0, 14.0, 20.0]);
+        subject.doses = vec![DoseEvent::new(8.0, 100.0, 1, 0.0, true, 12.0)];
+        assert!(subject.doses[0].ss && subject.has_periodic_ss_dose());
+        assert!(!ode_subject_supported(&model, &subject));
+        assert!(ode_tvcov_supported(&model, &subject));
+        let theta = vec![1.0, 0.5, 20.0];
+        let eta = vec![0.15, -0.10];
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     }
 
     /// #486: an η-dependent `ExpressionScale` `obs_scale = 1000/V` on the **ODE

@@ -370,6 +370,8 @@ pub fn individual_nll_into_with_schedule(
     }
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
 
     // Eta prior: eta' * Omega_inv * eta
     let eta_vec = DVector::from_column_slice(eta);
@@ -443,7 +445,7 @@ pub fn individual_nll_into_with_schedule(
                 }
             }
             let v_resid = model.residual_variance_at_scaled(
-                subject.obs_cmts[j],
+                err_keys[j],
                 f_pred,
                 sigma_values,
                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
@@ -535,11 +537,13 @@ fn dense_residual_data_term(
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> Option<f64> {
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let mut r = match ruv_mult {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,
             preds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -550,7 +554,7 @@ fn dense_residual_data_term(
         None => compute_r_matrix_with_correlations(
             &model.error_spec,
             preds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -622,6 +626,8 @@ pub(crate) fn obs_nll_subject_from_preds(
     // FREM covariate rows keep their own (unscaled) EPSCOV variance.
     let ruv_scale = model.residual_var_scale(eta);
     let ruv_mult = model.ruv_obs_mult(subject, theta);
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
@@ -652,7 +658,7 @@ pub(crate) fn obs_nll_subject_from_preds(
             let v = match frem_var {
                 Some(vv) => vv.max(1e-12),
                 None => (model.residual_variance_at_scaled(
-                    subject.obs_cmts[j],
+                    err_keys[j],
                     f,
                     sigma_values,
                     ruv_mult.as_ref().map(|m| m[j].as_slice()),
@@ -1071,6 +1077,8 @@ pub fn foce_subject_nll_standard(
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
     let n_obs = subject.observations.len();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // f0 = ipred - H * eta_hat (linearized population prediction)
     let h_eta = h_matrix * eta_hat;
@@ -1089,7 +1097,7 @@ pub fn foce_subject_nll_standard(
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             error_spec,
             r_eval,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1100,7 +1108,7 @@ pub fn foce_subject_nll_standard(
         None => compute_r_matrix_with_correlations(
             error_spec,
             r_eval,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1334,6 +1342,8 @@ pub fn foce_subject_nll_interaction_dense(
 ) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as
     // the data term and FOCE-standard path assemble it.
@@ -1341,7 +1351,7 @@ pub fn foce_subject_nll_interaction_dense(
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             error_spec,
             ipreds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1352,7 +1362,7 @@ pub fn foce_subject_nll_interaction_dense(
         None => compute_r_matrix_with_correlations(
             error_spec,
             ipreds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1393,7 +1403,7 @@ pub fn foce_subject_nll_interaction_dense(
     let dr = crate::stats::residual_error::compute_dr_df_matrices(
         error_spec,
         ipreds,
-        &subject.obs_cmts,
+        err_keys.as_ref(),
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
@@ -1565,6 +1575,8 @@ fn gaussian_foce_accum(
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
     let mult_row = |j: usize| -> Option<&[f64]> { ruv_mult.map(|m| m[j].as_slice()) };
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // Partition observation indices into quantified vs censored (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
@@ -1591,10 +1603,9 @@ fn gaussian_foce_accum(
         } else {
             match mult_row(j) {
                 Some(m) => {
-                    error_spec.variance_at_scaled(subject.obs_cmts[j], f, sigma_values, &[], m)
-                        * ruv_scale
+                    error_spec.variance_at_scaled(err_keys[j], f, sigma_values, &[], m) * ruv_scale
                 }
-                None => error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+                None => error_spec.variance_at(err_keys[j], f, sigma_values) * ruv_scale,
             }
         };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
@@ -1611,10 +1622,8 @@ fn gaussian_foce_accum(
         let aj = h_matrix.row(j);
         let dvar_df = if is_pk_row {
             match mult_row(j) {
-                Some(m) => {
-                    error_spec.dvar_df_scaled(subject.obs_cmts[j], f, sigma_values, m) * ruv_scale
-                }
-                None => error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+                Some(m) => error_spec.dvar_df_scaled(err_keys[j], f, sigma_values, m) * ruv_scale,
+                None => error_spec.dvar_df(err_keys[j], f, sigma_values) * ruv_scale,
             }
         } else {
             0.0 // FREM rows: additive near-zero sigma, ∂R/∂f = 0
@@ -1647,7 +1656,7 @@ fn gaussian_foce_accum(
     for &j in &bloq_idx {
         let limit = subject.observations[j];
         let f = ipreds[j];
-        let cmt = subject.obs_cmts[j];
+        let cmt = err_keys[j];
         // `v_resid`/`d`/`d2` all carry the same proportional-loading (`m²`) and
         // `exp(2·η_ruv)` scaling, so the censored curvature is built from mutually
         // consistent derivatives of one `v(f)`.
@@ -2056,6 +2065,8 @@ pub fn compute_cwres(
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // f0 = ipred - H * eta_hat
     let h_eta = h_matrix * eta_hat;
@@ -2070,7 +2081,7 @@ pub fn compute_cwres(
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             error_spec,
             &f0,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -2081,7 +2092,7 @@ pub fn compute_cwres(
         None => compute_r_matrix_with_correlations(
             error_spec,
             &f0,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -2299,13 +2310,13 @@ pub fn individual_nll_iov(
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
     // IIV on residual error (#409): η_ruv is a BSV eta, indexed into `eta`.
     let ruv_scale = model.residual_var_scale(eta);
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv,
-            None => {
-                model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale
-            }
+            None => model.residual_variance_at(err_keys[j], f_pred, sigma_values) * ruv_scale,
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
@@ -2455,7 +2466,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 

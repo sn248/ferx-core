@@ -125,6 +125,9 @@ pub(crate) fn model_preds(
         );
         pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
+    // Analytic Form C readout (#650): replaces the built-in concentration. No-op
+    // for ODE models (handled inside `compute_predictions_ode`) and when unset.
+    pk::apply_analytic_readout(model, subject, theta, eta, &mut preds);
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
     pk::apply_log_transform(model, &mut preds);
     preds
@@ -525,6 +528,27 @@ fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagn
         ),
     )
     .with_suggestion(format!("available covariate columns: {}", available))]
+}
+
+/// Reject an adaptive-dosing simulation on a covariate-selected error model (#658).
+///
+/// The adaptive assay resolves residual variance by the monitored **compartment**
+/// number (`residual_variance_at(cmt, …)`), but `ErrorSpec::Selected`'s `endpoints`
+/// map is keyed by the selector's **0-based branch index**, not CMT. A CMT-keyed
+/// lookup misses and `variance_at` returns `NaN`, silently corrupting the assay
+/// draw. The combination has no coherent meaning today, so reject it loudly rather
+/// than emit NaN observations.
+fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), String> {
+    if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
+        return Err(
+            "adaptive-dosing simulation does not support a covariate-selected `[error_model]` \
+             (`if (COV …) { … } else { … }`): the assay keys residual error by the monitored \
+             compartment, but a selected error model keys endpoints by covariate branch. Use a \
+             single-endpoint error model for the monitored signal."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Covariates referenced by the model but missing from the `[covariates]`
@@ -1157,12 +1181,36 @@ pub(crate) fn check_transit_support(
                 .to_string(),
         );
     }
+    // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
+    // transit closed form assumes constant parameters over each absorption window, so it
+    // cannot serve it. The plain `cl/v/n/mtt` form carries a `transit_ode_equivalent`
+    // (built at parse time), which the runtime dispatch routes such subjects to, so it is
+    // NOT rejected. Only a form outside the desugar's scope (a `lagtime=`/`f=` mapping or a
+    // custom `[scaling]` — no equivalent) is rejected here rather than mis-predict.
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        && model.transit_ode_equivalent.is_none()
+    {
+        return Some(
+            "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
+             not support a TIME-dependent structural parameter: the transit closed form \
+             assumes constant parameters over each absorption window, and this form is \
+             outside the automatic ODE-equivalent rewrite. Write the model as an ODE \
+             transit() forcing in [odes] directly."
+                .to_string(),
+        );
+    }
     for subject in &population.subjects {
-        if subject.has_tv_covariates() {
+        // Time-varying covariates make the disposition switch mid-absorption, which the
+        // closed form cannot serve. The plain form's `transit_ode_equivalent` handles it
+        // (the runtime dispatch routes TV-cov subjects there), so reject only the
+        // out-of-scope forms that carry no equivalent.
+        if subject.has_tv_covariates() && model.transit_ode_equivalent.is_none() {
             return Some(format!(
-                "one_cpt_transit does not support within-subject time-varying covariates \
-                 (subject {}): the transit closed form assumes constant parameters over each \
-                 absorption window. Use an ODE transit model.",
+                "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
+                 not support within-subject time-varying covariates (subject {}): the transit \
+                 closed form assumes constant parameters over each absorption window, and this \
+                 form is outside the automatic ODE-equivalent rewrite. Write the model as an \
+                 ODE transit() forcing in [odes] directly.",
                 subject.id
             ));
         }
@@ -1188,6 +1236,39 @@ pub(crate) fn check_transit_support(
     None
 }
 
+/// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
+/// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
+///
+/// The depot amount is reconstructed by dose superposition (`apply_analytic_readout`),
+/// which is invalid across a reset — the closed form cannot restart the accumulation,
+/// so the readout would silently see a zero depot after the reset and mis-predict.
+/// Rather than return a subtly wrong `PRED`/OFV, fail loudly and point at an ODE
+/// model (which integrates the depot state across resets). A `central`-only readout
+/// is unaffected. Returns `None` for the common no-readout / IV / central-only case.
+pub(crate) fn check_analytic_readout_support(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    let ar = model.analytic_readout.as_ref()?;
+    if !ar.references_depot() {
+        return None;
+    }
+    for subject in &population.subjects {
+        if subject.has_resets() {
+            return Some(format!(
+                "[scaling] y: an analytic Form C readout that references the oral `depot` \
+                 amount is not supported on a subject with an EVID=3/4 reset (subject {}): \
+                 the depot amount is reconstructed by dose superposition, which is invalid \
+                 across a reset. Reference only the `central` amount, or use an ODE model \
+                 (`ode(states=[depot, central])`) which integrates the depot across resets. \
+                 See issue #650.",
+                subject.id
+            ));
+        }
+    }
+    None
+}
+
 /// Panic on an unsupported `one_cpt_transit` model/data combination, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
@@ -1196,6 +1277,19 @@ pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Populat
         panic!(
             "predict()/simulate() received a model/data combination one_cpt_transit cannot \
              honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
+/// Panic on a depot-referencing analytic Form C readout + reset subject, for the
+/// `Vec`-returning `predict()`/`simulate()` paths (mirrors
+/// [`assert_transit_support`]). `fit()` returns this as an `Err`.
+pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_analytic_readout_support(model, population) {
+        panic!(
+            "predict()/simulate() received a model/data combination the analytic Form C \
+             readout cannot honour: {msg}\n(fit() reports this as an error rather than \
+             panicking.)"
         );
     }
 }
@@ -2016,6 +2110,12 @@ pub fn fit(
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     if let Some(e) = check_transit_support(model, population) {
+        return Err(e);
+    }
+    // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
+    // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
+    // would silently read a zero depot. Fail loudly instead.
+    if let Some(e) = check_analytic_readout_support(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -4695,7 +4795,7 @@ fn compute_subject_results(
             let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
                 &ipred,
-                &subject.obs_cmts,
+                model.error_spec.obs_keys(subject).as_ref(),
                 &model.error_spec,
                 &params.sigma.values,
                 &model.residual_correlations,
@@ -4956,6 +5056,58 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
 mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
+
+    /// #658: an adaptive-dosing simulation on a covariate-selected error model
+    /// must be rejected — the assay keys residual variance by CMT, but a
+    /// `Selected` spec keys endpoints by covariate branch (a CMT-keyed lookup
+    /// would miss and draw NaN). A single-endpoint error model is accepted.
+    #[test]
+    fn adaptive_rejects_selected_error_model() {
+        use crate::parser::model_parser::parse_model_string;
+        let ode_selected = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_TOTAL   ~ 0.05 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+        let model = parse_model_string(ode_selected).expect("ODE+Selected model parses");
+        let err = reject_selected_error_for_adaptive(&model)
+            .expect_err("Selected error model must be rejected for adaptive dosing");
+        assert!(
+            err.to_lowercase().contains("adaptive") && err.contains("error_model"),
+            "error should cite the adaptive/error_model restriction: {err}"
+        );
+
+        // A single-endpoint error model on the same structure is accepted.
+        let ode_single = ode_selected.replace(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+            "  DV ~ proportional(PROP_TOTAL)",
+        );
+        let single = parse_model_string(&ode_single).expect("ODE+Single model parses");
+        assert!(reject_selected_error_for_adaptive(&single).is_ok());
+    }
 
     fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         let n = iwres.len();
@@ -5604,6 +5756,12 @@ pub fn simulate_with_options(
     #[cfg(feature = "survival")]
     validate_ode_tte_simulatable(model, population, opts.horizon)?;
 
+    // Parity with `fit()`: a referenced covariate absent from the data would
+    // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
+    // would route every row to branch 0, applying the wrong residual variance
+    // with no diagnostic). Reject it here the same way `fit()` does (#658).
+    first_error(&check_covariates(model, population))?;
+
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
     // this API must get the same guard: a NaN window makes every `t_event < window`
@@ -6069,6 +6227,13 @@ where
             .to_string()
     })?;
 
+    // The adaptive assay keys residual variance by the monitored compartment
+    // number (`residual_variance_at(cmt, …)`), but a `Selected` error model's
+    // endpoints are keyed by the covariate selector's 0-based branch index, not
+    // CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
+    // the assay draw. Reject the combination rather than emit NaN observations (#658).
+    reject_selected_error_for_adaptive(model)?;
+
     // An empty schedule means the controller is never consulted: the result is a
     // dose-free simulation that the verifier (replaying an empty ledger) passes
     // trivially. That is almost always a forgotten `decision_times` (the field
@@ -6423,6 +6588,12 @@ pub fn simulate_adaptive_from_spec(
     // here rather than allowed to silently produce nothing.
     let compiled = crate::sim::adaptive_control::compile_adaptive(model, spec)
         .map_err(|e| format!("simulate_adaptive_from_spec: {e}"))?;
+    // Parity with `fit()`: model-referenced covariates (e.g. a `Selected` error
+    // model's selector) must be present too, not just the `observe` signal (#658).
+    first_error(&check_covariates(model, population))?;
+    // A `Selected` error model keys endpoints by selector branch, not CMT, so the
+    // compartment-keyed assay would draw NaN — reject it (see the helper's note, #658).
+    reject_selected_error_for_adaptive(model)?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
     // Apply the same loud check fits use for model covariates (`check_covariates`).
@@ -6513,6 +6684,11 @@ pub fn simulate_with_uncertainty(
     #[cfg(feature = "survival")]
     validate_ode_tte_simulatable(model, population, None)?;
 
+    // Parity with `fit()`: reject a referenced covariate absent from the data
+    // rather than silently reading it as 0.0 (a `Selected` error-model selector
+    // would otherwise route every row to branch 0). See #658.
+    first_error(&check_covariates(model, population))?;
+
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
         // Re-seed StdRng from entropy so simulate-without-seed is still
@@ -6592,6 +6768,7 @@ pub fn predict(
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_analytic_readout_support(model, population);
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
@@ -6918,7 +7095,9 @@ mod iov_integration {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -8959,8 +9138,63 @@ mod simulate_with_uncertainty_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
+    }
+
+    /// A `one_cpt_transit` + `TIME` model that the ODE desugar does NOT cover — here because
+    /// of a `lagtime=` mapping (the desugar is scoped to the plain `cl/v/n/mtt` form) — stays
+    /// on the closed form and must be rejected up front rather than silently freezing `TIME`
+    /// at the first record. (The plain form is instead rewritten to the ODE `transit()`
+    /// equivalent and works; see the parser test `transit_time_desugars_to_ode_equivalent`.)
+    #[test]
+    fn transit_with_time_and_lagtime_is_rejected() {
+        use crate::parser::model_parser::parse_model_string;
+        const TRANSIT_TIME_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVCL_LATE(7.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  if (TIME > 12.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V   = TVV
+  MTT = TVMTT
+  NTR = TVN
+  LAGTIME = TVLAG
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+        let model = parse_model_string(TRANSIT_TIME_LAG).expect("parse transit+TIME+lag");
+        assert_eq!(
+            model.pk_model,
+            crate::types::PkModel::OneCptTransit,
+            "the lagtime= form is outside the desugar scope, so it stays closed-form"
+        );
+        assert!(
+            crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
+            "fixture must use the TIME built-in"
+        );
+        let msg = check_transit_support(&model, &tiny_population())
+            .expect("transit + TIME (lagtime form) must be rejected up front");
+        assert!(
+            msg.contains("TIME"),
+            "rejection message must name the TIME limitation: {msg}"
+        );
     }
 
     fn tiny_population() -> Population {
@@ -9776,7 +10010,9 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -10107,7 +10343,9 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -10266,7 +10504,9 @@ mod tests_derived_session_clock {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -10585,7 +10825,9 @@ mod tests_derived_iov_kappa {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

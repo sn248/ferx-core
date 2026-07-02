@@ -1424,7 +1424,12 @@ fn compute_joint_posterior_hessian(
     let ipreds = predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
 
     // Compute residual variance with FREM overrides
-    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let mut r_diag = compute_r_diag(
+        &model.error_spec,
+        &ipreds,
+        model.error_spec.obs_keys(subject).as_ref(),
+        sigma,
+    );
     // IIV on residual error (#409): scale PK residual variance by exp(2·η̂_ruv).
     let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
     if ruv_scale != 1.0 {
@@ -1611,11 +1616,12 @@ fn subject_is_estimate_joint(
         let m3 = matches!(model.bloq_method, BloqMethod::M3);
         // IIV on residual error (#409): scale by exp(2·η_ruv) for this draw's eta.
         let ruv_scale = model.residual_var_scale(eta_sample);
+        // #658: per-observation residual endpoint keys (covariate selector or CMT).
+        let err_keys = model.error_spec.obs_keys(subject);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
             let f = f.max(1e-12);
-            let v =
-                (model.residual_variance_at(subject.obs_cmts[j], f, sigma) * ruv_scale).max(1e-12);
+            let v = (model.residual_variance_at(err_keys[j], f, sigma) * ruv_scale).max(1e-12);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
                 obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
@@ -1980,7 +1986,12 @@ pub(crate) fn compute_posterior_hessian(
             return omega_inv + jacobian.transpose() * &r_inv * jacobian;
         }
     }
-    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let mut r_diag = compute_r_diag(
+        &model.error_spec,
+        &ipreds,
+        model.error_spec.obs_keys(subject).as_ref(),
+        sigma,
+    );
     // IIV on residual error (#409): scale the PK residual variance at the mode by
     // exp(2·η̂_ruv) so the Laplace proposal precision reflects the per-subject
     // residual SD. FREM rows are overwritten below with their own variance.

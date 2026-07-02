@@ -444,23 +444,6 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     }
 }
 
-/// Decide whether to run the SLSQP fallback after the primary NLopt run.
-///
-/// The fallback retries from the current point with SLSQP when the primary
-/// optimizer did not report a clean convergence code. It is suppressed when the
-/// stop was `MaxEvalReached` (#499): a spent evaluation budget is not a failure a
-/// second optimizer can fix — the user needs a larger `maxiter` — so re-running a
-/// fresh full-budget SLSQP would just double the cost. It is also suppressed when
-/// the run already used SLSQP (nothing to switch to) or the user cancelled.
-fn should_run_slsqp_fallback(
-    converged: bool,
-    already_slsqp: bool,
-    cancelled: bool,
-    max_eval_reached: bool,
-) -> bool {
-    !converged && !already_slsqp && !cancelled && !max_eval_reached
-}
-
 fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
@@ -1072,10 +1055,8 @@ fn optimize_nlopt(
                 if matches!(algo, nlopt::Algorithm::Slsqp) {
                     cap_slsqp_gradient(g, &lower_s, &upper_s);
                 }
-                // Gate on the global best (same reason as the `best_seen` update
-                // below): `state.best_ofv` resets to INFINITY when the SLSQP
-                // fallback starts, so using it here would let the fallback's first
-                // eval overwrite a better gradient found by the primary run.
+                // Gate on the global best (same tracker as the `best_seen` update
+                // below) so `last_gradient` always reflects the best point seen.
                 {
                     let global_best = best_seen_cl
                         .lock()
@@ -1101,11 +1082,9 @@ fn optimize_nlopt(
                 eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
             }
         }
-        // `best_seen` is global across the primary run and any SLSQP fallback.
-        // Gate on the externally-tracked best (not `state.best_ofv`, which
-        // resets to INFINITY when the fallback starts fresh) so the first
-        // fallback eval at the drifted post-primary x0 can't clobber a
-        // better point found earlier.
+        // `best_seen` tracks the global minimum across the whole run so the
+        // final restore (issue #59) lands on the true best point, even when the
+        // optimizer drifts away from it before terminating.
         {
             let mut bs = best_seen_cl.lock().unwrap();
             if bs.as_ref().is_none_or(|(_, prev)| ofv < *prev) {
@@ -1224,42 +1203,38 @@ fn optimize_nlopt(
     // Run optimization
     let result = opt.optimize(&mut x0);
 
-    // `max_eval_reached` is tracked separately from `converged` (#499): hitting
-    // the eval budget is not a failure that a fresh SLSQP run can fix — the user
-    // simply needs a larger `maxiter` — so it must not trigger the fallback.
+    // `max_eval_reached` distinguishes a spent evaluation budget from other
+    // non-convergence: it gets its own warning ("increase maxiter") rather than
+    // the generic "did not converge" message.
     let mut max_eval_reached = false;
-    let (mut converged, first_algo) = match &result {
+    let converged = match &result {
         Ok((status, _)) => {
             if options.verbose {
                 eprintln!("NLopt finished: {:?}", status);
             }
             max_eval_reached = matches!(status, nlopt::SuccessState::MaxEvalReached);
-            (
-                matches!(
-                    status,
-                    nlopt::SuccessState::Success
-                        | nlopt::SuccessState::FtolReached
-                        | nlopt::SuccessState::XtolReached
-                        | nlopt::SuccessState::StopValReached
-                ),
-                algo,
+            matches!(
+                status,
+                nlopt::SuccessState::Success
+                    | nlopt::SuccessState::FtolReached
+                    | nlopt::SuccessState::XtolReached
+                    | nlopt::SuccessState::StopValReached
             )
         }
         Err((fail, _)) => {
             if options.verbose {
                 eprintln!("NLopt stopped: {:?}", fail);
             }
-            (matches!(fail, nlopt::FailState::RoundoffLimited), algo)
+            matches!(fail, nlopt::FailState::RoundoffLimited)
         }
     };
 
     drop(opt);
 
-    // Fallback: retry with SLSQP from the current point when the primary
-    // optimizer did not converge cleanly — except on `MaxEvalReached`, which is a
-    // spent eval budget, not a failure a second optimizer can fix (#499).
-    let already_slsqp = matches!(first_algo, nlopt::Algorithm::Slsqp);
-    let cancelled = crate::cancel::is_cancelled(&options.cancel);
+    // A spent evaluation budget gets a targeted "increase maxiter" warning; every
+    // other non-convergence falls through to the generic "did not converge"
+    // warning below. There is no automatic second optimization — a user who wants
+    // SLSQP sets `optimizer = slsqp` as the primary (issue #657).
     if max_eval_reached {
         warnings.push(format!(
             "Outer optimization hit the evaluation budget (maxiter = {}) before \
@@ -1269,249 +1244,10 @@ fn optimize_nlopt(
         if options.verbose {
             eprintln!(
                 "NLopt hit the evaluation budget (maxiter = {}) without converging — \
-                 increase maxiter for a tighter fit. Skipping the SLSQP fallback \
-                 (it cannot fix a spent budget).",
+                 increase maxiter for a tighter fit.",
                 options.outer_maxiter,
             );
         }
-    }
-    if should_run_slsqp_fallback(converged, already_slsqp, cancelled, max_eval_reached) {
-        if options.verbose {
-            eprintln!("Retrying with NLopt SLSQP from current point...");
-        }
-
-        let state2 = new_nlopt_state(n_subj, n_eta, &x0);
-
-        let n_evals_cl2 = Arc::clone(&n_evals_outer);
-        let ebe_accum_cl2 = Arc::clone(&ebe_accum);
-        let best_seen_cl2 = Arc::clone(&best_seen);
-        let last_gradient_cl2 = Arc::clone(&last_gradient);
-        // SLSQP fallback also operates in scaled xs space (same scale as primary opt).
-        let objective2 = |xs: &[f64], grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
-            if crate::cancel::is_cancelled(&options.cancel) {
-                if let Some(g) = grad {
-                    for gi in g.iter_mut() {
-                        *gi = 0.0;
-                    }
-                }
-                return 1e20;
-            }
-            // Stagnation guard — see primary closure for rationale.
-            if state.stagnation_stopped {
-                if let Some(g) = grad {
-                    for gi in g.iter_mut() {
-                        *gi = 0.0;
-                    }
-                }
-                state.n_evals += 1;
-                n_evals_cl2.fetch_add(1, Ordering::Relaxed);
-                return state.best_ofv;
-            }
-            let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-            let params = unpack_params(&x, init_params);
-            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let (ehs, hms, ebe_stats2, kappas) = run_inner_loop_warm(
-                model,
-                population,
-                &params,
-                options.inner_maxiter,
-                options.inner_tol,
-                Some(&state.cached_etas),
-                Some(&mu_k),
-                options.min_obs_for_convergence_check as usize,
-            );
-            let nll = pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kappas,
-                options.interaction,
-            );
-            let raw_ofv = 2.0 * nll;
-
-            let ebe_guard2 =
-                ebe_guard_rejects(&ebe_stats2, n_subj, raw_ofv, options.max_unconverged_frac);
-            {
-                let mut acc = ebe_accum_cl2.lock().unwrap();
-                if acc.max_unconverged < ebe_stats2.n_unconverged {
-                    acc.max_unconverged = ebe_stats2.n_unconverged;
-                }
-                acc.total_fallback += ebe_stats2.n_fallback;
-                if ebe_guard2 {
-                    acc.n_convergence_warnings += 1;
-                }
-            }
-            // Consistent guard penalty for the gradient line search (mirrors the primary
-            // closure / `guard_penalty_value`); flat `1e20` wall for derivative-free callers.
-            let guarded = ebe_guard2 || !raw_ofv.is_finite();
-            let ofv = if guarded {
-                if grad.is_some() {
-                    guard_penalty_value(xs, &lower_s, &upper_s)
-                } else {
-                    1e20
-                }
-            } else {
-                raw_ofv
-            };
-
-            let mut grad_norm_for_trace: Option<f64> = None;
-            if let Some(g) = grad {
-                // Mirror the primary closure: a guard-rejected or non-finite point gets a
-                // steepest-ascent nudge instead of a population gradient (the iteration-6
-                // stall this PR targets also reaches the SLSQP fallback — #603 review #3),
-                // and falls through to the shared bookkeeping so the eval stays traced
-                // (#603 review #5).
-                if guarded {
-                    for i in 0..g.len() {
-                        let center_s = (lower_s[i] + upper_s[i]) / 2.0;
-                        g[i] = 100.0 * (xs[i] - center_s);
-                    }
-                } else {
-                    // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                    let grad_raw = population_gradient(
-                        &x,
-                        n_subj,
-                        init_params,
-                        model,
-                        population,
-                        &ehs,
-                        &hms,
-                        &kappas,
-                        &bounds,
-                        options,
-                        &mut state.n_grad_evals,
-                    );
-                    let mut sq = 0.0_f64;
-                    for k in 0..g.len() {
-                        let gi = if grad_raw[k].is_finite() {
-                            grad_raw[k] * scale[k]
-                        } else {
-                            0.0
-                        };
-                        g[k] = gi;
-                        sq += gi * gi;
-                    }
-                    grad_norm_for_trace = Some(sq.sqrt());
-                    // SLSQP overshoot guard (issue #55) — this fallback
-                    // closure is unconditionally SLSQP.
-                    cap_slsqp_gradient(g, &lower_s, &upper_s);
-                    // See `best_seen` comment in the primary closure — gate on the
-                    // global accumulator, not `state.best_ofv` which is fresh here.
-                    {
-                        let global_best = best_seen_cl2
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .map(|(_, o)| *o)
-                            .unwrap_or(f64::INFINITY);
-                        if ofv < global_best {
-                            *last_gradient_cl2.lock().unwrap() = Some(grad_raw.clone());
-                        }
-                    }
-                }
-            }
-
-            state.cached_etas = ehs;
-            state.cached_h_mats = hms;
-            state.n_evals += 1;
-            n_evals_cl2.fetch_add(1, Ordering::Relaxed);
-            if ofv < state.best_ofv {
-                state.best_ofv = ofv;
-                if verbose {
-                    eprintln!("Eval {:>4}: OFV = {:.6} (SLSQP)", state.n_evals, ofv);
-                }
-            }
-            // See `best_seen` comment in the primary closure — gate on the
-            // global accumulator, not `state.best_ofv` which is fresh here.
-            {
-                let mut bs = best_seen_cl2.lock().unwrap();
-                if bs.as_ref().is_none_or(|(_, prev)| ofv < *prev) {
-                    *bs = Some((xs.to_vec(), ofv));
-                }
-            }
-            if detect_stagnation(state, n, options.stagnation_guard) && verbose {
-                eprintln!(
-                    "Eval {:>4}: SLSQP fallback stopping early — OFV has converged \
-                     (no improvement above 1e-3 in last window). This is normal \
-                     convergence behaviour, not an error: further evaluations are \
-                     unlikely to find a better solution.",
-                    state.n_evals,
-                );
-            }
-
-            // Optimizer trace (SLSQP fallback, step_norm in scaled space)
-            if crate::estimation::trace::is_active() {
-                let step_norm = {
-                    let sq: f64 = xs
-                        .iter()
-                        .zip(&state.prev_x)
-                        .map(|(a, b)| (a - b).powi(2))
-                        .sum();
-                    let n = sq.sqrt();
-                    if n > 0.0 {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                };
-                let method_str = match options.method {
-                    EstimationMethod::FoceI => "focei",
-                    _ => "foce",
-                };
-                crate::estimation::trace::write_foce(
-                    state.n_evals,
-                    method_str,
-                    ofv,
-                    grad_norm_for_trace,
-                    step_norm,
-                    "slsqp",
-                    Some(ebe_stats2.n_unconverged),
-                    Some(ebe_stats2.n_fallback),
-                );
-            }
-            state.prev_x = xs.to_vec();
-
-            ofv
-        };
-
-        let mut opt2 = nlopt::Nlopt::new(
-            nlopt::Algorithm::Slsqp,
-            n,
-            objective2,
-            nlopt::Target::Minimize,
-            state2,
-        );
-        opt2.set_lower_bounds(&lower_s).unwrap();
-        opt2.set_upper_bounds(&upper_s).unwrap();
-        opt2.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
-            .unwrap();
-        opt2.set_xtol_rel(1e-12).unwrap();
-        opt2.set_ftol_rel(1e-12).unwrap();
-
-        let result2 = opt2.optimize(&mut x0);
-        converged = match &result2 {
-            Ok((status, _)) => {
-                if options.verbose {
-                    eprintln!("NLopt SLSQP finished: {:?}", status);
-                }
-                matches!(
-                    status,
-                    nlopt::SuccessState::Success
-                        | nlopt::SuccessState::FtolReached
-                        | nlopt::SuccessState::XtolReached
-                        | nlopt::SuccessState::StopValReached
-                )
-            }
-            Err((fail, _)) => {
-                if options.verbose {
-                    eprintln!("NLopt SLSQP stopped: {:?}", fail);
-                }
-                matches!(fail, nlopt::FailState::RoundoffLimited)
-            }
-        };
-        drop(opt2);
     }
 
     // Restore the best-seen point (issue #59). NLopt returns the last
@@ -3966,23 +3702,6 @@ mod tests {
         assert_eq!(resolve_outer_ftol(false, false, Some(1e-10)), 1e-10);
     }
 
-    /// SLSQP-fallback gate (#499): fall back only when the primary run did not
-    /// converge and did not exhaust its eval budget, is not already SLSQP, and was
-    /// not cancelled. `MaxEvalReached` (budget spent) must suppress it.
-    #[test]
-    fn slsqp_fallback_gate() {
-        // Genuine non-convergence (not MaxEvalReached) → fall back.
-        assert!(should_run_slsqp_fallback(false, false, false, false));
-
-        // Hit the eval budget → skip (needs larger maxiter, not another optimizer).
-        assert!(!should_run_slsqp_fallback(false, false, false, true));
-
-        // Already converged, already SLSQP, or cancelled → never fall back.
-        assert!(!should_run_slsqp_fallback(true, false, false, false));
-        assert!(!should_run_slsqp_fallback(false, true, false, false));
-        assert!(!should_run_slsqp_fallback(false, false, true, false));
-    }
-
     /// Covariance progress reporter math (the pure pieces behind `cov_progress`).
     /// Stride caps output at ~20 lines but never zero; the print predicate fires
     /// every `step` items plus the final one; the ETA extrapolates wall-clock
@@ -4841,7 +4560,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -5047,7 +4768,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
         check_gradient(&model, &make_population(3), 2);
     }
@@ -5465,7 +5188,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -6222,6 +5947,58 @@ mod tests {
             r.ofv < init_ofv - 1e-6,
             "with a budget the optimizer should improve the OFV: {} vs init {init_ofv}",
             r.ofv
+        );
+    }
+
+    /// Non-convergence is reported directly and runs exactly one outer
+    /// optimization — there is no automatic SLSQP retry from the stop point
+    /// (issue #657, which removed `should_run_slsqp_fallback` and the second
+    /// `nlopt::Nlopt` run). A gradient optimizer with a tiny `outer_maxiter`
+    /// stops non-converged at its eval budget; the total objective-evaluation
+    /// count must stay within a *single* optimization's budget
+    /// (`outer_maxiter * (n + 1)`), so a re-added second optimization from the
+    /// current point would blow this bound.
+    #[test]
+    fn non_convergence_reports_directly_without_second_optimization() {
+        let model = make_model();
+        let population = make_population(3);
+        let template = &model.default_params;
+        let n = pack_params(template).len();
+
+        // A non-SLSQP gradient primary (`nlopt_lbfgs`) with a tiny budget: its
+        // xtol/ftol are set unreachably tight, so `outer_maxiter * (n + 1)` evals
+        // is the stop criterion and it cannot converge. Pre-#657 exactly this
+        // shape (non-converged, non-SLSQP) is what an unguarded fallback re-add
+        // would retry with SLSQP.
+        let outer_maxiter = 2;
+        let o = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::NloptLbfgs,
+            outer_maxiter,
+            run_covariance_step: false,
+            mu_referencing: true,
+            ..FitOptions::default()
+        };
+        let r = optimize_population(&model, &population, template, &o);
+
+        assert!(
+            !r.converged,
+            "test setup: a {outer_maxiter}-iter budget must not converge (OFV = {})",
+            r.ofv
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("did not converge")),
+            "non-convergence must surface the warning directly; got {:?}",
+            r.warnings
+        );
+        // One optimization only: no automatic second run from the stop point.
+        let single_budget = outer_maxiter as usize * (n + 1);
+        assert!(
+            r.n_iterations <= single_budget,
+            "expected a single optimization (<= {single_budget} evals), got {} — \
+             a second optimization (SLSQP fallback) appears to have run",
+            r.n_iterations
         );
     }
 }

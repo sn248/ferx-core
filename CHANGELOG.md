@@ -44,6 +44,12 @@ section of the SDLC for the versioning policy).
   FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
+- **A `TIME`-built-in structural parameter combined with a built-in absorption input-rate
+  forcing or a non-zero ODE `init(...)` baseline** now gets exact analytic FOCE/FOCEI
+  sensitivities instead of finite differences (#486). The event-driven walk that threads the
+  per-event `TIME` already carries the absorption `R_in` forcing (since #643) and seeds the
+  `init(...)` state (since #662), so the model-level decline for those combinations was stale;
+  it has been removed. Validated against finite differences of the production predictor.
 - **Built-in absorption forcings (`zero_order(dur)`, `first_order`, and `mixed`) combined
   with inter-occasion variability (IOV)** now get exact analytic FOCE/FOCEI sensitivities on
   the ODE path instead of finite differences (#486), closing the last zero-order gap. The IOV

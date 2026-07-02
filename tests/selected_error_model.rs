@@ -217,6 +217,84 @@ fn selected_error_model_with_sde_is_rejected_at_parse() {
     );
 }
 
+/// Same free/total selector as `FREE_TOTAL`, but the two branch sigmas are
+/// declared in one `block_sigma` so their residuals are *correlated* — the
+/// total and unbound assays of one sample co-vary (#669). A co-temporal
+/// total (FREE=0) / unbound (FREE=1) pair now resolves to different branches
+/// and picks up the cross-branch off-diagonal in the dense residual `R`.
+const FREE_TOTAL_BLOCK: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.0025, 0.0075, 0.09]
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+
+[fit_options]
+  method = focei
+";
+
+/// #669: a covariate-selected `[error_model]` combined with `block_sigma`
+/// correlated residuals now parses and fits. The parser records one
+/// cross-branch correlation, and a bounded FOCEI fit runs to a finite OFV with
+/// the dense residual `R` path active (the co-temporal total/unbound pair
+/// carries the off-diagonal covariance).
+#[test]
+fn selected_error_with_block_sigma_fits() {
+    let model = parse_model_string(FREE_TOTAL_BLOCK).expect("block_sigma + selected must parse");
+    assert!(
+        matches!(model.error_spec, ErrorSpec::Selected { .. }),
+        "expected a Selected error spec"
+    );
+    assert_eq!(
+        model.residual_correlations.len(),
+        1,
+        "one cross-branch residual correlation from the block_sigma off-diagonal"
+    );
+
+    // Simulate DVs at truth, then run a bounded FOCEI fit (Tier-2: no
+    // convergence loop, just a finite OFV out of the dense-R path).
+    let design = free_total_pop(8);
+    let truth = model.default_params.clone();
+    let sims = simulate_with_seed(&model, &design, &truth, 1, 669669);
+    let mut pop = design.clone();
+    for subj in pop.subjects.iter_mut() {
+        subj.observations = sims
+            .iter()
+            .filter(|r| r.id == subj.id)
+            .map(|r| r.outcome.continuous_value())
+            .collect();
+    }
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceI;
+    opts.methods = vec![];
+    opts.interaction = true;
+    opts.run_covariance_step = false;
+    opts.outer_maxiter = 2;
+    opts.verbose = false;
+
+    let r = fit(&model, &pop, &model.default_params, &opts)
+        .expect("block_sigma + selected FOCEI fit must run");
+    assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
+}
+
 /// End-to-end numerical validation: simulate with a known split
 /// (`σ_total = 0.05`, `σ_unbound = 0.30`) and recover it from a neutral start
 /// where both sigmas begin at 0.15. Recovery of the *ordered, separated* split

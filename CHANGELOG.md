@@ -30,6 +30,14 @@ section of the SDLC for the versioning policy).
   exact analytic FOCEI outer (θ/Ω/σ) gradient instead of finite differences (#486): the
   residual-eta `c̃`-column coupling `d/R` gains its magnitude direct-θ terms, mirroring the
   σ-parameter block. Validated against reconverged finite differences of the FOCEI objective.
+- **`prepare_frem()` accepts a prior fit to seed FREM init values** (#239). The new
+  optional `fit_init: Option<&FremFitInit>` parameter carries a completed fit's theta
+  and omega estimates; when supplied, the generated FREM model's PK theta inits and
+  PK-PK omega block are seeded from those converged values instead of the base
+  model file's declared inits, so a subsequent fit of the FREM model warm-starts
+  closer to convergence. Names are matched case-insensitively against the base
+  model; unmatched names fall back to the declared inits. `None` preserves the
+  prior behaviour unchanged.
 - **Covariate-selected residual error models (`if/else` in `[error_model]`)** (#658).
   The `[error_model]` block can now select a residual error model per observation
   by an arbitrary covariate condition — e.g. a free-vs-total assay switched by a
@@ -40,8 +48,11 @@ section of the SDLC for the versioning policy).
   per-row flag without recoding it into a synthetic `CMT` column. Works on
   analytical **and** ODE models, across FOCE/FOCEI, Gauss-Newton, SAEM, and
   importance sampling. The selector covariate becomes a required data column
-  (`E_MISSING_COVARIATE`). `block_sigma` correlated residuals with a selected
-  error model are rejected with a clear error for now. See
+  (`E_MISSING_COVARIATE`). `block_sigma` correlated residuals are supported
+  together with a selected error model (#669): co-temporal rows resolving to
+  different branches (e.g. a total/unbound assay pair) pick up the cross-branch
+  covariance `ρ·σ_i·σ_j` in the dense residual `R`, exactly as for per-CMT
+  endpoints. See
   [Error model → Covariate-selected error models](https://ferx-nlme.github.io/ferx-core/model-file/error-model.html).
 - **Full `[scaling] y = <expr>` output readouts (Form C) on analytical PK models** (#650).
   A closed-form (`pk one_cpt_iv(...)`, …) model can now replace the built-in
@@ -54,10 +65,12 @@ section of the SDLC for the versioning policy).
   (read per-observation, so a per-row flag switches the readout), and `if/else`. FOCEI/FOCE
   gradients flow through it **analytically** (outer and inner) on both the static
   dose-superposition path and the time-varying-covariate / oral-infusion event-walk path —
-  so a free-vs-total readout gated on a per-row `FREE` flag stays analytic. IOV subjects, a
-  readout referencing the oral depot amount, per-CMT readouts, and direct θ/η references
-  fall back to finite-difference gradients (the prediction stays exact, and the parser
-  emits a warning). Peripheral compartment amounts are rejected (use an ODE model). See
+  so a free-vs-total readout gated on a per-row `FREE` flag stays analytic — including on
+  **IOV** subjects (`kappa` declarations) since #655, where the readout parameters are
+  BSV-only (a `kappa` reference is rejected at parse) so only the concentration carries the
+  occasion κ. A readout referencing the oral depot amount, per-CMT readouts, and direct θ/η
+  references fall back to finite-difference gradients (the prediction stays exact, and the
+  parser emits a warning). Peripheral compartment amounts are rejected (use an ODE model). See
   [Scaling → Form C](https://ferx-nlme.github.io/ferx-core/model-file/scaling.html).
 
 ### Changed
@@ -90,6 +103,14 @@ section of the SDLC for the versioning policy).
   fit. Non-convergence is now reported directly (`converged = false` plus the "Outer
   optimization did not converge" warning) with no automatic retry. Users who want SLSQP can
   still set `optimizer = slsqp`.
+- **IMPMAP/IMP's FREM Rao-Blackwell E-step now runs a per-subject adaptive ISCALE
+  pilot search** instead of a fixed `iscale = 1.0` (#406 follow-up). The RB
+  conditional PK proposal is usually well matched, but for subjects where the
+  inner-loop Hessian is a poor estimate of the true PK conditional curvature
+  (sparse PK data), a fixed proposal width could leave ESS low even after RB.
+  Mirrors the ISCALE rescue the full-dimensional sampler already had. Applies to
+  the iterative MCEM E-step only; the eval-only / final-marginal IS report keeps
+  a fixed proposal for run-to-run reproducibility.
 
 ### Added
 - **Log-transform-both-sides (LTBS) combined with time-varying covariates** now gets an exact

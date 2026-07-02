@@ -447,9 +447,11 @@ fn ruv_kappa(eps: f64, r: f64, d: f64) -> f64 {
 ///
 /// A genuine cross-endpoint off-diagonal `R` (paired total/unbound rows) would need
 /// the full dense `M_k`/`B_{kl}` assembly, but such models require a per-CMT / Form-C
-/// readout that is out of analytic scope (they run FD). The off-diagonal check is a
-/// defensive guard: if one ever reaches here, bail to FD rather than silently drop the
-/// off-diagonals.
+/// or covariate-selected (#669) multi-endpoint readout that is out of analytic scope
+/// (they run FD). The off-diagonal check is a defensive guard: if one ever reaches
+/// here, bail to FD rather than silently drop the off-diagonals. The endpoint keys are
+/// resolved via `ErrorSpec::obs_keys` so a `Selected` spec's per-row branch — not the
+/// raw CMT column — drives the diagonal variance builders.
 fn corr_residual_diag(
     model: &CompiledModel,
     subject: &Subject,
@@ -461,12 +463,19 @@ fn corr_residual_diag(
     };
     let corr = &model.residual_correlations;
     let es = &model.error_spec;
+    // #669: per-observation endpoint keys must come from the covariate selector
+    // (`obs_keys`), not the raw CMT column — a `Selected` spec keys endpoints by
+    // branch index, decoupled from `obs_cmts` (typically all-1 on an analytical
+    // single-endpoint model). Passing `obs_cmts` here would score every row
+    // against the wrong branch's sigma. `PerCmt`/`Single` still get exactly the
+    // CMT column (`obs_keys` borrows it unchanged).
+    let err_keys = es.obs_keys(subject);
     let ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     let n = ipreds.len();
     let r = compute_r_matrix_with_correlations(
         es,
         &ipreds,
-        &subject.obs_cmts,
+        err_keys.as_ref(),
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
@@ -484,7 +493,7 @@ fn corr_residual_diag(
     let dr = compute_dr_df_matrices(
         es,
         &ipreds,
-        &subject.obs_cmts,
+        err_keys.as_ref(),
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
@@ -495,7 +504,7 @@ fn corr_residual_diag(
     let d2 = compute_d2r_df2_matrices(
         es,
         &ipreds,
-        &subject.obs_cmts,
+        err_keys.as_ref(),
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
@@ -528,10 +537,13 @@ fn corr_residual_rd_at_sigma(
     let corr = &model.residual_correlations;
     let es = &model.error_spec;
     let n = ipreds.len();
+    // #669: selector-resolved endpoint keys, not the raw CMT column (see
+    // `corr_residual_diag`).
+    let err_keys = es.obs_keys(subject);
     let dr = compute_dr_df_matrices(
         es,
         ipreds,
-        &subject.obs_cmts,
+        err_keys.as_ref(),
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
@@ -542,7 +554,7 @@ fn corr_residual_rd_at_sigma(
     let mut rv = vec![0.0; n];
     let mut dv = vec![0.0; n];
     for j in 0..n {
-        rv[j] = es.variance_at_with_correlations(subject.obs_cmts[j], ipreds[j], sigma, corr);
+        rv[j] = es.variance_at_with_correlations(err_keys[j], ipreds[j], sigma, corr);
         dv[j] = dr[j][(j, j)];
     }
     (rv, dv)
@@ -3021,7 +3033,7 @@ mod tests {
     use crate::estimation::parameterization::pack_params;
     use crate::parser::model_parser::parse_model_string;
     use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_interaction};
-    use crate::types::{DoseEvent, OmegaMatrix, Subject};
+    use crate::types::{DoseEvent, ErrorSpec, OmegaMatrix, Subject};
     use std::collections::HashMap;
 
     const TWOCPT: &str = r#"
@@ -4044,6 +4056,116 @@ mod tests {
             let f1 = fd_at(k, h);
             let f2 = fd_at(k, h / 2.0);
             let fd = (4.0 * f2 - f1) / 3.0;
+            approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
+        }
+    }
+
+    /// Covariate-selected (`if/else`) `block_sigma` fixture: each row's residual
+    /// branch is chosen by a per-row `FREE` flag, and the two branch sigmas are
+    /// correlated through one `block_sigma`. Distinct observation times mean no
+    /// two rows share a residual block, so `R` stays diagonal and the analytic
+    /// outer-gradient path (`corr_residual_diag`) proceeds rather than bailing to
+    /// FD — exactly the path that must resolve the endpoint via the selector
+    /// (`obs_keys`), not the raw CMT column (#669).
+    const SELECTED_BLOCK_SIGMA_1CPT: &str = "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.04, 0.03, 0.09]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }\n[covariates]\n  FREE continuous\n[fit_options]\n  method = focei\n";
+
+    /// [`dense_subject`] with a per-row `FREE` covariate driving the selected
+    /// residual branch. `times` and `free_flags` must be equal length; times are
+    /// kept distinct by the caller so `R` is diagonal.
+    fn selected_dense_subject(
+        model: &CompiledModel,
+        theta: &[f64],
+        times: &[f64],
+        free_flags: &[f64],
+    ) -> Subject {
+        let mut subject = dense_subject(model, theta, times);
+        subject.obs_covariates = free_flags
+            .iter()
+            .map(|&f| HashMap::from([("FREE".to_string(), f)]))
+            .collect();
+        subject
+    }
+
+    /// #669 regression: with the `Selected` + `block_sigma` guard lifted, the
+    /// analytic FOCEI outer gradient must resolve each row's endpoint via the
+    /// covariate selector. If `corr_residual_diag` / `corr_residual_rd_at_sigma`
+    /// read the raw CMT column (all-1 here) instead of the branch, every `FREE=0`
+    /// row is scored against the `else` branch's sigma and the analytic gradient
+    /// diverges from FD of ferx's dense FOCEI marginal (which uses the correct
+    /// keys). Must match across every θ/Ω/σ coordinate.
+    #[test]
+    fn population_packed_gradient_selected_block_sigma_matches_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::Population;
+
+        let model =
+            parse_model_string(SELECTED_BLOCK_SIGMA_1CPT).expect("parse selected block_sigma");
+        assert!(matches!(model.error_spec, ErrorSpec::Selected { .. }));
+        assert!(!model.residual_correlations.is_empty());
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            &model
+        ));
+
+        // Distinct times → diagonal R (analytic path proceeds); alternating FREE
+        // flags route rows to both branches within one subject.
+        let theta = &[1.1, 11.0];
+        let s1 = selected_dense_subject(
+            &model,
+            theta,
+            &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        );
+        let s2 = selected_dense_subject(
+            &model,
+            theta,
+            &[0.25, 1.5, 3.0, 6.0, 12.0, 36.0],
+            &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+        );
+        let pop = Population {
+            subjects: vec![s1, s2],
+            covariate_names: vec!["FREE".into()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut template = model.default_params.clone();
+        template.theta = theta.to_vec();
+        let x = pack_params(&template);
+        let params = unpack_params(&x, &template);
+        let ehs: Vec<DVector<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe_corr(&model, s, &params)))
+            .collect();
+
+        let analytic = population_gradient_sens(&model, &pop, &template, &x, &ehs)
+            .expect("selected block_sigma is analytic");
+
+        let ofv = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, &template);
+            2.0 * pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    let eta = precise_ebe_corr(&model, s, &p);
+                    marginal_nll_dense_at(&model, s, &p, &eta)
+                })
+                .sum::<f64>()
+        };
+        let fd_at = |k: usize, h: f64| -> f64 {
+            let mut xp = x.clone();
+            xp[k] += h;
+            let mut xm = x.clone();
+            xm[k] -= h;
+            (ofv(&xp) - ofv(&xm)) / (2.0 * h)
+        };
+        for k in 0..x.len() {
+            let h = 1e-4 * (1.0 + x[k].abs());
+            let f1 = fd_at(k, h);
+            let f2 = fd_at(k, h / 2.0);
+            let fd = (4.0 * f2 - f1) / 3.0; // Richardson
             approx::assert_relative_eq!(analytic[k], fd, max_relative = 2e-3, epsilon = 1e-5);
         }
     }

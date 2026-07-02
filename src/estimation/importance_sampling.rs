@@ -1329,6 +1329,44 @@ pub(crate) fn subject_is_draws(
     }
 }
 
+/// Shared grid-search core for a per-subject ISCALE pilot search. Tries a grid
+/// of `N_GRID` log-spaced scale factors in `[iscale_min, iscale_max]`, calling
+/// `pilot_ess(scale, pilot_seed)` for each and returning the scale with the
+/// best reported ESS fraction. `pilot_ess` returns `None` for a degenerate
+/// draw (e.g. a non-PD proposal) — that scale is skipped, not treated as best.
+/// Returns 1.0 if ISCALE is disabled (`iscale_min >= iscale_max`, or both == 1.0).
+fn iscale_pilot_grid_search(
+    iscale_min: f64,
+    iscale_max: f64,
+    seed: u64,
+    mut pilot_ess: impl FnMut(f64, u64) -> Option<f64>,
+) -> f64 {
+    if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
+        return 1.0;
+    }
+    const N_GRID: usize = 7;
+    let log_min = iscale_min.ln();
+    let log_max = iscale_max.ln();
+    let mut best_scale = 1.0_f64;
+    let mut best_ess = f64::NEG_INFINITY;
+
+    for g in 0..N_GRID {
+        let frac = g as f64 / (N_GRID - 1) as f64;
+        let scale = (log_min + frac * (log_max - log_min)).exp();
+        // Use a different seed per scale to avoid correlations
+        let pilot_seed = seed
+            .wrapping_add(0x4953_4341_4C45_0000u64)
+            .wrapping_add(g as u64);
+        if let Some(ess) = pilot_ess(scale, pilot_seed) {
+            if ess > best_ess {
+                best_ess = ess;
+                best_scale = scale;
+            }
+        }
+    }
+    best_scale
+}
+
 /// Find the optimal ISCALE for a subject via pilot draws.
 ///
 /// Tries a grid of log-spaced scale factors in `[iscale_min, iscale_max]`
@@ -1351,24 +1389,8 @@ pub(crate) fn find_optimal_iscale(
     iscale_min: f64,
     iscale_max: f64,
 ) -> f64 {
-    if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
-        return 1.0;
-    }
-    // Grid of 7 log-spaced scale factors from iscale_min to iscale_max
-    let n_grid = 7;
-    let n_pilot = 50;
-    let log_min = iscale_min.ln();
-    let log_max = iscale_max.ln();
-    let mut best_scale = 1.0_f64;
-    let mut best_ess = f64::NEG_INFINITY;
-
-    for g in 0..n_grid {
-        let frac = g as f64 / (n_grid - 1) as f64;
-        let scale = (log_min + frac * (log_max - log_min)).exp();
-        // Use a different seed per scale to avoid correlations
-        let pilot_seed = seed
-            .wrapping_add(0x4953_4341_4C45_0000u64)
-            .wrapping_add(g as u64);
+    const N_PILOT: usize = 50;
+    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
         let draws = subject_is_draws(
             model,
             subject,
@@ -1379,7 +1401,7 @@ pub(crate) fn find_optimal_iscale(
             omega_inv,
             log_det_omega,
             d,
-            n_pilot,
+            N_PILOT,
             nu,
             pilot_seed,
             scratch,
@@ -1387,12 +1409,8 @@ pub(crate) fn find_optimal_iscale(
             false, // pilot draws don't need Sobol
             None,  // tune the narrow proposal alone; defensive mixing applies at the real draw
         );
-        if draws.ess_fraction > best_ess {
-            best_ess = draws.ess_fraction;
-            best_scale = scale;
-        }
-    }
-    best_scale
+        Some(draws.ess_fraction)
+    })
 }
 
 /// Per-subject ISCALE pilot search for the Rao-Blackwellised FREM path
@@ -1400,8 +1418,9 @@ pub(crate) fn find_optimal_iscale(
 /// well-matched, but for subjects where the inner-loop Hessian `h_pp` is a
 /// poor estimate of the true conditional curvature (sparse PK data, a mode
 /// still off from a prior iteration), a fixed `iscale = 1.0` can leave the
-/// proposal too narrow or too wide. Mirrors [`find_optimal_iscale`] but pilots
-/// through [`subject_is_draws_frem_rb`] so the grid search sees the true
+/// proposal too narrow or too wide. Mirrors [`find_optimal_iscale`] (sharing
+/// its grid-search core, [`iscale_pilot_grid_search`]) but pilots through
+/// [`subject_is_draws_frem_rb`] so the grid search sees the true
 /// reduced-dimension (PK-only) ESS instead of the full-dimensional one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_optimal_iscale_frem_rb(
@@ -1423,23 +1442,9 @@ pub(crate) fn find_optimal_iscale_frem_rb(
     iscale_min: f64,
     iscale_max: f64,
 ) -> f64 {
-    if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
-        return 1.0;
-    }
-    let n_grid = 7;
-    let n_pilot = 50;
-    let log_min = iscale_min.ln();
-    let log_max = iscale_max.ln();
-    let mut best_scale = 1.0_f64;
-    let mut best_ess = f64::NEG_INFINITY;
-
-    for g in 0..n_grid {
-        let frac = g as f64 / (n_grid - 1) as f64;
-        let scale = (log_min + frac * (log_max - log_min)).exp();
-        let pilot_seed = seed
-            .wrapping_add(0x4953_4341_4C45_0000u64)
-            .wrapping_add(g as u64);
-        let Some(draws) = subject_is_draws_frem_rb(
+    const N_PILOT: usize = 50;
+    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
+        subject_is_draws_frem_rb(
             model,
             subject,
             theta,
@@ -1452,22 +1457,16 @@ pub(crate) fn find_optimal_iscale_frem_rb(
             cov_idx,
             d,
             n_eta,
-            n_pilot,
+            N_PILOT,
             nu,
             pilot_seed,
             scratch,
             scale,
             false, // pilot draws don't need Sobol
             0.0,   // tune the narrow proposal alone; defensive mixing applies at the real draw
-        ) else {
-            continue;
-        };
-        if draws.ess_fraction > best_ess {
-            best_ess = draws.ess_fraction;
-            best_scale = scale;
-        }
-    }
-    best_scale
+        )
+        .map(|draws| draws.ess_fraction)
+    })
 }
 
 // ---------------------------------------------------------------------------

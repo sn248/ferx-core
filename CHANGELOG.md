@@ -60,6 +60,13 @@ section of the SDLC for the versioning policy).
   conditional censored term — the treatment NONMEM's `METHOD=1 LAPLACE` M3 uses (NONMEM
   runs M3 only under LAPLACE), which ferx's first-order FOCEI matches up to the
   FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
+- **Removed the automatic SLSQP fallback after a non-converged outer optimization** (#657).
+  When the primary optimizer stopped without clean convergence, ferx used to silently re-run
+  a full second outer optimization (with inner EBE loops) with SLSQP from the same point —
+  roughly doubling wall-time on already-slow non-converged runs while rarely rescuing the
+  fit. Non-convergence is now reported directly (`converged = false` plus the "Outer
+  optimization did not converge" warning) with no automatic retry. Users who want SLSQP can
+  still set `optimizer = slsqp`.
 
 ### Added
 - **A `TIME`-built-in structural parameter combined with a built-in absorption input-rate

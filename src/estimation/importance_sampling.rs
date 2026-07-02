@@ -2057,7 +2057,11 @@ pub(crate) fn compute_posterior_hessian(
         let r = crate::stats::residual_error::compute_r_matrix_with_correlations(
             &model.error_spec,
             &ipreds,
-            &subject.obs_cmts,
+            // #669: selector-resolved endpoint keys (matches the diagonal
+            // fallback below), not the raw CMT column — a `Selected` spec keys
+            // endpoints by branch, so `obs_cmts` would build the proposal
+            // precision from the wrong branch's sigma.
+            model.error_spec.obs_keys(subject).as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,

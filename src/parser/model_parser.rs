@@ -1720,7 +1720,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // validate the magnitude expressions).
     let single_error_args: Option<(ErrorModel, Vec<String>)> = match &parsed_error_model {
         ParsedErrorModel::Single(em, args) => Some((*em, args.clone())),
-        ParsedErrorModel::PerCmt(_) => None,
+        ParsedErrorModel::PerCmt(_) | ParsedErrorModel::Selected { .. } => None,
+    };
+    // Covariates the #658 error selector references become required data columns
+    // (validated as E_MISSING_COVARIATE at fit setup). Capture before
+    // `build_error_spec` consumes the parsed model.
+    let selector_covariates: Vec<String> = match &parsed_error_model {
+        ParsedErrorModel::Selected { covariates, .. } => covariates.clone(),
+        _ => Vec::new(),
     };
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
@@ -2234,6 +2241,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
         model.referenced_covariates.sort();
         model.scaling = scaling;
+    }
+
+    // Covariate-selected [error_model] (issue #658): the selector's covariates
+    // are required data columns, so register them like scaling covariates.
+    if !selector_covariates.is_empty() {
+        for cov in &selector_covariates {
+            if !model.referenced_covariates.contains(cov) {
+                model.referenced_covariates.push(cov.clone());
+            }
+        }
+        model.referenced_covariates.sort();
     }
 
     // ── [initial_conditions] block (issue #521) ──
@@ -8367,13 +8385,26 @@ fn validate_residual_correlations(
         return Ok(());
     }
 
+    // Covariate-selected residual error (#658) with block_sigma correlated
+    // residuals: the correlation pairing rule (same-time/occasion rows) is not
+    // yet defined in terms of the selector's per-observation endpoint, so reject
+    // the combination with a clear error rather than pairing ambiguously.
+    if matches!(error_spec, ErrorSpec::Selected { .. }) {
+        return Err(
+            "block_sigma correlated residuals are not yet supported together with a \
+             covariate-selected [error_model] (if/else). Use separate uncorrelated sigmas, \
+             or a per-CMT [error_model], for now (issue #658)."
+                .to_string(),
+        );
+    }
+
     let endpoint_loadings: Vec<Vec<usize>> = match error_spec {
         ErrorSpec::Single(_) => vec![error_spec
             .sigma_loadings(0, 1.0, sigma_names.len())
             .into_iter()
             .map(|(idx, _)| idx)
             .collect()],
-        ErrorSpec::PerCmt(map) => map
+        ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => map
             .keys()
             .map(|&cmt| {
                 error_spec
@@ -8526,6 +8557,18 @@ enum ParsedErrorModel {
     /// Per-CMT error models (every line prefixed `CMT=N:`). One entry per line,
     /// in source order; duplicates are rejected here.
     PerCmt(Vec<(usize, ErrorModel, Vec<String>)>),
+    /// Covariate-selected error models (issue #658): an `if (cov …) { DV ~ … }
+    /// [else if …]* else { DV ~ … }` block. `branches` holds the conditional
+    /// endpoints in source order; `default` is the mandatory final `else`
+    /// endpoint. `covariates` lists the covariate names the conditions
+    /// reference (added to `referenced_covariates` so they become required data
+    /// columns). Sigma references are still names here; `build_error_spec`
+    /// resolves them to flat-sigma indices.
+    Selected {
+        branches: Vec<(Condition, ErrorModel, Vec<String>)>,
+        default: (ErrorModel, Vec<String>),
+        covariates: Vec<String>,
+    },
 }
 
 /// Log-transform-both-sides (LTBS) flags extracted from the `[error_model]`
@@ -8565,9 +8608,253 @@ fn split_top_level_args(s: &str) -> Vec<String> {
     out
 }
 
+/// Does `s[i..]` begin with the keyword `kw`, terminated by a non-identifier
+/// character (so `if` matches but `iffy` does not)?
+fn starts_with_keyword(s: &str, i: usize, kw: &str) -> bool {
+    let rest = &s[i..];
+    if !rest.starts_with(kw) {
+        return false;
+    }
+    match rest[kw.len()..].chars().next() {
+        Some(c) => !(c.is_alphanumeric() || c == '_'),
+        None => true,
+    }
+}
+
+/// Advance past ASCII whitespace (spaces, tabs, newlines) from byte offset `i`.
+fn skip_ascii_ws(s: &str, i: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = i;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Given `s` where byte `open` is an opening delimiter `open_ch`, return the
+/// byte index of the matching closing delimiter `close_ch`, honouring nesting.
+fn match_delim(s: &str, open: usize, open_ch: u8, close_ch: u8) -> Result<usize, String> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes[open], open_ch);
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == open_ch {
+            depth += 1;
+        } else if b == close_ch {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(i);
+            }
+        }
+        i += 1;
+    }
+    Err(format!(
+        "[error_model] unbalanced `{}` … `{}` in if/else block",
+        open_ch as char, close_ch as char
+    ))
+}
+
+/// Parse one `DV ~ TYPE(sigmas)` statement that forms an if/else branch body
+/// into `(ErrorModel, sigma_names)`. Rejects LTBS forms (`log(DV) ~ …` /
+/// `log_additive`) and multi-statement bodies — a covariate-selected branch is
+/// a single ordinary error model (LTBS + covariate selection is out of scope).
+fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), String> {
+    let body = body.trim();
+    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap();
+    if log_lhs_re.is_match(body) {
+        return Err(
+            "[error_model] log-transform-both-sides (`log(DV) ~ …`) is not supported inside a \
+             covariate-selected if/else block"
+                .to_string(),
+        );
+    }
+    let re = Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)$").unwrap();
+    let caps = re.captures(body).ok_or_else(|| {
+        format!(
+            "[error_model] expected a single `DV ~ TYPE(...)` statement inside an if/else branch, \
+             got `{}`",
+            body
+        )
+    })?;
+    let error_type = caps[2].to_lowercase();
+    if error_type == "log_additive" {
+        return Err(
+            "[error_model] `log_additive` (log-transform-both-sides) is not supported inside a \
+             covariate-selected if/else block"
+                .to_string(),
+        );
+    }
+    let error_model = match error_type.as_str() {
+        "additive" => ErrorModel::Additive,
+        "proportional" => ErrorModel::Proportional,
+        "combined" => ErrorModel::Combined,
+        other => return Err(format!("Unknown error model: {}", other)),
+    };
+    let sigma_names = split_top_level_args(&caps[3]);
+    if sigma_names.len() != error_model.n_sigma() {
+        return Err(format!(
+            "[error_model] {} model expects {} sigma(s) but {} given: {}",
+            error_type,
+            error_model.n_sigma(),
+            sigma_names.len(),
+            body
+        ));
+    }
+    Ok((error_model, sigma_names))
+}
+
+/// Detect and parse a covariate-selected `[error_model]` (issue #658):
+///
+/// ```text
+/// if (FREE == 0) { DV ~ proportional(PROP_TOTAL) }
+/// else           { DV ~ proportional(PROP_UNBOUND) }
+/// ```
+///
+/// Returns `Ok(None)` when the block is not an `if/else` form (the caller then
+/// falls back to the line-based single / per-CMT parsing). The condition uses
+/// the shared `parse_condition`; each branch body reuses the ordinary
+/// `DV ~ TYPE(...)` grammar via [`parse_error_endpoint_body`]. A final `else`
+/// is required so every observation resolves to a declared endpoint.
+#[allow(clippy::type_complexity)]
+fn parse_selected_error_model(
+    lines: &[String],
+) -> Result<
+    Option<(
+        Vec<(Condition, ErrorModel, Vec<String>)>,
+        (ErrorModel, Vec<String>),
+        Vec<String>,
+    )>,
+    String,
+> {
+    // Join comment-stripped lines; the if/else spans multiple physical lines.
+    let joined: String = lines
+        .iter()
+        .map(|l| l.split('#').next().unwrap_or("").trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let s = joined.trim().to_string();
+    let start = skip_ascii_ws(&s, 0);
+    if !starts_with_keyword(&s, start, "if") {
+        return Ok(None);
+    }
+
+    // Covariate-only condition context: every bare identifier is a covariate.
+    let no_names: [String; 0] = [];
+    let no_nn: [(String, Vec<String>); 0] = [];
+    let cond_ctx = ParseCtx {
+        theta_names: &no_names,
+        eta_names: &no_names,
+        defined_vars: &no_names,
+        fallback_covariate: true,
+        nn_specs: &no_nn,
+        ode_state_names: &no_names,
+    };
+
+    let bytes = s.as_bytes();
+    let mut i = start;
+    let mut branches: Vec<(Condition, ErrorModel, Vec<String>)> = Vec::new();
+    let default: (ErrorModel, Vec<String>);
+
+    loop {
+        // `if`
+        i = skip_ascii_ws(&s, i);
+        if !starts_with_keyword(&s, i, "if") {
+            return Err("[error_model] expected `if` in covariate-selected block".to_string());
+        }
+        i += 2;
+        // `( cond )`
+        i = skip_ascii_ws(&s, i);
+        if i >= bytes.len() || bytes[i] != b'(' {
+            return Err("[error_model] expected `(` after `if`".to_string());
+        }
+        let close = match_delim(&s, i, b'(', b')')?;
+        let cond_str = &s[i + 1..close];
+        let toks = tokenize(cond_str)?;
+        let (cond, cp) = parse_condition(&toks, 0, cond_ctx)?;
+        if skip_newlines(&toks, cp) != toks.len() {
+            return Err(format!(
+                "[error_model] trailing tokens in if-condition `{}`",
+                cond_str
+            ));
+        }
+        i = close + 1;
+        // `{ body }`
+        i = skip_ascii_ws(&s, i);
+        if i >= bytes.len() || bytes[i] != b'{' {
+            return Err("[error_model] expected `{` after if-condition".to_string());
+        }
+        let bclose = match_delim(&s, i, b'{', b'}')?;
+        let (em, names) = parse_error_endpoint_body(&s[i + 1..bclose])?;
+        branches.push((cond, em, names));
+        i = bclose + 1;
+
+        // `else` (required — either `else if` chains or `else { … }` terminates)
+        i = skip_ascii_ws(&s, i);
+        if !starts_with_keyword(&s, i, "else") {
+            return Err(
+                "[error_model] a covariate-selected if/else must end with a final `else { DV ~ … }` \
+                 so every observation maps to an error model"
+                    .to_string(),
+            );
+        }
+        i += 4;
+        i = skip_ascii_ws(&s, i);
+        if starts_with_keyword(&s, i, "if") {
+            continue; // else-if: parse another branch
+        }
+        if i >= bytes.len() || bytes[i] != b'{' {
+            return Err(
+                "[error_model] `else` must be followed by `if (...) {...}` or `{...}`".to_string(),
+            );
+        }
+        let eclose = match_delim(&s, i, b'{', b'}')?;
+        default = parse_error_endpoint_body(&s[i + 1..eclose])?;
+        i = eclose + 1;
+        break;
+    }
+
+    let tail = skip_ascii_ws(&s, i);
+    if tail != s.len() {
+        return Err(format!(
+            "[error_model] unexpected content after covariate-selected if/else: `{}`",
+            s[tail..].trim()
+        ));
+    }
+
+    // Covariate names referenced by any branch condition become required data
+    // columns (validated as E_MISSING_COVARIATE at fit setup).
+    let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (cond, _, _) in &branches {
+        visit_condition_nodes(cond, &mut |e| {
+            if let Expression::Covariate(name) = e {
+                cov_set.insert(name.clone());
+            }
+        });
+    }
+    let mut covariates: Vec<String> = cov_set.into_iter().collect();
+    covariates.sort();
+
+    Ok(Some((branches, default, covariates)))
+}
+
 fn parse_error_model(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
+    // Covariate-selected if/else form (issue #658) — detected and parsed first;
+    // falls through to the line-based single / per-CMT grammar when absent.
+    if let Some((branches, default, covariates)) = parse_selected_error_model(lines)? {
+        return Ok((
+            ParsedErrorModel::Selected {
+                branches,
+                default,
+                covariates,
+            },
+            LtbsFlags::default(),
+            None,
+        ));
+    }
     // Single-endpoint:
     //   DV ~ proportional(SIGMA_NAME)
     //   DV ~ additive(SIGMA_NAME)
@@ -8799,6 +9086,61 @@ fn build_error_spec(
             Ok((
                 representative.unwrap_or(ErrorModel::Additive),
                 ErrorSpec::PerCmt(map),
+            ))
+        }
+        ParsedErrorModel::Selected {
+            branches, default, ..
+        } => {
+            // Resolve one endpoint's sigma names to flat-sigma indices.
+            let resolve = |em: ErrorModel, names: &[String]| -> Result<EndpointError, String> {
+                let mut sigma_idx = Vec::with_capacity(names.len());
+                for nm in names {
+                    let idx = sigma_names.iter().position(|s| s == nm).ok_or_else(|| {
+                        format!(
+                            "[error_model] references unknown sigma '{}' \
+                             (declare it in [parameters])",
+                            nm
+                        )
+                    })?;
+                    sigma_idx.push(idx);
+                }
+                Ok(EndpointError {
+                    error_model: em,
+                    sigma_idx,
+                })
+            };
+            // Assign 0-based keys in source order; the `else` endpoint is the
+            // final key. The selector evaluates conditions in order and returns
+            // the first match, falling back to the `else` key.
+            let representative = branches.first().map(|(_, em, _)| *em).unwrap_or(default.0);
+            let mut endpoints: HashMap<usize, EndpointError> = HashMap::new();
+            let mut conds: Vec<(Condition, usize)> = Vec::with_capacity(branches.len());
+            let mut labels: Vec<String> = Vec::with_capacity(branches.len() + 1);
+            for (k, (cond, em, names)) in branches.into_iter().enumerate() {
+                endpoints.insert(k, resolve(em, &names)?);
+                labels.push(format!("branch{k}"));
+                conds.push((cond, k));
+            }
+            let default_key = endpoints.len();
+            endpoints.insert(default_key, resolve(default.0, &default.1)?);
+            labels.push("else".to_string());
+            let selector = crate::types::ErrorSelector {
+                eval: Box::new(move |cov: &HashMap<String, f64>| {
+                    for (cond, key) in &conds {
+                        if eval_condition(cond, &[], &[], cov, &HashMap::new(), &[]) {
+                            return *key;
+                        }
+                    }
+                    default_key
+                }),
+                branch_labels: labels,
+            };
+            Ok((
+                representative,
+                ErrorSpec::Selected {
+                    selector,
+                    endpoints,
+                },
             ))
         }
     }
@@ -10089,6 +10431,18 @@ fn used_sigma_names(
                 for a in args {
                     scan(a, &mut out);
                 }
+            }
+        }
+        ParsedErrorModel::Selected {
+            branches, default, ..
+        } => {
+            for (_, _, args) in branches {
+                for a in args {
+                    scan(a, &mut out);
+                }
+            }
+            for a in &default.1 {
+                scan(a, &mut out);
             }
         }
     }
@@ -20213,6 +20567,265 @@ if (WT > 70) {
             model.error_spec,
             ErrorSpec::Single(ErrorModel::Proportional)
         ));
+    }
+
+    // ── Covariate-selected error models (`if/else`, issue #658) ─────────────
+
+    /// Minimal **analytical** 1-cpt model whose `[error_model]` is overridden by
+    /// `error_block`. Two proportional sigmas + a `FREE` covariate let a
+    /// free-vs-total split-error `if/else` be expressed on an analytical PK model.
+    fn selected_err_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_TOTAL   ~ 0.10 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+{}
+
+[covariates]
+  FREE continuous
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_selected_error_model_parses() {
+        let model = parse_full_model(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ))
+        .unwrap()
+        .model;
+
+        match &model.error_spec {
+            ErrorSpec::Selected {
+                selector,
+                endpoints,
+            } => {
+                assert_eq!(endpoints.len(), 2);
+                // Branch 0 (FREE == 0) → PROP_TOTAL (sigma idx 0).
+                let total = endpoints.get(&0).expect("branch 0 endpoint");
+                assert_eq!(total.error_model, ErrorModel::Proportional);
+                assert_eq!(total.sigma_idx, vec![0]);
+                // Else branch (key 1) → PROP_UNBOUND (sigma idx 1).
+                let unbound = endpoints.get(&1).expect("else endpoint");
+                assert_eq!(unbound.error_model, ErrorModel::Proportional);
+                assert_eq!(unbound.sigma_idx, vec![1]);
+                // Selector resolves FREE=0 → branch 0, FREE=1 → else (key 1).
+                let free0: std::collections::HashMap<String, f64> =
+                    [("FREE".to_string(), 0.0)].into_iter().collect();
+                let free1: std::collections::HashMap<String, f64> =
+                    [("FREE".to_string(), 1.0)].into_iter().collect();
+                assert_eq!((selector.eval)(&free0), 0);
+                assert_eq!((selector.eval)(&free1), 1);
+            }
+            other => panic!("expected Selected, got {:?}", other),
+        }
+
+        // The selector covariate becomes a required data column.
+        assert!(model.referenced_covariates.iter().any(|c| c == "FREE"));
+    }
+
+    #[test]
+    fn test_selected_error_model_else_if_chain() {
+        // Three-way split: FREE==0, FREE==1, else — keys 0, 1, 2 (else).
+        let model = parse_full_model(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else if (FREE == 1) {\n    DV ~ proportional(PROP_UNBOUND)\n  } else {\n    DV ~ additive(PROP_TOTAL)\n  }",
+        ))
+        .unwrap()
+        .model;
+        match &model.error_spec {
+            ErrorSpec::Selected {
+                selector,
+                endpoints,
+            } => {
+                assert_eq!(endpoints.len(), 3);
+                let m = |v: f64| -> usize {
+                    let cov: std::collections::HashMap<String, f64> =
+                        [("FREE".to_string(), v)].into_iter().collect();
+                    (selector.eval)(&cov)
+                };
+                assert_eq!(m(0.0), 0);
+                assert_eq!(m(1.0), 1);
+                assert_eq!(m(2.0), 2); // no branch matches → else key
+            }
+            other => panic!("expected Selected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_selected_error_model_requires_else() {
+        let err = expect_parse_err(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  }",
+        ));
+        assert!(
+            err.contains("must end with a final"),
+            "expected a missing-else error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_selected_error_model_rejects_ltbs_branch() {
+        let err = expect_parse_err(&selected_err_model_str(
+            "  if (FREE == 0) {\n    log(DV) ~ additive(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ));
+        assert!(
+            err.contains("log-transform-both-sides"),
+            "expected an LTBS-rejected error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_selected_error_unknown_sigma_rejected() {
+        let err = expect_parse_err(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(NOPE)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ));
+        assert!(
+            err.contains("unknown sigma"),
+            "expected an unknown-sigma error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_selected_error_model_rejects_block_sigma() {
+        // block_sigma correlated residuals are deferred for the selector form.
+        let src = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.01, 0.005, 0.09]
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+        let err = expect_parse_err(src);
+        assert!(
+            err.contains("covariate-selected") && err.contains("block_sigma"),
+            "expected a block_sigma+Selected rejection, got: {err}"
+        );
+    }
+
+    /// End-to-end dispatch: `obs_keys` resolves each observation's covariate
+    /// snapshot to the right endpoint key, and `variance_at` then uses the
+    /// per-endpoint sigma. A total row (FREE=0) and an unbound row (FREE=1) at
+    /// the same prediction must get *different* proportional variances.
+    #[test]
+    fn test_selected_error_obs_keys_dispatch() {
+        let model = parse_full_model(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ))
+        .unwrap()
+        .model;
+
+        // Two rows in the *same* CMT (=1) but different `FREE` flags.
+        let subject = crate::types::Subject {
+            id: "S1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0, 10.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![
+                HashMap::from([("FREE".to_string(), 0.0)]),
+                HashMap::from([("FREE".to_string(), 1.0)]),
+            ],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let keys = model.error_spec.obs_keys(&subject);
+        assert_eq!(keys.as_ref(), &[0usize, 1usize]);
+        assert_eq!(model.error_spec.obs_key(&subject, 0), 0);
+        assert_eq!(model.error_spec.obs_key(&subject, 1), 1);
+
+        // sigma = [SD_total, SD_unbound]. Proportional variance = (f·σ)².
+        let sigma = [0.10, 0.30];
+        let f = 10.0;
+        let v_total = model.error_spec.variance_at(keys[0], f, &sigma);
+        let v_unbound = model.error_spec.variance_at(keys[1], f, &sigma);
+        assert!((v_total - (f * 0.10).powi(2)).abs() < 1e-9);
+        assert!((v_unbound - (f * 0.30).powi(2)).abs() < 1e-9);
+        assert!(v_unbound > v_total);
+    }
+
+    #[test]
+    fn test_selected_error_model_parses_on_ode_model() {
+        // Acceptance: covariate selection works on ODE models too (unlike
+        // per-CMT error, which is ODE-only for the opposite reason).
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_TOTAL   ~ 0.05 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+        let model = parse_full_model(src).unwrap().model;
+        assert!(model.ode_spec.is_some(), "should be an ODE model");
+        match &model.error_spec {
+            ErrorSpec::Selected { endpoints, .. } => assert_eq!(endpoints.len(), 2),
+            other => panic!("expected Selected on ODE model, got {:?}", other),
+        }
+        assert!(model.referenced_covariates.iter().any(|c| c == "FREE"));
     }
 
     // ── IIV on residual error (`iiv_on_ruv`, #409) ──────────────────────────

@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Covariate-selected residual error models (`if/else` in `[error_model]`)** (#658).
+  The `[error_model]` block can now select a residual error model per observation
+  by an arbitrary covariate condition — e.g. a free-vs-total assay switched by a
+  `FREE` flag: `if (FREE == 0) { DV ~ proportional(PROP_TOTAL) } else { DV ~
+  proportional(PROP_UNBOUND) }`, with `else if` chains and a required final
+  `else`. This mirrors the Form C `[scaling] y = <expr>` selector (#650), so a
+  model can express both the readout **and** its residual error against the same
+  per-row flag without recoding it into a synthetic `CMT` column. Works on
+  analytical **and** ODE models, across FOCE/FOCEI, Gauss-Newton, SAEM, and
+  importance sampling. The selector covariate becomes a required data column
+  (`E_MISSING_COVARIATE`). `block_sigma` correlated residuals with a selected
+  error model are rejected with a clear error for now. See
+  [Error model → Covariate-selected error models](https://ferx-nlme.github.io/ferx-core/model-file/error-model.html).
 - **Full `[scaling] y = <expr>` output readouts (Form C) on analytical PK models** (#650).
   A closed-form (`pk one_cpt_iv(...)`, …) model can now replace the built-in
   concentration output with an arbitrary readout expression — enabling flexible

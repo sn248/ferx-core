@@ -1679,6 +1679,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     };
     let mut grad = vec![0.0_f64; n_eta];
     let mut ruv_grad = 0.0_f64;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     for (j, obs) in sens.iter().enumerate() {
         let cens = if m3 {
             subject.cens.get(j).copied().unwrap_or(0)
@@ -1687,7 +1689,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         };
         let (coef, ruv_term) = residual_inner_obs(
             model,
-            subject.obs_cmts[j],
+            err_keys[j],
             subject.observations[j],
             obs.f,
             sigma,
@@ -1750,13 +1752,15 @@ fn dense_residual_inner_gradient(
     }
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
     let corr = &model.residual_correlations;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
     let r = match ruv_mult.as_deref() {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,
             &ipreds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1767,7 +1771,7 @@ fn dense_residual_inner_gradient(
         None => crate::stats::residual_error::compute_r_matrix_with_correlations(
             &model.error_spec,
             &ipreds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1789,7 +1793,7 @@ fn dense_residual_inner_gradient(
     let dr = crate::stats::residual_error::compute_dr_df_matrices(
         &model.error_spec,
         &ipreds,
-        &subject.obs_cmts,
+        err_keys.as_ref(),
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
@@ -1887,6 +1891,8 @@ fn analytic_eta_nll_gradient_iov(
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     let mut grad = vec![0.0_f64; n_stacked];
     let mut ruv_grad = 0.0_f64;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     for (j, obs) in sens.iter().enumerate() {
         let cens = if m3 {
             subject.cens.get(j).copied().unwrap_or(0)
@@ -1898,7 +1904,7 @@ fn analytic_eta_nll_gradient_iov(
         // The signed `cens` makes right-censored rows use the upper tail.
         let (coef, ruv_term) = residual_inner_obs(
             model,
-            subject.obs_cmts[j],
+            err_keys[j],
             subject.observations[j],
             obs.f,
             sigma,

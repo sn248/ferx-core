@@ -4731,7 +4731,7 @@ fn compute_subject_results(
             let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
                 &ipred,
-                &subject.obs_cmts,
+                model.error_spec.obs_keys(subject).as_ref(),
                 &model.error_spec,
                 &params.sigma.values,
                 &model.residual_correlations,

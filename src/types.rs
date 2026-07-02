@@ -3314,11 +3314,16 @@ impl CompiledModel {
 
     /// Whether a custom residual-error magnitude (#484) is active. The
     /// per-observation magnitude expression makes the residual variance depend
-    /// on θ directly (not only through the prediction `f`), which the analytic
-    /// inner/outer gradient kernels do not yet carry — so both gradient loops
-    /// fall back to finite differences when this is `true`. The FD forward NLL
-    /// is itself magnitude-aware, so FD stays exact. Removing this gate is the
-    /// Phase 5 follow-up (AD through the magnitude program).
+    /// on θ directly (not only through the prediction `f`). The analytic gradient
+    /// now carries this via a direct-θ channel (`mag_variance_dtheta` in
+    /// `sens_outer_gradient::prepare_stacked` / `theta_block`; the inner loop via
+    /// `residual_inner_obs`), so **both** loops are analytic on FOCE and FOCEI
+    /// (#644/#659) — including combined with `iiv_on_ruv` on the closed-form
+    /// (#673/#677) and ODE (#486) paths, since the outer assembly is
+    /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude
+    /// combined with an M3-censored row, a correlated `block_sigma`, or more than
+    /// `MAX_RUV_MAG_AXES` θ (see #486's remaining-FD register). The FD forward NLL
+    /// is itself magnitude-aware, so those fallbacks stay exact.
     #[inline]
     pub fn has_custom_ruv_magnitude(&self) -> bool {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())

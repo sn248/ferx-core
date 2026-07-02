@@ -8731,6 +8731,61 @@ mod tests {
         run_packed_check_foce(&model, &[0.22, 11.0, 1.4, 1.6]);
     }
 
+    /// As [`ONECPT_ODE_RUV_MAG`] plus IIV on residual error (`iiv_on_ruv = ETA_RUV`) and
+    /// `method = focei` — the custom σ-magnitude × `iiv_on_ruv` composition on the **ODE**
+    /// provider path. The ODE outer gradient reuses the SAME provider-agnostic
+    /// `prepare_stacked`/`theta_block` assembly as the closed-form path (the provider only
+    /// changes how `∂f/∂η, ∂f/∂θ` are produced), and the magnitude direct-θ terms read only
+    /// `error_spec`/`theta`/`f`, so this composition is analytic on ODE just as it is on CF
+    /// (#673/#677). Pins that (#486 audit found it was analytic-but-untested; the register
+    /// had wrongly listed it as an FD/HARD cell).
+    const ONECPT_ODE_RUV_MAG_IIV: &str = r#"
+[parameters]
+  theta TVCL(0.2,  0.001, 10.0)
+  theta TVV(10.0,  0.1,  500.0)
+  theta TVKA(1.5,  0.01,  50.0)
+  theta RUV_LATE(1.5, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// FOCEI custom σ-magnitude × `iiv_on_ruv` on the **ODE** provider path: the analytic
+    /// packed gradient must match reconverged FD of the (magnitude- and `exp(2·η_ruv)`-aware)
+    /// FOCEI marginal, every θ/Ω/σ coordinate. Proves the shared outer assembly serves the
+    /// composition on ODE (register correction — it is analytic, not HARD/FD).
+    #[test]
+    fn magnitude_iiv_on_ruv_ode_packed_matches_fd() {
+        let model =
+            parse_model_string(ONECPT_ODE_RUV_MAG_IIV).expect("parse ODE magnitude + iiv_on_ruv");
+        assert!(model.is_ode_based(), "must be on the ODE provider path");
+        assert!(model.has_custom_ruv_magnitude());
+        assert_eq!(model.residual_error_eta, Some(3), "ETA_RUV is the 4th eta");
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(&model),
+            "ODE FOCEI magnitude × iiv_on_ruv must route to the analytic outer gradient"
+        );
+        run_ruv_packed_check(&model, &[0.22, 11.0, 1.4, 1.6]);
+    }
+
     /// Regression guard (#578-style): a bare-sigma (no custom magnitude) subject's
     /// analytic packed gradient must stay bit-for-bit identical to a value snapshot
     /// taken before #576/#486's `prepare_stacked`/`theta_block`/`sigma_block` edits.

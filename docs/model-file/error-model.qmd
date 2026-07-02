@@ -292,6 +292,15 @@ Rules and restrictions:
   of the selector, so the combination is rejected with a clear error. Use
   uncorrelated sigmas, or a per-CMT model, for correlated residuals.
 - **LTBS** (`log(DV) ~ ...` / `log_additive`) is not supported inside a branch.
+- **SDE / `[diffusion]` models are not supported.** The EKF measurement-noise
+  path uses a single error model and cannot switch per observation, so the
+  combination is rejected at parse time. Use a single-endpoint error model.
+- **Adaptive dosing** (`simulate_adaptive*`) is not supported: the assay keys
+  residual error by the monitored compartment, whereas a selected error model
+  keys endpoints by covariate branch — the combination is rejected.
+- **`simulate()` validates the selector covariate** the same way `fit()` does: a
+  selector covariate absent from the data is a hard `E_MISSING_COVARIATE` error,
+  never silently read as 0.
 
 ### Comparison with NONMEM
 

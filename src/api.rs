@@ -530,6 +530,27 @@ fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagn
     .with_suggestion(format!("available covariate columns: {}", available))]
 }
 
+/// Reject an adaptive-dosing simulation on a covariate-selected error model (#658).
+///
+/// The adaptive assay resolves residual variance by the monitored **compartment**
+/// number (`residual_variance_at(cmt, …)`), but `ErrorSpec::Selected`'s `endpoints`
+/// map is keyed by the selector's **0-based branch index**, not CMT. A CMT-keyed
+/// lookup misses and `variance_at` returns `NaN`, silently corrupting the assay
+/// draw. The combination has no coherent meaning today, so reject it loudly rather
+/// than emit NaN observations.
+fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), String> {
+    if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
+        return Err(
+            "adaptive-dosing simulation does not support a covariate-selected `[error_model]` \
+             (`if (COV …) { … } else { … }`): the assay keys residual error by the monitored \
+             compartment, but a selected error model keys endpoints by covariate branch. Use a \
+             single-endpoint error model for the monitored signal."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Covariates referenced by the model but missing from the `[covariates]`
 /// declaration. These are still read (leniently) so the model works; the parser
 /// has already warned that they ought to be declared.
@@ -4993,6 +5014,58 @@ mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
 
+    /// #658: an adaptive-dosing simulation on a covariate-selected error model
+    /// must be rejected — the assay keys residual variance by CMT, but a
+    /// `Selected` spec keys endpoints by covariate branch (a CMT-keyed lookup
+    /// would miss and draw NaN). A single-endpoint error model is accepted.
+    #[test]
+    fn adaptive_rejects_selected_error_model() {
+        use crate::parser::model_parser::parse_model_string;
+        let ode_selected = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_TOTAL   ~ 0.05 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+        let model = parse_model_string(ode_selected).expect("ODE+Selected model parses");
+        let err = reject_selected_error_for_adaptive(&model)
+            .expect_err("Selected error model must be rejected for adaptive dosing");
+        assert!(
+            err.to_lowercase().contains("adaptive") && err.contains("error_model"),
+            "error should cite the adaptive/error_model restriction: {err}"
+        );
+
+        // A single-endpoint error model on the same structure is accepted.
+        let ode_single = ode_selected.replace(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+            "  DV ~ proportional(PROP_TOTAL)",
+        );
+        let single = parse_model_string(&ode_single).expect("ODE+Single model parses");
+        assert!(reject_selected_error_for_adaptive(&single).is_ok());
+    }
+
     fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         let n = iwres.len();
         SubjectResult {
@@ -6111,6 +6184,13 @@ where
             .to_string()
     })?;
 
+    // The adaptive assay keys residual variance by the monitored compartment
+    // number (`residual_variance_at(cmt, …)`), but a `Selected` error model's
+    // endpoints are keyed by the covariate selector's 0-based branch index, not
+    // CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
+    // the assay draw. Reject the combination rather than emit NaN observations (#658).
+    reject_selected_error_for_adaptive(model)?;
+
     // An empty schedule means the controller is never consulted: the result is a
     // dose-free simulation that the verifier (replaying an empty ledger) passes
     // trivially. That is almost always a forgotten `decision_times` (the field
@@ -6468,6 +6548,9 @@ pub fn simulate_adaptive_from_spec(
     // Parity with `fit()`: model-referenced covariates (e.g. a `Selected` error
     // model's selector) must be present too, not just the `observe` signal (#658).
     first_error(&check_covariates(model, population))?;
+    // A `Selected` error model keys endpoints by selector branch, not CMT, so the
+    // compartment-keyed assay would draw NaN — reject it (see the helper's note, #658).
+    reject_selected_error_for_adaptive(model)?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
     // Apply the same loud check fits use for model covariates (`check_covariates`).

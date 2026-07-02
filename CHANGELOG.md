@@ -85,6 +85,14 @@ section of the SDLC for the versioning policy).
   fit. Non-convergence is now reported directly (`converged = false` plus the "Outer
   optimization did not converge" warning) with no automatic retry. Users who want SLSQP can
   still set `optimizer = slsqp`.
+- **IMPMAP/IMP's FREM Rao-Blackwell E-step now runs a per-subject adaptive ISCALE
+  pilot search** instead of a fixed `iscale = 1.0` (#406 follow-up). The RB
+  conditional PK proposal is usually well matched, but for subjects where the
+  inner-loop Hessian is a poor estimate of the true PK conditional curvature
+  (sparse PK data), a fixed proposal width could leave ESS low even after RB.
+  Mirrors the ISCALE rescue the full-dimensional sampler already had. Applies to
+  the iterative MCEM E-step only; the eval-only / final-marginal IS report keeps
+  a fixed proposal for run-to-run reproducibility.
 
 ### Added
 - **Log-transform-both-sides (LTBS) combined with time-varying covariates** now gets an exact

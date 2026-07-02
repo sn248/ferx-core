@@ -3263,6 +3263,23 @@ impl CompiledModel {
         }
     }
 
+    /// Whether a custom residual-error magnitude (#484) is active. The
+    /// per-observation magnitude expression makes the residual variance depend
+    /// on θ directly (not only through the prediction `f`). The analytic gradient
+    /// now carries this via a direct-θ channel (`mag_variance_dtheta` in
+    /// `sens_outer_gradient::prepare_stacked` / `theta_block`; the inner loop via
+    /// `residual_inner_obs`), so **both** loops are analytic on FOCE and FOCEI
+    /// (#644/#659) — including combined with `iiv_on_ruv` on the closed-form
+    /// (#673/#677) and ODE (#486) paths, since the outer assembly is
+    /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude
+    /// combined with an M3-censored row, a correlated `block_sigma`, or more than
+    /// `MAX_RUV_MAG_AXES` θ (see #486's remaining-FD register). The FD forward NLL
+    /// is itself magnitude-aware, so those fallbacks stay exact.
+    #[inline]
+    pub fn has_custom_ruv_magnitude(&self) -> bool {
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
+    }
+
     /// Multiplicative factor applied to the residual *variance* for a subject
     /// whose random-effect vector is `eta`, from the IIV-on-RUV term
     /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
@@ -3273,57 +3290,6 @@ impl CompiledModel {
     /// `exp(2*eta_k)` is exactly equivalent to scaling the residual SD by
     /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
     /// combined alike.
-    /// One predicate in the `iiv_on_ruv` × {plain | IOV | M3} × {closed-form | ODE}
-    /// routing decision. **As of #486 this gate forces FD for no combination** — every
-    /// `iiv_on_ruv` model (closed-form / ODE, plain / IOV / M3 BLOQ, including the triples)
-    /// is served by the shared, provider-agnostic gradient assembly. The censored ×
-    /// residual-eta cross-terms (`h·z` inner column, `C·z`/`C·m·a` true-Hessian / mixed
-    /// blocks, the σ-cross) live in `residual_inner_obs` (inner) and `prepare` /
-    /// `prepare_stacked` (outer), keyed on `subject.cens[j]` and `residual_error_eta` over
-    /// whatever `ObsSens` the walk emits. So the **non-IOV ODE M3 BLOQ + `iiv_on_ruv`**
-    /// combination — the last holdout — is analytic too (the #547 pattern: the ODE walk
-    /// emits the same per-observation shape the closed-form M3 + `iiv_on_ruv` assembly
-    /// already handled; the ODE and closed-form packed gradients are bit-identical and both
-    /// match reconverged FD to ~1e-7, inner and outer, #486). The predicate is retained as
-    /// the canonical "does `iiv_on_ruv` force FD here?" marker — now uniformly `false` — so
-    /// the inner/outer gates and their tests document the closed frontier in one place.
-    ///
-    /// **This is NOT the single source of truth for the full routing** — the decision
-    /// is spread across several predicates that must move together, so a future scope
-    /// change has to touch all the relevant ones in lockstep or the inner and outer
-    /// loops desync:
-    /// - this gate (consulted by [`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available)
-    ///   and the inner bails [`analytic_inner_common_bail`] / the ODE inner gate);
-    /// - [`iov_analytical_supported`](crate::sens::provider::iov_analytical_supported)
-    ///   (closed-form IOV: declines M3, served for plain/`iiv_on_ruv`);
-    /// - [`ode_iov_supported`](crate::sens::ode_provider::ode_iov_supported)
-    ///   (ODE IOV + `iiv_on_ruv`, including the M3 triple, routed here);
-    /// - [`analytical_supported`](crate::sens::provider::analytical_supported)
-    ///   (closed-form M3 + `iiv_on_ruv`, #4c).
-    ///
-    /// Net effect today: analytic for **every** `iiv_on_ruv` combination —
-    /// **closed-form M3 + `iiv_on_ruv`** (#4c), **closed-form IOV + `iiv_on_ruv`**
-    /// (#4b/#474), **ODE IOV + `iiv_on_ruv`** incl. the M3 triple (#486, via
-    /// `ode_iov_supported`), and **non-IOV ODE M3 + `iiv_on_ruv`** (#486).
-    #[inline]
-    pub fn iiv_on_ruv_forces_fd(&self) -> bool {
-        // No remaining `iiv_on_ruv` combination forces FD (#486); see the doc above.
-        let _ = self;
-        false
-    }
-
-    /// Whether a custom residual-error magnitude (#484) is active. The
-    /// per-observation magnitude expression makes the residual variance depend
-    /// on θ directly (not only through the prediction `f`), which the analytic
-    /// inner/outer gradient kernels do not yet carry — so both gradient loops
-    /// fall back to finite differences when this is `true`. The FD forward NLL
-    /// is itself magnitude-aware, so FD stays exact. Removing this gate is the
-    /// Phase 5 follow-up (AD through the magnitude program).
-    #[inline]
-    pub fn has_custom_ruv_magnitude(&self) -> bool {
-        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
-    }
-
     #[inline]
     pub fn residual_var_scale(&self, eta: &[f64]) -> f64 {
         match self.residual_error_eta {

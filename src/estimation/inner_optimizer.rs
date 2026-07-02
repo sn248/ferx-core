@@ -1393,13 +1393,10 @@ pub(crate) fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
         // *combination* with a correlated residual bails: the dense-R inner kernel does
         // not carry the magnitude's θ-dependence, so route it to FD (magnitude-aware).
         || (model.has_custom_ruv_magnitude() && !model.residual_correlations.is_empty())
-        // `iiv_on_ruv`: residual-η is served analytically on both loops for the
-        // closed-form path — plain (#474), IOV (#4b), and M3-BLOQ (#4c) — and for the ODE
-        // path including the M3 + IOV triple (#486); the scaling and the censored/quantified
-        // `η_ruv` terms live in the shared, provider-agnostic gradient. Only **non-IOV ODE**
-        // M3 + `iiv_on_ruv` still bails here (via `iiv_on_ruv_forces_fd`, now
-        // M3-AND-`ode_spec`-AND-`n_kappa == 0`).
-        || model.iiv_on_ruv_forces_fd()
+    // `iiv_on_ruv` needs no bail here: residual-η is served analytically on both loops for
+    // every combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples
+    // (#474/#4b/#4c/#591/#623/#677); the scaling and the censored/quantified `η_ruv` terms
+    // live in the shared, provider-agnostic gradient.
 }
 
 /// True when the subject carries survival/TTE observation records, whose hazard-likelihood
@@ -1475,7 +1472,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
         // The ODE inner path does NOT bail on LTBS or `ExpressionScale`: the `Dual1` ODE
         // walk shares `solve_ode_g` with the objective, so ODE-LTBS takes the analytic
         // inner gradient (#474). Only the escape hatch / `gradient = fd` / SDE /
-        // `iiv_on_ruv`-forces-FD cases revert here.
+        // magnitude-×-`block_sigma` cases revert here.
         if no_analytic_inner_forced()
             || matches!(model.gradient_method, GradientMethod::Fd)
             || model.is_sde()
@@ -1487,7 +1484,6 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
             // with a correlated residual bails: the dense-R inner kernel does not carry
             // the magnitude's θ-dependence — matching `analytic_inner_common_bail`.
             || (model.has_custom_ruv_magnitude() && !model.residual_correlations.is_empty())
-            || model.iiv_on_ruv_forces_fd()
         {
             return false;
         }
@@ -1899,9 +1895,8 @@ fn analytic_eta_nll_gradient_iov(
     // so `v`/`dv_df` carry that factor and the `η_ruv` column gets the variance term
     // `Σ_j (1 − ε²/v)` — exactly the non-IOV treatment in
     // `analytic_eta_nll_gradient_with_schedule`. `residual_var_scale` returns `1.0` when
-    // no `iiv_on_ruv` is declared, so a plain IOV model is unaffected. (IOV + M3 still
-    // routes to FD via `iiv_on_ruv_forces_fd` / `iov_analytical_supported`, so no censored
-    // residual-eta branch is needed here.)
+    // no `iiv_on_ruv` is declared, so a plain IOV model is unaffected. (M3-censored rows are
+    // handled by the censored branch below, #580/#591.)
     // Only pay the `exp(2·η_ruv)` scaling + the `η_ruv` column when `iiv_on_ruv` is
     // active; a plain IOV model runs the original op count (no per-obs ×1.0 multiplies
     // and no residual-eta accumulation — #474 review).
@@ -1918,8 +1913,8 @@ fn analytic_eta_nll_gradient_iov(
     // Jacobian, so the EBE minimises the same censored objective. The triple
     // M3 + IOV + `iiv_on_ruv` is analytic too (#591): on a censored row with
     // `ruv_active`, `residual_inner_obs` also returns the `h·z` residual-eta column
-    // (the `η_ruv` index lives in the BSV block of the stacked vector). Only the ODE
-    // triple stays FD (via `iiv_on_ruv_forces_fd`).
+    // (the `η_ruv` index lives in the BSV block of the stacked vector). The ODE triple is
+    // analytic as well (#486/#623) — every `iiv_on_ruv` combination is served.
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
     let mut grad = vec![0.0_f64; n_stacked];
     let mut ruv_grad = 0.0_f64;
@@ -2950,7 +2945,7 @@ mod tests {
     /// Closed-form `iiv_on_ruv` + M3 BLOQ (#4c): the analytic non-IOV inner
     /// η-gradient must match central FD of `individual_nll`, exercising the censored
     /// `η_ruv` data column `h·z` and the `exp(2·η_ruv)` variance scaling on the
-    /// censored rows (which previously forced FD via `iiv_on_ruv_forces_fd`).
+    /// censored rows (which previously forced FD).
     #[test]
     fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
         use std::cell::RefCell;
@@ -2961,7 +2956,6 @@ mod tests {
         .expect("parse closed-form iiv_on_ruv");
         model.bloq_method = crate::types::BloqMethod::M3;
         assert_eq!(model.residual_error_eta, Some(3));
-        assert!(!model.iiv_on_ruv_forces_fd());
 
         let subject = Subject {
             id: "1".into(),
@@ -3072,8 +3066,8 @@ mod tests {
     /// censored residual-eta data column `h·z` and the `exp(2·η_ruv)` variance scaling are
     /// applied by the provider-agnostic `residual_inner_obs` over the **event-driven ODE
     /// walk's** `ObsSens` (not the closed-form provider), so the analytic inner η-gradient
-    /// must match central FD of `individual_nll`. This is what flipping `iiv_on_ruv_forces_fd`
-    /// to a uniform `false` now admits on the inner loop.
+    /// must match central FD of `individual_nll` — the non-IOV ODE M3 + `iiv_on_ruv` combo
+    /// the inner loop now admits (#623).
     #[test]
     fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
         use std::cell::RefCell;
@@ -3085,10 +3079,6 @@ mod tests {
         model.bloq_method = crate::types::BloqMethod::M3;
         assert_eq!(model.residual_error_eta, Some(3));
         assert!(model.is_ode_based(), "model must be on the ODE path");
-        assert!(
-            !model.iiv_on_ruv_forces_fd(),
-            "non-IOV ODE M3 + iiv_on_ruv must no longer force FD (#486)"
-        );
 
         let subject = Subject {
             id: "1".into(),
@@ -4656,8 +4646,8 @@ mod iov_tests {
     /// (`analytic_eta_nll_gradient_iov`) must match central FD of the inner objective
     /// `individual_nll_iov` over `[η_bsv, η_ruv, κ₁..κ_K]` — including the `η_ruv` column
     /// (`Σ_j 1 − ε²/v`) and the `exp(2·η_ruv)` residual-variance scaling now woven into
-    /// the IOV inner gradient. Proves the gate flip (`iov_analytical_supported` /
-    /// `iiv_on_ruv_forces_fd`) ships a *correct* gradient, not just an enabled one.
+    /// the IOV inner gradient. Proves the gate flip (`iov_analytical_supported`) ships a
+    /// *correct* gradient, not just an enabled one.
     #[test]
     fn iov_iiv_on_ruv_inner_grad_matches_fd() {
         use crate::parser::model_parser::parse_model_string;
@@ -4670,7 +4660,6 @@ mod iov_tests {
         assert!(crate::sens::provider::iov_analytical_supported(&model));
         assert!(crate::sens::provider::iov_sens_supported(&model));
         assert!(!analytic_inner_common_bail(&model));
-        assert!(!model.iiv_on_ruv_forces_fd());
 
         let subject = Subject {
             id: "1".into(),
@@ -5111,10 +5100,8 @@ mod iov_tests {
         .expect("parse ODE IOV + M3 + iiv_on_ruv");
         assert_eq!(model.residual_error_eta, Some(3));
         assert!(model.is_ode_based(), "must be on the ODE path");
-        // The ODE triple is analytic on both loops as of #486 (n_kappa > 0, so
-        // `iiv_on_ruv_forces_fd` no longer trips).
+        // The ODE triple is analytic on both loops as of #486.
         assert!(crate::sens::provider::iov_sens_supported(&model));
-        assert!(!model.iiv_on_ruv_forces_fd());
         assert!(!analytic_inner_common_bail(&model));
 
         for cens_sign in [1i8, -1] {
@@ -5228,7 +5215,6 @@ mod iov_tests {
         assert!(crate::sens::provider::iov_analytical_supported(&model));
         assert!(crate::sens::provider::iov_sens_supported(&model));
         assert!(!analytic_inner_common_bail(&model));
-        assert!(!model.iiv_on_ruv_forces_fd());
 
         let mut subject = Subject {
             id: "1".into(),
@@ -5348,14 +5334,12 @@ mod iov_tests {
         assert!(!analytic_inner_common_bail(&model));
         // IIV on residual error is NO LONGER a blanket common bail (#4b): the inner
         // gradient now carries the `exp(2·η_ruv)` scaling and the `η_ruv` variance column.
-        // For this **IOV** model (`n_kappa > 0`), even the M3 triple is analytic as of #486
-        // (`iiv_on_ruv_forces_fd` no longer trips — its `n_kappa == 0` guard keeps only the
-        // *non-IOV* ODE M3 + `iiv_on_ruv` combo on FD).
+        // For this **IOV** model (`n_kappa > 0`), even the M3 triple is analytic as of #486;
+        // the non-IOV ODE M3 + `iiv_on_ruv` combo is analytic as well (#623).
         model.residual_error_eta = Some(0);
         assert!(!analytic_inner_common_bail(&model));
         model.bloq_method = crate::types::BloqMethod::M3;
         assert!(!analytic_inner_common_bail(&model));
-        assert!(!model.iiv_on_ruv_forces_fd());
         model.bloq_method = crate::types::BloqMethod::Drop;
         model.residual_error_eta = None;
         // LTBS × IOV now takes the FD *inner* gradient via `analytic_inner_common_bail`'s
@@ -5496,8 +5480,8 @@ mod iov_tests {
     /// IIV on residual error (#474): the closed-form inner η-gradient must match a
     /// The inner-gradient model gate accepts a closed-form `iiv_on_ruv` model AND
     /// closed-form **M3 BLOQ + `iiv_on_ruv`** (#4c — the censored × residual-eta
-    /// cross-terms are assembled). Only **non-IOV ODE** M3 + `iiv_on_ruv` still keeps FD
-    /// (gated via `iiv_on_ruv_forces_fd`; the ODE *IOV* triple is analytic as of #486).
+    /// cross-terms are assembled). The **non-IOV ODE** M3 + `iiv_on_ruv` combo is analytic
+    /// as well (#623), as is the ODE *IOV* triple (#486).
     #[test]
     fn analytic_inner_grad_gate_iiv_on_ruv() {
         use crate::parser::model_parser::parse_model_string;
@@ -5509,7 +5493,6 @@ mod iov_tests {
         // #4c: closed-form M3 + iiv_on_ruv is now analytic (was FD).
         model.bloq_method = crate::types::BloqMethod::M3;
         assert!(analytic_inner_grad_supported_model(&model));
-        assert!(!model.iiv_on_ruv_forces_fd());
     }
 
     /// central finite difference of the production `individual_nll` (which applies

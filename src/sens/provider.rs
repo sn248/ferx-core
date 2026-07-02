@@ -616,12 +616,10 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))
-        // IIV on residual error (#474): the analytic gradient (inner η-column +
-        // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves the
-        // closed-form AND ODE paths — including IOV and the M3-BLOQ triple
-        // (closed-form #4b/#591, ODE IOV #486). Only **non-IOV** ODE M3 + `iiv_on_ruv`
-        // still routes to FD, which is all `iiv_on_ruv_forces_fd` gates now.
-        && !model.iiv_on_ruv_forces_fd()
+    // IIV on residual error (#474) needs no gate here: the analytic gradient (inner η-column +
+    // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves every `iiv_on_ruv`
+    // combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples
+    // (#474/#4b/#591/#623/#677) — with no FD carve-out.
 }
 
 /// [`analytic_outer_gradient_available`], kept as the shared entry point that
@@ -910,8 +908,8 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // all keyed on the residual-eta index, which lives in the BSV block of the stacked
     // layout. So opening the gate lights up both loops; the censored rows still leave
     // `H̃`/`log|H̃|` (no `c̃` residual-eta column), matching the objective. The ODE *IOV*
-    // triple is analytic too (#486); only the **non-IOV ODE** M3 + `iiv_on_ruv` combo stays
-    // FD (via `iiv_on_ruv_forces_fd`, `ode_spec`-AND-`n_kappa == 0`-gated).
+    // triple is analytic too (#486); the **non-IOV ODE** M3 + `iiv_on_ruv` combo is analytic
+    // as well (#623) — every `iiv_on_ruv` combination is served, with no FD carve-out.
     //
     // IIV on residual error (`iiv_on_ruv`) IS analytic for closed-form IOV models:
     // `η_ruv` enters only through the variance (`v = R(f)·exp(2·η_ruv)`, `∂f/∂η_ruv = 0`),
@@ -5058,9 +5056,8 @@ mod tests {
         ruv.residual_error_eta = Some(0);
         assert!(analytic_outer_gradient_available(&ruv));
         // …and closed-form M3 BLOQ + `iiv_on_ruv` is now analytic too (#4c — the
-        // censored × residual-eta cross-terms are assembled). Only ODE M3 +
-        // `iiv_on_ruv` keeps FD (via `iiv_on_ruv_forces_fd`, which gates on
-        // `ode_spec.is_some()`).
+        // censored × residual-eta cross-terms are assembled). The ODE M3 +
+        // `iiv_on_ruv` combo is analytic as well (#623), so every combination is served.
         let mut ruv_m3 = test_helpers::analytical_model(GradientMethod::Auto);
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
@@ -9272,9 +9269,8 @@ mod tests {
     /// **M3 + IOV + `iiv_on_ruv`** is analytic too as of #591 — the closed-form assembly
     /// already carried the censored residual-eta cross coefficients `(C·z, C·m)`, so
     /// `iov_analytical_supported` admits it (and `analytic_outer_gradient_available`
-    /// follows). The ODE IOV triple is analytic too (#486); only the *non-IOV ODE* triple
-    /// stays FD (via `iiv_on_ruv_forces_fd`). Plain IOV and IOV + `iiv_on_ruv` (no M3) stay
-    /// analytic.
+    /// follows). The ODE IOV triple is analytic too (#486), as is the *non-IOV ODE* triple
+    /// (#623). Plain IOV and IOV + `iiv_on_ruv` (no M3) stay analytic.
     #[test]
     fn iov_analytical_supported_admits_m3_but_not_the_ruv_triple() {
         let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
@@ -9289,9 +9285,6 @@ mod tests {
         model.residual_error_eta = Some(0);
         assert!(iov_analytical_supported(&model));
         assert!(analytic_outer_gradient_available(&model));
-        // Only the *non-IOV ODE* triple stays FD, gated by `iiv_on_ruv_forces_fd`
-        // (ode_spec-AND-n_kappa==0); the closed-form triple here does not trip it.
-        assert!(!model.iiv_on_ruv_forces_fd());
         // IOV + iiv_on_ruv without M3: analytic (#4b).
         model.bloq_method = crate::types::BloqMethod::Drop;
         assert!(iov_analytical_supported(&model));
@@ -11444,8 +11437,8 @@ mod tests {
     /// `ode_iov_supported` admits M3, `iiv_on_ruv`, and the full **triple** M3 + IOV +
     /// `iiv_on_ruv` — all provider-agnostic over the stacked `[η_bsv, κ]` layout (the ODE
     /// walk emits a zero `∂f/∂η_ruv` column; the shared assembly applies the variance
-    /// scaling and the residual-eta column). Only the **non-IOV** ODE M3 + `iiv_on_ruv`
-    /// combo stays FD, gated by `iiv_on_ruv_forces_fd` (`n_kappa == 0`). LTBS still declines.
+    /// scaling and the residual-eta column). The **non-IOV** ODE M3 + `iiv_on_ruv` combo is
+    /// analytic as well (#623), so every combination is served. LTBS still declines.
     #[test]
     fn ode_iov_supported_admits_m3_and_the_ruv_triple() {
         let mut model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
@@ -11459,19 +11452,11 @@ mod tests {
             crate::sens::ode_provider::ode_iov_supported(&model),
             "ODE IOV + iiv_on_ruv must be on the analytic path (#486)"
         );
-        assert!(
-            !model.iiv_on_ruv_forces_fd(),
-            "IOV (n_kappa > 0) is not forced to FD"
-        );
         // The full triple M3 + ODE IOV + iiv_on_ruv: analytic as of #486.
         model.bloq_method = crate::types::BloqMethod::M3;
         assert!(
             crate::sens::ode_provider::ode_iov_supported(&model),
             "ODE IOV + M3 + iiv_on_ruv (the triple) must be analytic (#486)"
-        );
-        assert!(
-            !model.iiv_on_ruv_forces_fd(),
-            "the IOV triple is not forced to FD"
         );
         assert!(
             iov_sens_supported(&model),

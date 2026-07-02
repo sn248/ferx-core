@@ -402,6 +402,68 @@ fn eval_readout_jet<T: crate::sens::num::PkNum>(
     prog.eval_output_g::<T>(ro_state, params, cov, ro_vars, ro_stack)
 }
 
+/// κ = 0 (BSV-only) readout-parameter snapshots for the analytic IOV walk (#655).
+/// Production's [`crate::pk::apply_analytic_readout`] builds the readout PK params from
+/// `eta_bsv` (no κ) — only the concentration carries the occasion κ — so these snapshots
+/// carry `∂/∂(θ, η_bsv)` and zero `∂/∂κ`. When covariates / `TIME` vary across observations
+/// the snapshot is per-observation; otherwise a single shared snapshot suffices (the readout
+/// param jet is then identical across rows, so a per-obs `Vec` would deep-clone the nested
+/// `CombinedDerivs` `N − 1` times per gradient eval on a hot path — `bsv_amount` already
+/// carries a single snapshot for the same reason).
+enum ReadoutSnapshots {
+    Static((crate::types::PkParams, CombinedDerivs)),
+    PerObs(Vec<(crate::types::PkParams, CombinedDerivs)>),
+}
+
+impl ReadoutSnapshots {
+    /// The κ = 0 readout snapshot for observation `j` (the shared one when `Static`).
+    #[inline]
+    fn at(&self, j: usize) -> &(crate::types::PkParams, CombinedDerivs) {
+        match self {
+            Self::Static(s) => s,
+            Self::PerObs(v) => &v[j],
+        }
+    }
+}
+
+/// Evaluate the analytic Form C readout at one IOV observation (#655) — shared by the outer
+/// (`Dual2`) and inner (`Dual1`) walks so the κ = 0 seeding convention lives in one place.
+/// Seeds the readout PK params from the BSV-only snapshot (`group = None`, so the κ axes are
+/// dropped) via the caller's monomorphized `seed`, then runs the readout jet under this
+/// observation's model time.
+///
+/// `conc` **must already be clamped to ≥ 0** — production clamps `conc.max(0.0)` *before* the
+/// readout ([`crate::pk::event_driven`] → [`crate::pk::apply_analytic_readout`]) and returns
+/// the readout output unclamped, so the caller clamps the concentration jet and does not
+/// re-clamp the result. A readout referencing `TIME` resolves `Op::PushTime` from the
+/// model-time thread-local, so it is entered at `obs_time` to match the guard
+/// `apply_analytic_readout` sets (a no-op read for a `TIME`-free readout).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn eval_readout_at_obs<T: crate::sens::num::PkNum>(
+    prog: &crate::parser::model_parser::OdeOutputProgram,
+    conc: T,
+    snapshot: &(crate::types::PkParams, CombinedDerivs),
+    slot_row: &[Option<usize>; N_PK],
+    cov: &std::collections::HashMap<String, f64>,
+    obs_time: f64,
+    seed: impl Fn(&CombinedDerivs, Option<usize>, usize, f64) -> T,
+    ro_state: &mut Vec<T>,
+    ro_vars: &mut Vec<T>,
+    ro_stack: &mut Vec<T>,
+) -> T {
+    let (pk_ro, cd_ro) = snapshot;
+    let params: [T; N_PK] = std::array::from_fn(|s| {
+        let val = pk_ro.values.get(s).copied().unwrap_or(0.0);
+        match slot_row[s] {
+            Some(i) => seed(cd_ro, None, i, val),
+            None => T::from_f64(val),
+        }
+    });
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(obs_time);
+    eval_readout_jet::<T>(prog, conc, &params, cov, ro_state, ro_vars, ro_stack)
+}
+
 /// Whether the model's `[initial_conditions]` baseline (#521) is one the Dual2
 /// provider differentiates exactly (#524): every init carries a compiled
 /// `amount_deriv` program and the `(θ, η)` axis count fits the init dispatch
@@ -915,6 +977,20 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     {
         return false;
     }
+    // Analytic Form C readout (`[scaling] y = <expr>`, #655): served on the IOV
+    // event-driven walk when it fits the eight structural `PkDual` slots — the same
+    // walk-capable scope the TV-cov path uses (`readout_tvcov_supported`: a uniform
+    // dual-evaluable `Single` readout, no depot reference, no `[initial_conditions]`,
+    // no slot past `PK_IDX_V3`). `run_obs_iov` / `run_obs_iov_eta` seed the readout PK
+    // params from the κ = 0 (BSV-only) per-obs snapshot while the walk's concentration
+    // carries κ, matching production `apply_analytic_readout(..., eta_bsv, ...)`. A
+    // readout outside that scope (per-CMT, depot, direct θ/η, slot overflow) declines to
+    // FD here so the reported method stays honest — the closed-form IOV twin of
+    // `analytical_supported_core`'s `analytic_readout_dual_supported` clause.
+    // `readout_tvcov_supported` is `true` for a plain (no-readout) model.
+    if !readout_tvcov_supported(model) {
+        return false;
+    }
     let n_eff = model.n_eta + model.n_kappa;
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
@@ -997,12 +1073,13 @@ pub fn subject_sensitivities_iov(
     if !iov_analytical_supported(model) {
         return None;
     }
-    // Analytic Form C readout (#650) under IOV: the IOV dual walk does not yet
-    // route the amount state through the readout, so fall back to FD (correct via
-    // the readout-aware f64 predictor). See `subject_sensitivities_tvcov`.
-    if model.analytic_readout.is_some() {
-        return None;
-    }
+    // Analytic Form C readout program (#655), threaded into the walk to replace each
+    // observation's central concentration with `y = <expr>`. `iov_analytical_supported`
+    // has already confirmed the readout (if any) fits the walk. `None` for a plain model.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     let s = build_iov_sources(model, subject, theta, stacked_eta)?;
     // Run the walk over `Dual2<M>` (M = n_theta + n_stacked); the dual width tracks
     // the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK axes, so it stays
@@ -1015,6 +1092,7 @@ pub fn subject_sensitivities_iov(
                     model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
                     &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
                     s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
+                    readout, s.readout_obs.as_ref(),
                 ),)+
                 _ => None,
             }
@@ -1058,6 +1136,17 @@ struct IovSources {
     /// carries `∂A₀/∂(θ, η_bsv)` but zero `∂A₀/∂κ`. `None` when the model has no
     /// `[initial_conditions]`.
     bsv_amount: Option<(crate::types::PkParams, CombinedDerivs)>,
+    /// For an analytic Form C readout (`[scaling] y = <expr>`) under IOV (#655): one
+    /// **BSV-only** (`κ = 0`) `(pk, combined-derivs)` snapshot per observation,
+    /// evaluated at that observation's covariate / `TIME` snapshot. Production's
+    /// `apply_analytic_readout` builds the readout PK params (the amount's `V`, plus
+    /// non-structural `BMAX`/`KD`) from `eta_bsv` (no κ) — only the concentration jet
+    /// carries κ — so this snapshot drives the readout param jet with `∂/∂(θ, η_bsv)`
+    /// and zero `∂/∂κ` (seeded `group = None`), while the walk's κ-bearing concentration
+    /// supplies the central amount. `Static` when covariates / `TIME` are subject-static
+    /// (one shared snapshot), `PerObs` otherwise; `None` when the model has no analytic
+    /// readout. See [`ReadoutSnapshots`].
+    readout_obs: Option<ReadoutSnapshots>,
 }
 
 fn build_iov_sources(
@@ -1277,6 +1366,33 @@ fn build_iov_sources(
         Some((pk, cd))
     };
 
+    // Analytic Form C readout param snapshots (#655): one κ = 0 (BSV-only) `(pk, cd)`
+    // per observation, matching production `apply_analytic_readout(..., eta_bsv,
+    // obs_cov(j), obs_time(j))`. Per-event when covariates / `TIME` vary (each obs at its
+    // own snapshot); otherwise one static snapshot reused across observations (the
+    // derivative-program eval is the cost, so clone the shared `cd`). Built only when a
+    // readout is present — such a model is init-free with no `[scaling]` divisor, so
+    // `bsv_amount`/`scale_groups` are `None` and the post-walk transform blocks are inert.
+    let readout_obs = if model.analytic_readout.is_none() {
+        None
+    } else if per_event {
+        let mut v = Vec::with_capacity(subject.obs_times.len());
+        for j in 0..subject.obs_times.len() {
+            let cov = subject.obs_cov(j);
+            let t = subject.obs_times[j];
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, t);
+            let cd = cd_at(t, &combined_pk_only, cov)?;
+            v.push((pk, cd));
+        }
+        Some(ReadoutSnapshots::PerObs(v))
+    } else {
+        // Subject-static covariates / `TIME`: one shared snapshot, so the walk reads the same
+        // κ = 0 readout params at every observation (no per-obs `CombinedDerivs` clone).
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
+        let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
+        Some(ReadoutSnapshots::Static((pk, cd)))
+    };
+
     Some(IovSources {
         sources,
         dose_src,
@@ -1290,6 +1406,7 @@ fn build_iov_sources(
         n_theta,
         scale_groups,
         bsv_amount,
+        readout_obs,
     })
 }
 
@@ -1308,12 +1425,12 @@ fn subject_eta_grad_iov_analytical(
     if !iov_analytical_supported(model) {
         return None;
     }
-    // Analytic Form C readout (#650) under IOV: the IOV dual walk does not yet
-    // route the amount state through the readout, so fall back to FD (correct via
-    // the readout-aware f64 predictor). See `subject_sensitivities_tvcov`.
-    if model.analytic_readout.is_some() {
-        return None;
-    }
+    // Analytic Form C readout program (#655); `iov_analytical_supported` has already
+    // confirmed the readout (if any) fits the walk. `None` for a plain model.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     let s = build_iov_sources(model, subject, theta, stacked_eta)?;
     let n_dim = s.n_stacked;
     macro_rules! disp {
@@ -1323,6 +1440,7 @@ fn subject_eta_grad_iov_analytical(
                     model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
                     &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
                     s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
+                    readout, s.readout_obs.as_ref(),
                 ),)+
                 _ => None,
             }
@@ -1362,6 +1480,8 @@ fn run_obs_iov<const M: usize>(
     n_theta: usize,
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -1488,31 +1608,62 @@ fn run_obs_iov<const M: usize>(
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#655): scratch for the per-observation dual eval.
+    let mut ro_state: Vec<Dual2<M>> = Vec::new();
+    let mut ro_vars: Vec<Dual2<M>> = Vec::new();
+    let mut ro_stack: Vec<Dual2<M>> = Vec::new();
+
     let mut obs_out = Vec::with_capacity(conc.len());
-    for c in &conc {
-        // Clamp parity with production `conc.max(0.0)`: a negative value's
-        // derivatives vanish (consistency with the OFV).
-        let neg = c.value < 0.0;
+    for (j, c) in conc.iter().enumerate() {
+        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
+        // `conc.max(0.0)` in `event_driven_predictions` and only then applies the readout
+        // (which is returned unclamped). A negative value's derivatives vanish, matching the
+        // OFV. For a plain (no-readout) model this reproduces the old post-loop clamp exactly
+        // (`constant(0.0)` has zero grad/hess).
+        let c_clamped: Dual2<M> = if c.value < 0.0 {
+            Dual2::<M>::constant(0.0)
+        } else {
+            *c
+        };
+        // Analytic Form C readout (#655): replace the (clamped) central concentration jet
+        // with `y = <expr>`. The concentration carries the occasion κ (through the walk);
+        // the readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
+        // seeded `group = None`), matching production `apply_analytic_readout(..., eta_bsv)`.
+        // The readout output is NOT re-clamped (production does not re-clamp it).
+        let c: Dual2<M> = match (readout, readout_obs) {
+            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual2<M>>(
+                ro,
+                c_clamped,
+                ro_obs.at(j),
+                slot_row,
+                subject.obs_cov(j),
+                subject.obs_times[j],
+                &seed,
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            ),
+            _ => c_clamped,
+        };
+        let c = &c;
         let mut df_deta = vec![0.0; n_stacked];
         let mut df_dtheta = vec![0.0; n_theta];
         let mut d2f_deta2 = vec![0.0; n_stacked * n_stacked];
         let mut d2f_deta_dtheta = vec![0.0; n_stacked * n_theta];
-        if !neg {
-            for p in 0..n_stacked {
-                df_deta[p] = c.grad[n_theta + p];
-                for q in 0..n_stacked {
-                    d2f_deta2[p * n_stacked + q] = c.hess[n_theta + p][n_theta + q];
-                }
-                for m in 0..n_theta {
-                    d2f_deta_dtheta[p * n_theta + m] = c.hess[n_theta + p][m];
-                }
+        for p in 0..n_stacked {
+            df_deta[p] = c.grad[n_theta + p];
+            for q in 0..n_stacked {
+                d2f_deta2[p * n_stacked + q] = c.hess[n_theta + p][n_theta + q];
             }
             for m in 0..n_theta {
-                df_dtheta[m] = c.grad[m];
+                d2f_deta_dtheta[p * n_theta + m] = c.hess[n_theta + p][m];
             }
         }
+        for m in 0..n_theta {
+            df_dtheta[m] = c.grad[m];
+        }
         obs_out.push(ObsSens {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
             d2f_deta2,
             df_dtheta,
@@ -1666,6 +1817,8 @@ fn run_obs_iov_eta<const N: usize>(
     n_stacked: usize,
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -1762,19 +1915,44 @@ fn run_obs_iov_eta<const N: usize>(
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#655): scratch for the per-observation dual eval.
+    let mut ro_state: Vec<Dual1<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
+
     let mut out = Vec::with_capacity(conc.len());
-    for c in &conc {
-        // Clamp parity with production `conc.max(0.0)`: a negative value's derivatives
-        // vanish (consistency with the OFV / the Dual2 walk).
-        let neg = c.value < 0.0;
+    for (j, c) in conc.iter().enumerate() {
+        // Clamp the concentration jet to ≥ 0 BEFORE the readout (production ordering), then
+        // apply the Form C readout unclamped — the η-only mirror of the `run_obs_iov` step.
+        // The readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
+        // `group = None`) while the clamped concentration supplies the κ-bearing central amount.
+        let c_clamped: Dual1<N> = if c.value < 0.0 {
+            Dual1::<N>::constant(0.0)
+        } else {
+            *c
+        };
+        let c: Dual1<N> = match (readout, readout_obs) {
+            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual1<N>>(
+                ro,
+                c_clamped,
+                ro_obs.at(j),
+                slot_row,
+                subject.obs_cov(j),
+                subject.obs_times[j],
+                &seed,
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            ),
+            _ => c_clamped,
+        };
+        let c = &c;
         let mut df_deta = vec![0.0; n_stacked];
-        if !neg {
-            for (p, df) in df_deta.iter_mut().enumerate() {
-                *df = c.grad[p];
-            }
+        for (p, df) in df_deta.iter_mut().enumerate() {
+            *df = c.grad[p];
         }
         out.push(ObsGrad {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
         });
     }
@@ -2489,11 +2667,19 @@ fn run_obs_tvcov<const M: usize>(
 
     let mut obs_out = Vec::with_capacity(conc.len());
     for (j, c) in conc.iter().enumerate() {
-        // Analytic Form C readout: replace the central concentration jet with
-        // `y = <expr>`. The per-observation PK duals (`pk_at_obs[j]`) already carry
-        // each parameter's `∂/∂(θ,η)` in the walk basis — including a non-structural
-        // `BMAX`/`KD` seeded into its allocated structural slot — so the readout's
-        // derivatives compose directly. The central amount is `concentration × V`.
+        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
+        // `conc.max(0.0)` and only then applies the readout (returned unclamped). For a
+        // plain model this reproduces the old post-loop clamp (`constant(0.0)` zeros grad/hess).
+        let c_clamped: Dual2<M> = if c.value < 0.0 {
+            Dual2::<M>::constant(0.0)
+        } else {
+            *c
+        };
+        // Analytic Form C readout: replace the (clamped) central concentration jet with
+        // `y = <expr>`. The per-observation PK duals (`pk_at_obs[j]`) already carry each
+        // parameter's `∂/∂(θ,η)` in the walk basis — including a non-structural `BMAX`/`KD`
+        // seeded into its allocated structural slot — so the readout's derivatives compose
+        // directly. The central amount is `concentration × V`; the output is not re-clamped.
         let c: Dual2<M> = if let Some(ro) = readout {
             let pkd = &pk_at_obs[j];
             // Flat PK-slot dual vector for `eval_output_g`'s `indiv_to_pk` lookups;
@@ -2511,9 +2697,14 @@ fn run_obs_tvcov<const M: usize>(
                 PK_IDX_V3 => pkd.v3,
                 _ => Dual2::<M>::constant(0.0),
             });
+            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
+            // thread-local; enter this observation's time to match production's
+            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
+            let _time_guard =
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
             eval_readout_jet::<Dual2<M>>(
                 ro,
-                *c,
+                c_clamped,
                 &params,
                 subject.obs_cov(j),
                 &mut ro_state,
@@ -2521,32 +2712,27 @@ fn run_obs_tvcov<const M: usize>(
                 &mut ro_stack,
             )
         } else {
-            *c
+            c_clamped
         };
         let c = &c;
-        // Clamp parity with production `conc.max(0.0)`: a negative value's
-        // derivatives vanish (consistency with the OFV).
-        let neg = c.value < 0.0;
         let mut df_deta = vec![0.0; n_eta];
         let mut df_dtheta = vec![0.0; n_theta];
         let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
         let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
-        if !neg {
-            for k in 0..n_eta {
-                df_deta[k] = c.grad[n_theta + k];
-                for l in 0..n_eta {
-                    d2f_deta2[k * n_eta + l] = c.hess[n_theta + k][n_theta + l];
-                }
-                for m in 0..n_theta {
-                    d2f_deta_dtheta[k * n_theta + m] = c.hess[n_theta + k][m];
-                }
+        for k in 0..n_eta {
+            df_deta[k] = c.grad[n_theta + k];
+            for l in 0..n_eta {
+                d2f_deta2[k * n_eta + l] = c.hess[n_theta + k][n_theta + l];
             }
             for m in 0..n_theta {
-                df_dtheta[m] = c.grad[m];
+                d2f_deta_dtheta[k * n_theta + m] = c.hess[n_theta + k][m];
             }
         }
+        for m in 0..n_theta {
+            df_dtheta[m] = c.grad[m];
+        }
         obs_out.push(ObsSens {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
             d2f_deta2,
             df_dtheta,
@@ -2808,9 +2994,14 @@ fn run_obs_grad_tvcov<const N: usize>(
 
     let mut out = Vec::with_capacity(conc.len());
     for (j, c) in conc.iter().enumerate() {
-        // Analytic Form C readout (η-gradient): mirror the outer `run_obs_tvcov`
-        // over `Dual1<N>`. Central amount = concentration × V; the readout's
-        // `∂y/∂η` composes from the per-obs PK duals and the readout expression.
+        // Clamp conc ≥ 0 BEFORE the readout (production ordering), then apply the readout
+        // unclamped — the η-gradient mirror of the outer `run_obs_tvcov` over `Dual1<N>`.
+        // Central amount = concentration × V; `∂y/∂η` composes from the per-obs PK duals.
+        let c_clamped: Dual1<N> = if c.value < 0.0 {
+            Dual1::<N>::constant(0.0)
+        } else {
+            *c
+        };
         let c: Dual1<N> = if let Some(ro) = readout {
             let pkd = &pk_at_obs[j];
             let params: [Dual1<N>; N_PK] = std::array::from_fn(|s| match s {
@@ -2824,9 +3015,11 @@ fn run_obs_grad_tvcov<const N: usize>(
                 PK_IDX_V3 => pkd.v3,
                 _ => Dual1::<N>::constant(0.0),
             });
+            let _time_guard =
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
             eval_readout_jet::<Dual1<N>>(
                 ro,
-                *c,
+                c_clamped,
                 &params,
                 subject.obs_cov(j),
                 &mut ro_state,
@@ -2834,17 +3027,14 @@ fn run_obs_grad_tvcov<const N: usize>(
                 &mut ro_stack,
             )
         } else {
-            *c
+            c_clamped
         };
-        let neg = c.value < 0.0;
         let mut df_deta = vec![0.0; n_eta];
-        if !neg {
-            for k in 0..n_eta {
-                df_deta[k] = c.grad[k];
-            }
+        for k in 0..n_eta {
+            df_deta[k] = c.grad[k];
         }
         out.push(ObsGrad {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
         });
     }
@@ -3275,6 +3465,12 @@ fn run_obs_grad<const N: usize>(
                 value: fval,
                 grad: g,
             };
+            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
+            // thread-local; enter this observation's time to match production's
+            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
+            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
+                subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
+            );
             let y = eval_readout_jet::<Dual1<N>>(
                 prog,
                 conc,
@@ -4490,6 +4686,12 @@ fn run_obs<const N: usize>(
                 grad: g,
                 hess: h,
             };
+            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
+            // thread-local; enter this observation's time to match production's
+            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
+            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
+                subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
+            );
             let y = eval_readout_jet::<Dual2<N>>(
                 prog,
                 conc,
@@ -9269,6 +9471,308 @@ mod tests {
             &[0.2, 10.0, 1.5],
             &[0.12, -0.08, 0.20, 0.05, -0.10],
         );
+    }
+
+    // 1-cpt IV closed-form IOV with a saturable-binding analytic Form C readout
+    // `y = C + BMAX·C/(KD + C)`, `C = central/V` (#655). `CL = TVCL·exp(ETA_CL + KAPPA_CL)`
+    // carries the occasion κ through the concentration, while production applies the
+    // readout with the κ = 0 (BSV-only) PK params (`apply_analytic_readout(..., eta_bsv)`)
+    // — so the readout param jet (V, BMAX, KD) is κ-less and only `C` carries κ, exactly
+    // the split `run_obs_iov` seeds from `readout_obs`.
+    const WARFARIN_IOV_BINDING_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BMAX * (central / V) / (KD + central / V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// **Analytic Form C readout × IOV on the closed-form walk** (#655). The IOV provider
+    /// now replaces each observation's concentration jet with `y = <expr>`, seeding the
+    /// readout PK params from the κ = 0 (BSV-only) per-obs snapshot while the walk's
+    /// concentration carries κ — matching production `predict_iov`'s
+    /// `apply_analytic_readout(..., eta_bsv, ...)`. The full provider's value /
+    /// `∂(stacked-η)` / Hessian / `∂θ` must match FD of `predict_iov` (which applies the
+    /// readout), and the non-structural BMAX/KD must be first-class differentiable.
+    #[test]
+    fn iov_form_c_binding_readout_provider_matches_fd() {
+        let model =
+            parse_model_string(WARFARIN_IOV_BINDING_READOUT).expect("parse warfarin IOV readout");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_none(), "closed-form model");
+        assert!(model.analytic_readout.is_some(), "Form C readout parsed");
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV + central-only dual-evaluable Form C readout must be analytic (#655)"
+        );
+        let subject = iov_subject();
+        // θ = [TVCL, TVV, TVBMAX, TVKD]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+
+        // BMAX (θ 2) / KD (θ 3) are non-structural readout params (basis extension) — their
+        // θ-gradient must be non-zero, proving they are differentiated under IOV, not aliased.
+        let full =
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+        let max_bmax = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[2].abs())
+            .fold(0.0_f64, f64::max);
+        let max_kd = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[3].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_bmax > 1e-6, "∂y/∂BMAX must be non-zero under IOV");
+        assert!(max_kd > 1e-6, "∂y/∂KD must be non-zero under IOV");
+    }
+
+    #[test]
+    fn iov_form_c_binding_readout_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_BINDING_READOUT).expect("parse"),
+            &iov_subject(),
+            &[0.2, 10.0, 3.0, 2.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    // As `WARFARIN_IOV_BINDING_READOUT`, but the readout is gated on a **per-row** covariate
+    // (`FREE`) — the free-vs-total assay pattern (#650/#655). A per-observation `FREE` flag
+    // makes the subject a TV-covariate subject, so `build_iov_sources` takes the per-event
+    // branch and builds one κ = 0 readout snapshot per observation (`readout_obs`), each at
+    // that observation's covariate — the branch the plain (static-covariate) case above does
+    // not exercise.
+    const WARFARIN_IOV_BINDING_READOUT_FREE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) else central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// Covariate-gated Form C readout × IOV: the per-row `FREE` flag routes the subject
+    /// through the per-event `readout_obs` branch (one κ = 0 snapshot per observation, at
+    /// that obs's covariate). Value + all stacked-η/θ first/second derivatives must match
+    /// FD of `predict_iov`, and the inner η-gradient must equal the outer η-block.
+    #[test]
+    fn iov_form_c_readout_tvcov_gated_matches_fd() {
+        let model = parse_model_string(WARFARIN_IOV_BINDING_READOUT_FREE).expect("parse");
+        let mut subject = iov_subject();
+        // Alternating per-row FREE flag → per-observation covariate snapshots.
+        subject.obs_covariates = (0..subject.obs_times.len())
+            .map(|j| HashMap::from([("FREE".to_string(), (j % 2) as f64)]))
+            .collect();
+        assert!(
+            subject.has_tv_covariates(),
+            "FREE flag makes it a TV-cov subject"
+        );
+        assert!(
+            iov_analytical_supported(&model),
+            "covariate-gated Form C readout × IOV must be analytic (#655)"
+        );
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+        check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+    }
+
+    // A readout that references the `TIME` builtin directly (`y = central/V + BETA·TIME`).
+    // `TIME` resolves `Op::PushTime` from the model-time thread-local, so both the analytic
+    // readout jet and production `apply_analytic_readout` must enter each observation's time
+    // (Copilot #670 review). `BETA = TVBETA` is a non-structural readout param, so
+    // `∂y/∂TVBETA = TIME` — a direct probe that the observation time (not a stale 0) is used.
+    const WARFARIN_IOV_TIME_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBETA(0.05, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BETA = TVBETA
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BETA * TIME
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// A `TIME`-referencing Form C readout under IOV must evaluate `TIME` at each
+    /// observation. FD-of-`predict_iov` parity ties the analytic path to the (now equally
+    /// guarded) production predictor, and `∂y/∂TVBETA` must equal each observation's time
+    /// (it would be 0 everywhere if the readout read a stale model-time of 0).
+    #[test]
+    fn iov_form_c_time_readout_evaluated_at_obs_time() {
+        let model = parse_model_string(WARFARIN_IOV_TIME_READOUT).expect("parse");
+        assert!(
+            iov_analytical_supported(&model),
+            "TIME readout × IOV analytic (#655)"
+        );
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 0.05];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+        let full =
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+        for (j, o) in full.obs.iter().enumerate() {
+            // ∂(central/V + TVBETA·TIME)/∂TVBETA = TIME at observation j.
+            approx::assert_relative_eq!(
+                o.df_dtheta[2],
+                subject.obs_times[j],
+                max_relative = 1e-6,
+                epsilon = 1e-9
+            );
+        }
+    }
+
+    // A baseline-subtracted readout `y = central/V - E0` that is negative at every observation
+    // (E0 exceeds the concentration). Production clamps the *concentration* to ≥ 0 before the
+    // readout and returns the readout output **unclamped**; the provider must do the same
+    // rather than zeroing a negative output (user #670 review finding #1).
+    const WARFARIN_IOV_NEG_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVE0(100.0, 0.01, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  E0 = TVE0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V - E0
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// A negative-valued Form C readout under IOV: the readout output is returned unclamped
+    /// (matching production), so the provider value/gradient match FD of `predict_iov` on
+    /// rows where `y < 0` — the case the inverted clamp (zeroing the output) got wrong.
+    #[test]
+    fn iov_form_c_negative_output_readout_not_clamped() {
+        let model = parse_model_string(WARFARIN_IOV_NEG_READOUT).expect("parse");
+        assert!(iov_analytical_supported(&model));
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 100.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        let full =
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+        assert!(
+            full.obs.iter().all(|o| o.f < 0.0),
+            "readout must stay negative (unclamped), not zeroed"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+        check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+    }
+
+    // Non-IOV counterpart of the TIME-readout probe — exercises the static `run_obs` /
+    // `run_obs_grad` readout guard (and the shared production guard) added in the #670 review.
+    const ONECPT_IV_TIME_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBETA(0.05, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BETA = TVBETA
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BETA * TIME
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn form_c_time_readout_evaluated_at_obs_time() {
+        let m = parse_model_string(ONECPT_IV_TIME_READOUT).expect("parse");
+        assert!(analytical_supported(&m), "TIME readout stays analytic");
+        let s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        let theta = [0.2, 10.0, 0.05];
+        let eta = [0.12, -0.08];
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+        let full = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+        for (j, o) in full.obs.iter().enumerate() {
+            approx::assert_relative_eq!(
+                o.df_dtheta[2],
+                s.obs_times[j],
+                max_relative = 1e-6,
+                epsilon = 1e-9
+            );
+        }
+        for (lo, fo) in light.iter().zip(full.obs.iter()) {
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    lo.df_deta[k],
+                    fo.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
     }
 
     /// Closed-form **IOV + modeled-duration** dose (`RATE=-2` → `D1`, #486). The

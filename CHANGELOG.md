@@ -47,10 +47,12 @@ section of the SDLC for the versioning policy).
   (read per-observation, so a per-row flag switches the readout), and `if/else`. FOCEI/FOCE
   gradients flow through it **analytically** (outer and inner) on both the static
   dose-superposition path and the time-varying-covariate / oral-infusion event-walk path —
-  so a free-vs-total readout gated on a per-row `FREE` flag stays analytic. IOV subjects, a
-  readout referencing the oral depot amount, per-CMT readouts, and direct θ/η references
-  fall back to finite-difference gradients (the prediction stays exact, and the parser
-  emits a warning). Peripheral compartment amounts are rejected (use an ODE model). See
+  so a free-vs-total readout gated on a per-row `FREE` flag stays analytic — including on
+  **IOV** subjects (`kappa` declarations) since #655, where the readout parameters are
+  BSV-only (a `kappa` reference is rejected at parse) so only the concentration carries the
+  occasion κ. A readout referencing the oral depot amount, per-CMT readouts, and direct θ/η
+  references fall back to finite-difference gradients (the prediction stays exact, and the
+  parser emits a warning). Peripheral compartment amounts are rejected (use an ODE model). See
   [Scaling → Form C](https://ferx-nlme.github.io/ferx-core/model-file/scaling.html).
 
 ### Changed

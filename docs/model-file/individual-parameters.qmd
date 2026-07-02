@@ -153,9 +153,12 @@ switch and 1-cpt oral), `iov_time_builtin_provider_matches_fd_of_predict_iov`
 `ode_time_builtin_provider_matches_fd_of_production` (non-IOV ODE), and
 `ode_iov_time_builtin_provider_matches_fd_of_predict_iov` (ODE IOV) — including in
 combination with an η-dependent `ExpressionScale` obs_scale (the event-driven walk
-now applies the subject-static scale quotient post-walk). The only fallback
-specific to `TIME` is the direct `pk(...=TIME)` mapping (its slot is not desugared
-into the individual-parameter program).
+now applies the subject-static scale quotient post-walk). A direct
+`pk(...=TIME)` structural mapping is served analytically too: the parser desugars
+the mapped slot into a hidden individual parameter (`__ferx_pktime_*`), so it is
+exactly the explicit `[individual_parameters]` form and rides the same per-event
+walk (`time_builtin_direct_pk_mapping_matches_fd_of_production`,
+`time_builtin_direct_pk_mapping_equivalent_to_explicit_indiv_param`).
 
 ### Interaction with mu-referencing
 

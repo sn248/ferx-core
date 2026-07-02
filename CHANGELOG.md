@@ -29,15 +29,129 @@ section of the SDLC for the versioning policy).
   closed-form/ODE, including the `M3 + IOV + iiv_on_ruv` triple. **M3 FOCEI OFV values shift
   accordingly** (estimates/SEs are essentially unchanged), and the OFV now matches NONMEM
   `METHOD=1 LAPLACE` M3 up to the residual FOCEI-vs-LAPLACE second-order term. FOCE
-  (Sheiner–Beal) is a distinct objective and is unchanged.
+  (Sheiner–Beal) is a distinct objective, updated separately (see the next entry).
+- **FOCE (Sheiner–Beal) M3 BLOQ now uses the linearized-marginal moments** for the
+  censored tail probability — `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)` with the marginal mean
+  `f0 = f(η̂) − Hη̂` and marginal variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰`, the same moments the
+  quantified rows use — instead of the conditional prediction and residual variance
+  (#646). This makes plain FOCE a self-consistent Sheiner–Beal objective (matching
+  Monolix's linearization likelihood and first-order/Tobit theory); the analytic FOCE
+  gradient is updated to match, including a new direct Ω-gradient channel for the censored
+  variance, on both the non-IOV and IOV paths. **FOCE M3 OFV and estimates shift** (most
+  when between-subject variance is large, where `HΩHᵀ` dominates `R⁰`). FOCEI M3 keeps the
+  conditional censored term — the treatment NONMEM's `METHOD=1 LAPLACE` M3 uses (NONMEM
+  runs M3 only under LAPLACE), which ferx's first-order FOCEI matches up to the
+  FOCEI-vs-Laplace `∂²f/∂η²` second-order term.
 
 ### Added
+- **A `TIME`-built-in structural parameter combined with a built-in absorption input-rate
+  forcing or a non-zero ODE `init(...)` baseline** now gets exact analytic FOCE/FOCEI
+  sensitivities instead of finite differences (#486). The event-driven walk that threads the
+  per-event `TIME` already carries the absorption `R_in` forcing (since #643) and seeds the
+  `init(...)` state (since #662), so the model-level decline for those combinations was stale;
+  it has been removed. Validated against finite differences of the production predictor.
+- **Built-in absorption forcings (`zero_order(dur)`, `first_order`, and `mixed`) combined
+  with inter-occasion variability (IOV)** now get exact analytic FOCE/FOCEI sensitivities on
+  the ODE path instead of finite differences (#486), closing the last zero-order gap. The IOV
+  analytic walk is the same event-driven walk as the non-IOV time-varying-covariate path, so
+  each forcing's rate and moving-boundary window are rebuilt from that dose's own
+  per-occasion PK jet — the κ (occasion) sensitivity rides through exactly as η/θ do.
+  Validated against finite differences of the production `predict_iov` (value, gradient, and
+  Hessian over the stacked `[η, κ]` vector), including a κ-coupled `DUR` axis-placement check,
+  a `parallel` two-`first_order` pathway, and the `first_order` + estimated-lagtime and
+  `+ EVID 3/4 reset` combinations. The smooth-density input-rate kinds (igd / transit /
+  weibull) under IOV, and any built-in forcing combined with a steady-state dose under IOV,
+  remain on finite differences.
+- **Modeled-duration/rate doses (`RATE=-1`/`-2`) combined with steady-state dosing on the
+  closed-form (analytical 1-/2-/3-cpt) models** now get exact analytic FOCE/FOCEI
+  sensitivities instead of finite differences (#486), the last modeled-dose gap after #652
+  (the ODE path had it via #642). The closed-form dual steady-state equilibration threads the
+  modeled infusion-window jet `(rate, dur)` into each cycle's active/quiet split, so the
+  moving infusion-end flows through the steady-state trough exactly as it does through the
+  current pulse. Validated against finite differences of the production predictor and against
+  the independently NONMEM-anchored ODE steady-state modeled-dose twin.
+- **Initial conditions (`init(...)` / `[initial_conditions]`) are now fully analytic on the
+  FOCE/FOCEI sensitivity gradient** — every remaining combination that previously fell back to
+  finite differences is closed (#486). A parameter-dependent baseline (e.g. an indirect-response
+  or disease-progression PD baseline, `init(central) = BASE/V`) now gets exact analytic
+  gradients when combined with: a finite infusion, a built-in input-rate forcing
+  (igd/transit/weibull/`first_order`/`zero_order`), an estimated lagtime, steady-state dosing, a
+  modeled-duration/rate dose, and an EVID 3/4 reset — on the ODE event-driven walk; the
+  closed-form (1-/2-/3-cpt) `init` baseline on the time-varying-covariate walk; and `init`
+  **under IOV** on both engines (the amount stays BSV-only while the decay kernel follows each
+  occasion's clearance, matching `predict_iov`). Previously `init` was analytic only on the
+  closed-form dose-superposition path (#527) and the ODE plain-bolus TV-cov subset (#649);
+  everything else finite-differenced. Fits are unchanged — only the gradient path is now exact
+  (and faster) for these models.
+- **Zero-order absorption (`zero_order(dur)`, and the `zero_order` leg of a `mixed` model)
+  combined with time-varying covariates or an estimated lagtime** now gets exact analytic
+  FOCE/FOCEI sensitivities on the ODE event-driven walk instead of finite differences
+  (#486). The constant `F·amt·frac/dur` window is delivered per integration segment, with
+  its moving end `d.time + lag + dur` (and, under lagtime, its moving start) carried by
+  rate-off / rate-on saltations; the rate-off uses the general `g⁻ − g⁺` form so a
+  covariate that varies across the window end stays exact. Only `zero_order` under IOV
+  remains on finite differences.
+- **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) on the analytical
+  (closed-form 1-/2-/3-cpt) models** now get exact analytic FOCE/FOCEI sensitivities
+  instead of finite differences (#486), closing the largest closed-form-vs-ODE gap (the
+  ODE path already had this via #630/#635). The modeled infusion window resolves from the
+  PK parameters, so the infusion *end* is a moving boundary in `D`/`R`; the closed-form
+  event-driven walk now carries it exactly (to second order) via the dual window length,
+  the sign-mirror of the existing lagtime dose-*start* handling. Covers non-IOV and IOV
+  (per-occasion windows, including κ-coupled slots), on both the outer θ/Ω/σ gradient and
+  the inner EBE η-gradient. Validated against finite differences of the production
+  predictor and against the independently NONMEM-anchored ODE twin. Modeled-dose ×
+  steady-state and rate-defined (`RATE=-1`) infusion under `F ≠ 1` remain on finite
+  differences (as on the ODE path).
+- **An `ExpressionScale` `obs_scale` divisor (e.g. `obs_scale = V`) combined with IOV on a
+  closed-form (analytical 1-/2-/3-cpt) model** now gets exact analytic FOCE/FOCEI
+  sensitivities on both the outer and inner loops instead of finite differences (#486). The
+  scale divisor is applied as a per-occasion-group post-walk quotient over the stacked
+  `(θ, η, κ)` axes — each occasion's divisor rides its own κ through the PK parameters —
+  porting the pattern already used on the ODE IOV path. Time-varying covariates compose
+  (the divisor stays subject-static, matching NONMEM's per-occasion `S1` scaling). LTBS and
+  constant `ScalarScale` under IOV continue to use finite differences.
+- **Custom / time-varying residual-error magnitude (`[error_model]` σ-scaling expression)
+  now gets an exact analytic gradient** on both loops instead of finite differences
+  (#484/#576/#486). The magnitude is η-independent, so the inner EBE gradient just
+  threads the per-observation multiplier into the residual variance and its
+  `f`-derivative; the FOCEI outer θ/σ population gradient additionally
+  dual-differentiates the compiled magnitude program w.r.t. θ, adding a new
+  *direct*-θ term to `∂R/∂θ` for any theta the magnitude expression references
+  (e.g. a late-phase RUV inflation `PROP_ERR * (1 + RUV_LATE * TIME/48)`).
+  Validated against a live NONMEM FOCEI fit (OFV and every estimate, including
+  `RUV_LATE`, match to ~4-5 significant figures — see `examples/warfarin_ruv_magnitude.ferx`).
+  Plain `method = foce` (non-interaction) now gets the analytic gradient too, on both
+  the non-IOV and IOV paths: the Sheiner–Beal marginal threads the magnitude into its
+  typical-value residual variance `R⁰` (value and direct-θ derivative), so `auto`
+  resolves a FOCE magnitude model to a gradient-based optimizer instead of BOBYQA. The
+  supported theta count is also raised from 16 to 32. `block_sigma` correlated residual
+  error, `iiv_on_ruv`, an M3-BLOQ censored row, and more than 32 thetas still fall back
+  to the (magnitude-aware) finite-difference gradient.
+- **`init(...)` initial conditions with time-varying covariates** now get exact analytic
+  FOCE/FOCEI sensitivities on the ODE path instead of finite differences (#486). The
+  event-driven walk seeds the dual initial state from the subject's first-record covariate
+  snapshot (matching the production predictor's `init_pk`), so a covariate- or η-dependent
+  baseline (e.g. `init(central) = BASE / V`) carries `∂/∂(θ,η)`. Analytic for the plain-bolus
+  subset; `init(...)` combined with an EVID 3/4 reset, an estimated lagtime, a finite
+  infusion, a built-in input-rate forcing, steady-state, or a modeled-duration/rate dose
+  stays on the finite-difference fallback.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`, `D{cmt}`/`R{cmt}`) under IOV** now get
   exact analytic FOCE/FOCEI sensitivities on the ODE path instead of finite differences
   (#486). Each occasion resolves its own modeled infusion window from the per-occasion PK
   jet, and the moving infusion-end boundary carries `∂/∂{θ,η,κ}` — including when the
-  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`). Steady-state modeled doses
-  stay on the finite-difference fallback for now.
+  modeled slot is itself κ-coupled (`D1 = TVD1·exp(η + κ)`).
+- Three more **steady-state (`SS=1`) ODE dosing** combinations now get exact analytic
+  FOCE/FOCEI sensitivities instead of finite differences (#486): a modeled-duration/rate
+  dose (`RATE=-1`/`-2`), a rate-defined infusion under bioavailability `F ≠ 1`, and an
+  estimated lagtime. The SS dual equilibration now threads the
+  same mode-aware rate/window jet the non-SS event-driven walk uses into its per-cycle
+  active/quiet split, and a lagged SS dose's pre-arrival window `[t_dose, t_dose+lag)` is
+  seeded from the previous interval's steady-state tail (mirroring the production
+  predictor's own pre-arrival seed). Only SS combined with a non-autonomous RHS (one that
+  reads `TIME`/`TAFD`/`TAD`) stays on the FD fallback — a time-invariant pulse train has no
+  well-defined steady state under a time-dependent RHS. See
+  [Steady-state dosing](model-file/steady-state.qmd).
 - A structural parameter that reads the event-time built-in `TIME`/`time` (a
   NONMEM-style `$PK IF (TIME.GE.45) CL=…` time-dependent switch) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
@@ -47,8 +161,9 @@ section of the SDLC for the versioning policy).
   with and without inter-occasion variability, including together with an
   η-dependent `obs_scale` expression (the event-driven walk now applies the scale
   quotient — which also makes time-varying-covariate + expression-scale models
-  analytic). Only the direct `pk(...=TIME)` mapping still falls back to finite
-  differences.
+  analytic). The direct `pk(...=TIME)` structural mapping is covered too: the parser
+  desugars the mapped slot into a hidden individual parameter (`__ferx_pktime_*`), so
+  it rides the same per-event analytic walk as an `[individual_parameters]` switch.
 - A Form-C ODE readout (`[scaling] y = <expr>`) that references a θ or η
   **directly** (e.g. `y = central/V1 * (1 + ETA_CL) + TVBASE`) now gets exact
   analytic FOCE/FOCEI sensitivities instead of falling back to finite differences
@@ -66,6 +181,23 @@ section of the SDLC for the versioning policy).
   subject covariate snapshot), and the EVID=2 breakpoint rides the event-driven
   walk that already carried it — closing the matching cells the IOV path gained in
   #590/#591. LTBS-combined `obs_scale` stays on the FD fallback.
+- **Built-in absorption input-rate forcing** (`igd`/`transit`/`weibull`/`first_order`/
+  `zero_order`, incl. `mixed`) combined with an **EVID 3/4 reset** now gets exact
+  analytic FOCE/FOCEI sensitivities instead of finite differences (#486): the fix
+  threads the already-tracked `reset_floor` into the shared forcing helper (turning
+  off a dose's pre-reset tail, matching the infusion rule) kind-agnostically, so
+  `zero_order`'s own separate per-segment window mechanism (#530) inherits it too.
+  `igd`/`transit`/`weibull`/`first_order` (but not `zero_order`/`mixed`) also now get
+  exact analytic sensitivities combined with **time-varying covariates**, via the
+  same helper wired into the event-driven walk, hoisting the forcing's
+  dose-invariant constants fresh per segment as the PK snapshot changes. Combined
+  with an **estimated lagtime**, `igd`/`transit`/`first_order` are also now
+  analytic: the continuous `∂R_in/∂lag` flows through the walk's dual
+  time-after-dose, and the forcing's onset at the dose's lagged arrival is
+  injected as an exact rate-on saltation. `weibull` stays on the FD fallback when
+  combined with lagtime (its onset can diverge for shape `β < 1`), as does
+  `zero_order`'s own moving-boundary cutoff combined with TV-cov or lagtime (a
+  separate per-segment mechanism not yet ported to the event-driven walk).
 - **Analytic transit-compartment absorption** (#386). A new `pk one_cpt_transit(cl, v, n, mtt)`
   structural model evaluates Savic (2007) transit absorption into a one-compartment disposition as
   an exponential-tilting closed form (the incomplete-gamma `convolve_1cpt`), with exact `Dual2`
@@ -396,6 +528,16 @@ section of the SDLC for the versioning policy).
   data clock everywhere — the model `TIME`/`T` builtin, `[derived]` columns,
   sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
   report the value in the data file; no per-subject time shift is applied.
+
+### Fixed
+- **Finite / modeled-duration infusions combined with a time-varying covariate that
+  changes across the infusion's end** now get an exact analytic second-order gradient
+  (#486). The rate-off boundary sits between records, so the RHS Jacobian jumps there;
+  the closed-form rate-off saltation assumed a single parameter set and dropped the
+  `(J⁺ − J⁻)·x` curvature term, biasing the FOCEI Hessian / covariance-step SEs by a few
+  percent (first-order gradient and OFV were unaffected). The infusion end now uses the
+  same general `g⁻ − g⁺` saltation as the zero-order window end. Cases without a covariate
+  varying across the infusion end are unchanged.
 
 ### Changed
 - For `block_sigma` correlated residual models, the SAEM reported OFV (the

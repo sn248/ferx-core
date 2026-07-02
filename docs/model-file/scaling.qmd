@@ -146,9 +146,12 @@ program — so the per-subject inner EBE loop is exact for an η-dependent expre
 serves an η-dependent `obs_scale` analytically on both loops: on the static walk since
 #486, on the **non-IOV time-varying-covariate** walk since #486 (the divisor is
 subject-static, so one subject-static jet is applied post-walk), for IOV since #575, and
-for IOV subjects that also have time-varying covariates since #590. The IOV
+for IOV subjects that also have time-varying covariates since #590. The **closed-form
+(analytical 1-/2-/3-compartment) IOV** path serves it analytically on both loops since
+#486 as well, including IOV subjects with time-varying covariates — the same per-occasion
+post-walk quotient the ODE IOV path uses. The IOV
 expression-scale quotient follows production semantics: the scale is
-evaluated once per occasion group with the subject-level covariate snapshot, while the ODE
+evaluated once per occasion group with the subject-level covariate snapshot, while the
 event walk still uses per-event covariate snapshots for the dynamics. Per-CMT
 `obs_scale[CMT=N]` falls outside the analytic provider's scope entirely, and ODE
 expression scaling combined with LTBS still routes to FD. Result-neutral — estimates and

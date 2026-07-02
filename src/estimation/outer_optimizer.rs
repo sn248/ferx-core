@@ -79,7 +79,7 @@ pub fn optimize_population(
     // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
     // branching). Every other variant is returned unchanged, so this is a no-op
     // unless the user left the default `auto` in place.
-    let resolved = options.optimizer.resolve_auto(model);
+    let resolved = options.optimizer.resolve_auto(model, options.interaction);
     let owned_opts;
     let options = if resolved == options.optimizer {
         options

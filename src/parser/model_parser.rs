@@ -1155,19 +1155,30 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     } else {
         Vec::new()
     };
-    // #486 — the `__ferx_ro_` prefix is reserved for these synthetic params.
-    // Reject a user/generated parameter that carries it rather than silently
-    // misclassifying it as internal (it would vanish from EBE/sdtab output and be
-    // rejected as an unknown output column by `is_synthetic_readout_param`).
+    // #486 — the `__ferx_ro_` (Form-C readout) and `__ferx_pktime_` (direct `pk(...=TIME)`
+    // mapping) prefixes are reserved for synthetic individual parameters. Reject a
+    // user/generated parameter that carries either rather than silently misclassifying it
+    // as internal (it would vanish from EBE/sdtab output and be rejected as an unknown
+    // output column by `is_synthetic_readout_param`). This runs before either desugaring
+    // appends its own synthetic params, so `all_assigned`/`theta_names`/`eta_names` hold
+    // only user names here.
     if let Some(bad) = all_assigned
         .iter()
         .chain(theta_names.iter())
         .chain(eta_names.iter())
         .find(|n| is_synthetic_readout_param(n.as_str()))
     {
+        let (prefix, reserved_for) = if bad.starts_with(PKTIME_SYNTH_PREFIX) {
+            (
+                PKTIME_SYNTH_PREFIX,
+                "internal `pk(...=TIME)` mapping parameters",
+            )
+        } else {
+            (READOUT_SYNTH_PREFIX, "internal Form-C readout parameters")
+        };
         return Err(format!(
-            "parameter name `{bad}` uses the reserved `{READOUT_SYNTH_PREFIX}` prefix, which ferx \
-             reserves for internal Form-C readout parameters (#486). Rename it."
+            "parameter name `{bad}` uses the reserved `{prefix}` prefix, which ferx \
+             reserves for {reserved_for} (#486). Rename it."
         ));
     }
     // #486 slot headroom: each synthetic readout param consumes a PK slot. A model
@@ -1242,7 +1253,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     let (
         pk_model,
-        pk_param_map,
+        mut pk_param_map,
         mut ode_spec,
         diffusion_theta_names,
         diffusion_theta_inits,
@@ -1352,6 +1363,36 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             Vec::new(),
         )
     };
+
+    // #486 — desugar a direct `pk(...=TIME)` structural mapping into a synthetic
+    // individual parameter (`__ferx_pktime_<pk_name> = TIME`), mirroring the Form-C
+    // readout θ/η desugaring (#631). A bare `pk(v=TIME)` binding otherwise leaves the
+    // mapped PK slot out of the individual-parameter program's `pk_slots`, so
+    // `prog_covers_required_pk_slots` declines and the whole model routes to FD (#637
+    // follow-up). Rewriting the binding to reference the synthetic parameter makes the
+    // slot ride the validated per-event `TIME` sensitivity chain (value = event time via
+    // `Op::PushTime`, ∂/∂θ = ∂/∂η = 0). Runs before `pk_indices` / `build_pk_param_fn`
+    // consume `indiv_var_names` / `indiv_stmts`.
+    {
+        let mut time_bound: Vec<String> = pk_param_map
+            .iter()
+            .filter(|(_, v)| v.as_str() == "TIME" || v.as_str() == "time")
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !time_bound.is_empty() {
+            // A user parameter carrying the reserved `__ferx_pktime_` prefix is already
+            // rejected by the shared synthetic-prefix guard above (it runs before either
+            // desugaring adds its own synthetic params, so it sees only user names).
+            // Sorted for deterministic slot/var order across runs.
+            time_bound.sort();
+            for pk_name in time_bound {
+                let synth = format!("{PKTIME_SYNTH_PREFIX}{}", pk_name.to_lowercase());
+                indiv_var_names.push(synth.clone());
+                indiv_stmts.push(Statement::Assign(synth.clone(), Expression::Time));
+                pk_param_map.insert(pk_name, synth);
+            }
+        }
+    }
 
     // Build the CovariateNn handles up front (before build_pk_param_fn, which
     // captures them in the pk_param_fn closure). The same vector is also
@@ -2277,17 +2318,19 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Compile per-sigma magnitude multipliers now that covariate names are
     // known (they validate the magnitude expressions). `None` for the common
     // case of bare sigmas — the legacy variance path is then taken verbatim.
-    {
+    let ruv_magnitude_used_thetas: std::collections::HashSet<usize> = {
         let ruv_theta_names = model.theta_names.clone();
         let ruv_eta_names = model.eta_names.clone();
-        model.ruv_magnitude = build_ruv_magnitude(
+        let (rm, used_thetas) = build_ruv_magnitude(
             &single_error_args,
             &ruv_sigma_names,
             &ruv_theta_names,
             &ruv_eta_names,
             &covariate_decls,
         )?;
-    }
+        model.ruv_magnitude = rm;
+        used_thetas
+    };
 
     // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
     // Unnamed: `[event_model]` — one TTE endpoint.
@@ -2350,7 +2393,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
-    // reported as unused in mixed PK+TTE models.
+    // reported as unused in mixed PK+TTE models. A theta referenced only from a
+    // custom RUV magnitude expression (#484/#576, e.g. `RUV_LATE`) is unioned in
+    // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
+    // now carries its direct-θ channel), just never seen by `indiv_stmts`.
+    event_model_used_thetas.extend(ruv_magnitude_used_thetas);
     // #486 — surface the FD fallback when a direct-θ/η readout could not be
     // desugared because the PK-slot layout was full (see the headroom check above).
     if let Some(note) = readout_fd_fallback_note.take() {
@@ -8692,38 +8739,103 @@ fn validate_ruv_expr(
     }
 }
 
+/// Lower a parsed magnitude expression to a `Dual1`-differentiable
+/// [`RuvMagDerivProgram`] over `θ` only (#576/#486): the magnitude is validated
+/// ([`validate_ruv_expr`]) to never reference `η`, an individual parameter, or an
+/// NN output, so — unlike [`compile_scale_deriv_program`] — there is no `η` axis
+/// and no `var_to_pk_slot` to feed in. The scaled sigma resolves to var slot `0`,
+/// pinned to the constant `1.0` at eval time (mirroring the runtime closure's
+/// `vars.insert(sigma_name, 1.0)`); covariates are sorted cov slots; `TIME` reads
+/// the event-time built-in. The input `expr` is cloned, so the caller keeps its
+/// AST for the runtime closure.
+fn compile_ruv_mag_deriv_program(
+    expr: &Expression,
+    sigma_name: &str,
+    n_theta: usize,
+) -> RuvMagDerivProgram {
+    let mut e = expr.clone();
+    // Slot 0 = the pinned scaled sigma (bound to 1.0 at eval time). Slot 1 =
+    // `MACHEPS`, which `validate_ruv_expr` explicitly permits inside a magnitude
+    // expression alongside the scaled sigma. `eval_expression` (the runtime
+    // f64 closure) special-cases the `MACHEPS` name string at eval time, but
+    // bytecode compilation resolves every `Variable` name to a fixed slot up
+    // front — so without a reserved slot here, `resolve_expr_indices` would map
+    // `MACHEPS` to `VariableIdx(usize::MAX)`, which silently evaluates to `0.0`
+    // instead of `f64::EPSILON` (mirrors the ODE var builder's `macheps_slot`).
+    let var_idx: HashMap<String, usize> = [
+        (sigma_name.to_string(), 0),
+        ("MACHEPS".to_string(), 1),
+        ("macheps".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
+    let mut cov_set = std::collections::HashSet::new();
+    collect_covariates(&e, &mut cov_set);
+    let mut cov_names: Vec<String> = cov_set.into_iter().collect();
+    cov_names.sort();
+    let cov_idx: HashMap<String, usize> = cov_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+    RuvMagDerivProgram {
+        bc: compile_bytecode(&e),
+        n_theta,
+        cov_names,
+    }
+}
+
 /// Build the custom residual-error magnitude (#484) from the single-endpoint
-/// `[error_model]` arguments, once covariate names are known. Returns `None`
+/// `[error_model]` arguments, once covariate names are known. Returns `(None, {})`
 /// when every argument is a bare sigma (the legacy variance path is then taken
 /// verbatim). Each non-bare argument compiles to a per-observation multiplier
-/// closure over `(theta, observation covariates, TIME)`.
+/// closure over `(theta, observation covariates, TIME)`, plus a `Dual1`
+/// θ-derivative program (#576/#486) so the analytic outer θ/σ gradient can
+/// differentiate the magnitude exactly instead of falling back to FD.
+///
+/// The second element is the set of theta indices any magnitude expression
+/// references — a theta that appears *only* in `[error_model]` (e.g. `RUV_LATE`)
+/// would otherwise trip `check_unused_parameters`'s "not referenced" warning,
+/// mirroring how `[event_model]` thetas are unioned in.
 fn build_ruv_magnitude(
     single_error_args: &Option<(ErrorModel, Vec<String>)>,
     sigma_names: &[String],
     theta_names: &[String],
     eta_names: &[String],
     covariate_decls: &Option<Vec<CovariateDecl>>,
-) -> Result<Option<RuvMagnitude>, String> {
+) -> Result<(Option<RuvMagnitude>, std::collections::HashSet<usize>), String> {
+    let mut used_thetas = std::collections::HashSet::new();
     let Some((_em, args)) = single_error_args else {
-        return Ok(None);
+        return Ok((None, used_thetas));
     };
     let allowed_covs: Option<Vec<String>> = covariate_decls
         .as_ref()
         .map(|d| d.iter().map(|c| c.name.clone()).collect());
     let mut per_sigma: Vec<Option<RuvMagFn>> = Vec::with_capacity(args.len());
+    let mut per_sigma_deriv: Vec<Option<RuvMagDerivProgram>> = Vec::with_capacity(args.len());
     let mut any = false;
     for arg in args {
         let sigma_name = arg_sigma_name(arg, sigma_names)?;
         let trimmed = arg.trim();
         if trimmed == sigma_name {
             per_sigma.push(None);
+            per_sigma_deriv.push(None);
             continue;
         }
         any = true;
         // The scaled sigma resolves to a `Variable` (bound to 1.0 at eval);
         // unknown identifiers fall back to model covariates. TIME/time parse
-        // as event-time built-ins.
-        let defined = [sigma_name.clone()];
+        // as event-time built-ins. `MACHEPS`/`macheps` must resolve to a
+        // `Variable` too (not fall through to `Covariate`) — `validate_ruv_expr`'s
+        // `Variable` arm already permits it, but without a `defined_vars` entry
+        // the parser would classify it as an (undeclared, rejected) covariate
+        // instead, since this context sets `fallback_covariate: true` (#486 review).
+        let defined = [
+            sigma_name.clone(),
+            "MACHEPS".to_string(),
+            "macheps".to_string(),
+        ];
         let ctx = ParseCtx {
             theta_names,
             eta_names,
@@ -8735,6 +8847,16 @@ fn build_ruv_magnitude(
         let expr = parse_scalar_expression(trimmed, ctx)
             .map_err(|e| format!("[error_model] magnitude `{}`: {}", trimmed, e))?;
         validate_ruv_expr(&expr, &sigma_name, allowed_covs.as_deref())?;
+        visit_expr_nodes(&expr, &mut |e: &Expression| {
+            if let Expression::Theta(i) = e {
+                used_thetas.insert(*i);
+            }
+        });
+        per_sigma_deriv.push(Some(compile_ruv_mag_deriv_program(
+            &expr,
+            &sigma_name,
+            theta_names.len(),
+        )));
         let sig = sigma_name.clone();
         let f: RuvMagFn = Box::new(move |theta, obs_cov, time| {
             let mut vars: HashMap<String, f64> = HashMap::new();
@@ -8751,11 +8873,15 @@ fn build_ruv_magnitude(
         });
         per_sigma.push(Some(f));
     }
-    if any {
-        Ok(Some(RuvMagnitude { per_sigma }))
+    let rm = if any {
+        Some(RuvMagnitude {
+            per_sigma,
+            per_sigma_deriv,
+        })
     } else {
-        Ok(None)
-    }
+        None
+    };
+    Ok((rm, used_thetas))
 }
 
 // --- Individual parameter function builder ---
@@ -8874,7 +9000,6 @@ fn build_pk_param_fn(
     pk_entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
     let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
-    let mut pk_time_mapping: Vec<usize> = Vec::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -8888,9 +9013,11 @@ fn build_pk_param_fn(
             .get(var_name)
             .copied()
             .or_else(|| var_idx.get(&var_name.to_lowercase()).copied());
-        if var_name == "TIME" || var_name == "time" {
-            pk_time_mapping.push(pk_slot);
-        } else if let Some(var_slot) = var_slot {
+        // A direct `pk(...=TIME)` binding is desugared into a synthetic
+        // `__ferx_pktime_*` individual parameter upstream in `parse_full_model` (#486),
+        // so `var_name` is that synthetic name here (resolved via `var_idx` below), never
+        // a literal `TIME`.
+        if let Some(var_slot) = var_slot {
             pk_assignment_mapping.push((pk_slot, var_slot));
         } else if let Ok(c) = var_name.parse::<f64>() {
             // A numeric literal binds the slot to a constant — but `f64::from_str`
@@ -8972,12 +9099,26 @@ fn build_pk_param_fn(
     };
 
     let pk_var_slots = if is_analytical_pk {
-        pk_assignment_mapping.clone()
+        // Structural PK params (CL, V, …) plus any modeled-dose `D{cmt}`/`R{cmt}`
+        // slots (#486). The latter are not read by the closed-form kernels, but the
+        // analytic-sensitivity chain needs their `∂/∂(θ,η)` (+ 2nd order) rows so the
+        // event-driven walk can seed the modeled infusion rate/window dual
+        // (`pk_slot_dual_outer` looks the slot up in `pk_slots`). Appended after the
+        // structural slots so the row order stays stable; empty for a model with no
+        // modeled dose, so this is a no-op there. A fixed-dose subject of such a model
+        // routes to superposition, where the extra slot is seeded but unread (its
+        // kernel derivative is 0), so it is harmless.
+        let mut m = pk_assignment_mapping.clone();
+        m.extend(analytical_extra_mapping.iter().copied());
+        m
     } else {
         ode_assignment_mapping.clone()
     };
     let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
-    let uses_time_builtin = stmts_use_time || !pk_time_mapping.is_empty();
+    // A direct `pk(...=TIME)` mapping is desugared into a `__ferx_pktime_* = TIME`
+    // statement upstream (#486), so `stmts_use_time` already covers it — no separate
+    // literal-TIME-binding term is needed.
+    let uses_time_builtin = stmts_use_time;
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
@@ -9000,11 +9141,11 @@ fn build_pk_param_fn(
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64| {
             // Resolve the `TIME` built-in from the event time the caller passed.
-            // `Expression::Time` / `Op::PushTime` and the analytical
-            // `pk_time_mapping` slots read the model-time thread-local, so set
-            // it here for the duration of this evaluation. Gated on
-            // `uses_time_builtin` so models that don't use the built-in (the
-            // common case) pay nothing for the guard (#610).
+            // `Expression::Time` / `Op::PushTime` (including the desugared
+            // `__ferx_pktime_* = TIME` parameters, #486) read the model-time
+            // thread-local, so set it here for the duration of this evaluation. Gated
+            // on `uses_time_builtin` so models that don't use the built-in (the common
+            // case) pay nothing for the guard (#610).
             let _time_guard = uses_time_builtin.then(|| ModelTimeGuard::enter(time));
             // Pre-compute each NN's forward output once per call. The
             // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
@@ -9070,9 +9211,6 @@ fn build_pk_param_fn(
                     // per-call evaluation, just write the parsed value.
                     for &(pk_slot, c) in &pk_const_mapping {
                         p.values[pk_slot] = c;
-                    }
-                    for &pk_slot in &pk_time_mapping {
-                        p.values[pk_slot] = current_model_time();
                     }
                     // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
                     // each duration parameter into its reserved spare slot so the
@@ -9502,11 +9640,17 @@ fn collect_theta_eta_in_stmts(
 /// suppress these internal parameters — they are not user-declared quantities.
 pub(crate) const READOUT_SYNTH_PREFIX: &str = "__ferx_ro_";
 
-/// True for an individual-parameter name synthesized by the Form-C readout θ/η
-/// desugaring (see [`READOUT_SYNTH_PREFIX`]). User-facing per-subject output skips
-/// these so the synthetic parameters never surface as sdtab / fit-output columns.
+/// Reserved prefix for the individual parameter synthesized by desugaring a direct
+/// `pk(...=TIME)` structural mapping (`__ferx_pktime_<pk_name> = TIME`, #486). Like the
+/// readout prefix, it lets EBE / diagnostic output suppress the internal parameter.
+pub(crate) const PKTIME_SYNTH_PREFIX: &str = "__ferx_pktime_";
+
+/// True for a ferx-internal synthetic individual parameter — either a Form-C readout θ/η
+/// desugaring ([`READOUT_SYNTH_PREFIX`]) or a direct `pk(...=TIME)` mapping desugaring
+/// ([`PKTIME_SYNTH_PREFIX`]). User-facing per-subject output skips these so the synthetic
+/// parameters never surface as sdtab / fit-output columns.
 pub(crate) fn is_synthetic_readout_param(name: &str) -> bool {
-    name.starts_with(READOUT_SYNTH_PREFIX)
+    name.starts_with(READOUT_SYNTH_PREFIX) || name.starts_with(PKTIME_SYNTH_PREFIX)
 }
 
 /// A θ/η reference desugared out of a Form-C readout into a synthetic individual
@@ -11807,6 +11951,136 @@ impl ScaleDerivProgram {
     }
 }
 
+/// Differentiable form of a custom residual-error magnitude slot (#484/#576/#486):
+/// the magnitude expression compiled to bytecode, evaluable over `Dual1<M>` seeded
+/// on `θ` only. Unlike [`ScaleDerivProgram`] the magnitude never depends on `η` or
+/// an individual parameter (`validate_ruv_expr` rejects both), so there is a single
+/// var slot — the scaled sigma, pinned to the constant `1.0` — and no
+/// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
+/// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
+/// FD for a custom / time-varying σ magnitude.
+pub struct RuvMagDerivProgram {
+    bc: Bytecode,
+    n_theta: usize,
+    cov_names: Vec<String>,
+}
+
+/// Axis cap for the `Dual1<M>` dispatch table in [`RuvMagDerivProgram::theta_grad`]
+/// (same const-generic-dispatch convention as `MAX_SCALE_AXES` / `MAX_ODE_AXES`,
+/// but set higher — the magnitude program's bytecode evaluator is cheap to
+/// monomorphize, and covering realistic large-θ population models keeps the
+/// magnitude direct-θ channel analytic rather than dropping to FD, #486). A model
+/// with more thetas than this falls back to FD for the magnitude's direct-θ
+/// gradient channel — `analytic_outer_gradient_available` bounds `model.n_theta`
+/// against this constant when a custom magnitude is active.
+pub(crate) const MAX_RUV_MAG_AXES: usize = 32;
+
+impl RuvMagDerivProgram {
+    /// `∂(magnitude)/∂θ` at `theta` (with the observation's covariates and raw
+    /// TIME), dispatching the const-generic `Dual1<M>` eval on `theta.len()`.
+    /// `None` when `theta.len()` exceeds [`MAX_RUV_MAG_AXES`] or does not match
+    /// the program's own `n_theta` (caller falls back to FD).
+    pub(crate) fn theta_grad(
+        &self,
+        theta: &[f64],
+        cov: &HashMap<String, f64>,
+        time: f64,
+    ) -> Option<Vec<f64>> {
+        use crate::sens::dual1::Dual1;
+        if theta.len() != self.n_theta {
+            return None;
+        }
+        if theta.is_empty() {
+            return Some(Vec::new());
+        }
+        // Mirror the runtime `RuvMagFn` closure's `TIME`/`time` covariate-map
+        // injection: a legacy pre-built expression may still carry `TIME` as an
+        // `Expression::Covariate` node (parsed models use the `Expression::Time`
+        // built-in, read directly from `time` via `Op::PushTime`, and never reach
+        // this branch) — without it, such a `cov_name` would look up the
+        // observation's covariate map (which never carries a literal "TIME" key)
+        // and silently default to `0.0` instead of the actual observation time.
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| {
+                if n.eq_ignore_ascii_case("TIME") {
+                    time
+                } else {
+                    cov.get(n).copied().unwrap_or(0.0)
+                }
+            })
+            .collect();
+        // `theta_d`/`prog_vars` are exactly `$n`-sized at each dispatch arm (unlike
+        // `ScaleDerivProgram::eval_scale_dual1`'s padded-to-N buffers), so a plain
+        // stack array avoids the sibling's per-call heap `Vec` for the axis-bounded
+        // pieces (#486 review); `cov_vec`/`stack` stay on the heap, matching that
+        // sibling's own precedent — they are not axis-bounded.
+        macro_rules! run {
+            ($n:literal) => {{
+                let mut theta_d = [Dual1::<$n>::constant(0.0); $n];
+                for (m, d) in theta_d.iter_mut().enumerate() {
+                    *d = Dual1::var(theta[m], m);
+                }
+                // Slot 0 = the pinned scaled sigma (1.0); slot 1 = MACHEPS.
+                let prog_vars = [
+                    Dual1::<$n>::constant(1.0),
+                    Dual1::<$n>::constant(f64::EPSILON),
+                ];
+                let empty_nn: Vec<Vec<f64>> = Vec::new();
+                let mut stack: Vec<Dual1<$n>> = Vec::new();
+                let d = with_model_time(time, || {
+                    eval_bytecode_g::<Dual1<$n>>(
+                        &self.bc,
+                        &theta_d,
+                        &[],
+                        &cov_vec,
+                        &prog_vars,
+                        &empty_nn,
+                        &mut stack,
+                    )
+                });
+                d.grad.to_vec()
+            }};
+        }
+        Some(match theta.len() {
+            1 => run!(1),
+            2 => run!(2),
+            3 => run!(3),
+            4 => run!(4),
+            5 => run!(5),
+            6 => run!(6),
+            7 => run!(7),
+            8 => run!(8),
+            9 => run!(9),
+            10 => run!(10),
+            11 => run!(11),
+            12 => run!(12),
+            13 => run!(13),
+            14 => run!(14),
+            15 => run!(15),
+            16 => run!(16),
+            17 => run!(17),
+            18 => run!(18),
+            19 => run!(19),
+            20 => run!(20),
+            21 => run!(21),
+            22 => run!(22),
+            23 => run!(23),
+            24 => run!(24),
+            25 => run!(25),
+            26 => run!(26),
+            27 => run!(27),
+            28 => run!(28),
+            29 => run!(29),
+            30 => run!(30),
+            31 => run!(31),
+            32 => run!(32),
+            _ => return None,
+        })
+    }
+}
+
 /// Walk the AST in `stmts` and replace every `Statement::Assign(name, e)`
 /// with `Statement::AssignIdx(idx, e)`, every `Expression::Variable(name)`
 /// with `Expression::VariableIdx(idx)`, and every `Expression::Covariate(name)`
@@ -13430,6 +13704,57 @@ fn parse_if_statement(
 mod tests {
     use super::*;
 
+    /// #486: the residual-magnitude direct-θ program dispatches its `Dual1<M>`
+    /// evaluator for every axis count up to [`MAX_RUV_MAG_AXES`] (raised past 16),
+    /// and declines (`None`, caller → FD) only beyond it. `mult = θ_last · σ̂` (σ̂
+    /// pinned to 1.0), so `∂mult/∂θ_last = 1` and all other axes are 0 — a cheap
+    /// exact check that each newly-added dispatch arm is wired.
+    #[test]
+    fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
+        use std::collections::HashMap;
+        assert!(MAX_RUV_MAG_AXES >= 17, "cap must be raised past the old 16");
+        let cov = HashMap::new();
+        // Every axis count up to the cap — exercises each `Dual1<M>` dispatch arm.
+        for n in 1..=MAX_RUV_MAG_AXES {
+            let expr = Expression::BinOp(
+                Box::new(Expression::Theta(n - 1)),
+                BinOp::Mul,
+                Box::new(Expression::Variable("PROP".to_string())),
+            );
+            let prog = compile_ruv_mag_deriv_program(&expr, "PROP", n);
+            let theta = vec![0.5f64; n];
+            let grad = prog
+                .theta_grad(&theta, &cov, 0.0)
+                .unwrap_or_else(|| panic!("theta_grad must dispatch for n_theta = {n}"));
+            assert_eq!(grad.len(), n);
+            assert!(
+                (grad[n - 1] - 1.0).abs() < 1e-9,
+                "∂mult/∂θ_last = 1 (n={n})"
+            );
+            for (i, g) in grad.iter().enumerate() {
+                if i != n - 1 {
+                    assert!(
+                        g.abs() < 1e-9,
+                        "off-axis derivative must be 0 (n={n}, i={i})"
+                    );
+                }
+            }
+        }
+        // Beyond the cap → None, so the outer gradient falls back to FD.
+        let over = MAX_RUV_MAG_AXES + 1;
+        let expr = Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            Box::new(Expression::Variable("PROP".to_string())),
+        );
+        let prog = compile_ruv_mag_deriv_program(&expr, "PROP", over);
+        assert!(
+            prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0)
+                .is_none(),
+            "n_theta beyond MAX_RUV_MAG_AXES must decline to FD"
+        );
+    }
+
     // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 
     /// Parse `src`, asserting it fails; returns the error message. (`ParsedModel`
@@ -14738,6 +15063,78 @@ mod tests {
                 .any(|w| w.contains("computed but never used") && w.contains("`KEL`")),
             "without the [derived] use KEL must be flagged dead: {:?}",
             p2.model.parse_warnings
+        );
+    }
+
+    /// #486 regression: the synthetic `__ferx_pktime_*` parameter a direct
+    /// `pk(...=TIME)` mapping desugars into must be exempt from the "computed but never
+    /// used" census (like the `__ferx_ro_*` readout synthetics). The census tokenizes the
+    /// raw block text, which still reads `q=TIME` (never `q=__ferx_pktime_q`), so the
+    /// synthetic name looks unreferenced — only the `is_synthetic_readout_param` prefix
+    /// match keeps it from being flagged. If that exemption is ever dropped, every direct
+    /// `pk(...=TIME)` model would tell users to remove a load-bearing parameter.
+    #[test]
+    fn direct_pk_time_synth_param_not_flagged_unused() {
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV1(10.0, 0.1, 1000.0)
+  theta TVV2(20.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  V2 = TVV2
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let p = super::parse_full_model(src).expect("parse ok");
+        assert!(
+            !p.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "direct pk(q=TIME) must not flag the synthetic __ferx_pktime_q as dead: {:?}",
+            p.model.parse_warnings
+        );
+    }
+
+    /// #486: a user parameter using the reserved `__ferx_pktime_` prefix is rejected, and
+    /// the message names the *correct* prefix and feature (`pk(...=TIME)`), not the Form-C
+    /// readout prefix — even though the shared guard also matches the readout prefix.
+    #[test]
+    fn reserved_pktime_prefix_rejected_with_correct_message() {
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  __ferx_pktime_cl = TVCL * exp(ETA_CL)
+
+[structural_model]
+  pk one_cpt_iv(cl=__ferx_pktime_cl, v=10.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = super::parse_full_model(src)
+            .err()
+            .expect("reserved prefix must be rejected");
+        assert!(
+            err.contains(PKTIME_SYNTH_PREFIX),
+            "message must name the pktime prefix: {err}"
+        );
+        assert!(
+            err.contains("pk(...=TIME)"),
+            "message must name the pk(...=TIME) feature, not Form-C readout: {err}"
         );
     }
 
@@ -17195,6 +17592,112 @@ mod tests {
         assert!((m_early[1] - 1.0).abs() < 1e-12);
         assert!((m_late[0] - 1.5).abs() < 1e-12);
         assert!((m_late[1] - 1.0).abs() < 1e-12);
+    }
+
+    /// A theta referenced only from an `[error_model]` magnitude expression
+    /// (e.g. `RUV_LATE`, never used in `[individual_parameters]`) must not trip
+    /// the "declared but not referenced" warning — it *is* meaningfully
+    /// estimated, via the magnitude's direct-θ channel (#484/#576/#486).
+    #[test]
+    fn test_ruv_magnitude_theta_not_flagged_as_unused() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_LATE(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+"#;
+        let model = parse_model_string(content).unwrap();
+        assert!(model.has_custom_ruv_magnitude());
+        let warns: Vec<_> = model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("RUV_LATE"))
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "RUV_LATE is used by the magnitude expression, got: {:?}",
+            warns
+        );
+    }
+
+    /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
+    /// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
+    /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
+    /// for it now. Regression case: `WT + MACHEPS` guards a denominator; at
+    /// `WT = 0.0` the pre-fix bug (`MACHEPS` silently resolving to `0.0` in the
+    /// bytecode path) would divide by exactly zero and produce a non-finite
+    /// `∂mult/∂θ`.
+    #[test]
+    fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_LATE(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE / (WT + MACHEPS)))
+[covariates]
+  WT continuous
+"#;
+        let model = parse_model_string(content).unwrap();
+        let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+        let deriv = rm.per_sigma_deriv[0]
+            .as_ref()
+            .expect("prop slot has a deriv program");
+
+        let theta = vec![0.2, 10.0, 1.5];
+        let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
+        let grad = deriv
+            .theta_grad(&theta, &cov_zero, 10.0)
+            .expect("theta_grad supported");
+        assert!(
+            grad.iter().all(|g| g.is_finite()),
+            "MACHEPS must guard the WT=0 denominator, got {:?}",
+            grad
+        );
+        // ∂mult/∂RUV_LATE = 1/(WT+MACHEPS) = 1/EPSILON — a large but finite value.
+        approx::assert_relative_eq!(grad[2], 1.0 / f64::EPSILON, max_relative = 1e-9);
+    }
+
+    /// xhigh review: a *legacy* pre-built magnitude expression that still
+    /// represents `TIME` as an `Expression::Covariate("TIME")` node (rather than
+    /// the `Expression::Time` built-in every parsed `.ferx` model produces) must
+    /// still resolve `TIME` to the observation time in `theta_grad`, mirroring the
+    /// runtime `RuvMagFn` closure's `cov.insert("TIME", time)` injection. Without
+    /// it, `cov_vec` would look up "TIME" in the (never-populated) observation
+    /// covariate map and silently default to `0.0`.
+    #[test]
+    fn test_ruv_magnitude_deriv_program_resolves_time_as_covariate_node() {
+        // RUV_LATE * TIME, built directly as an AST (bypassing the parser, which
+        // would emit `Expression::Time` instead) to exercise the legacy branch.
+        let expr = Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            Box::new(Expression::Covariate("TIME".to_string())),
+        );
+        let deriv = compile_ruv_mag_deriv_program(&expr, "UNUSED_SIGMA", 1);
+        let empty_cov = std::collections::HashMap::new();
+        let grad = deriv
+            .theta_grad(&[2.0], &empty_cov, 10.0)
+            .expect("theta_grad supported");
+        // d(RUV_LATE * TIME)/d(RUV_LATE) = TIME = 10.0, not 0.0.
+        approx::assert_relative_eq!(grad[0], 10.0, max_relative = 1e-12);
     }
 
     #[test]

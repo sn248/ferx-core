@@ -1120,11 +1120,16 @@ pub fn foce_subject_nll_standard(
 
     // M3 BLOQ under FOCE: the censored rows leave the Sheiner–Beal marginal (R̃ and
     // the quadratic form are built over the quantified rows only) and re-enter as
-    // `−logΦ((LLOQ − f(η̂))/√R⁰)` — the univariate marginal CDF, with R at the
-    // population η (no interaction). Plain FOCE (this path) has no `log|H̃|` term at
-    // all, so censored rows only ever enter its data term. FOCEI
-    // (`foce_subject_nll_interaction`) does the opposite — it now folds the censored
-    // curvature into `H̃` (see `cens_hess`) — so the two paths deliberately diverge.
+    // the univariate marginal tail probability `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)`, using the
+    // SAME linearized-marginal moments the quantified rows use: the marginal mean
+    // `f0 = f(η̂) − Hη̂` and the marginal variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰ⱼ` (#646).
+    // This keeps FOCE a consistent Sheiner–Beal (linearized-marginal) objective —
+    // matching Monolix's linearization likelihood and first-order/Tobit theory —
+    // in contrast to FOCEI (`foce_subject_nll_interaction`), a *conditional* first-order
+    // method whose censored term stays at the conditional `f(η̂)`/`R⁰` and instead folds
+    // the censored curvature into `H̃` (see `cens_hess`, #486) — the same conditional
+    // treatment NONMEM's LAPLACE M3 uses, at FOCEI Gauss-Newton order (dropping the
+    // `∂²f/∂η²` term full Laplace keeps).
     let m3 = matches!(bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let quant: Vec<usize> = if m3 {
         (0..n_obs)
@@ -1139,11 +1144,14 @@ pub fn foce_subject_nll_standard(
         for j in 0..n_obs {
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if cens != 0 {
-                // `m3_logcdf` selects the tail from the CENS sign: lower tail for
-                // below-LLOQ (`cens > 0`), upper tail `(f − ULOQ)/sd` for above-ULOQ
-                // (`cens < 0`). `subject.observations[j]` holds the censoring limit.
+                // Marginal variance R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰ⱼ (Hⱼ = row j of the inner
+                // Jacobian ∂f/∂η). `m3_logcdf` selects the tail from the CENS sign:
+                // lower for below-LLOQ (`cens > 0`), upper for above-ULOQ (`cens < 0`);
+                // `subject.observations[j]` holds the censoring limit.
+                let hj = h_matrix.row(j).transpose();
+                let rtilde_jj = hj.dot(&(&omega.matrix * &hj)) + r_diag[j];
                 bloq_term +=
-                    -2.0 * m3_logcdf(subject.observations[j], ipreds[j], r_diag[j].sqrt(), cens);
+                    -2.0 * m3_logcdf(subject.observations[j], f0[j], rtilde_jj.sqrt(), cens);
             }
         }
     }
@@ -1876,9 +1884,10 @@ pub fn foce_subject_nll_iov(
     // M3 no longer force-promotes IOV-FOCE subjects to interaction (#591, mirroring the
     // non-IOV `foce_subject_nll` change in #367/8abadbb7): plain FOCE keeps a consistent
     // FOCE (Sheiner–Beal) objective for the whole subject — the censored rows leave the
-    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as
-    // `−logΦ((LLOQ−f̂)/√R⁰)` data terms with the population (η=0, κ=0) variance. FOCEI still
-    // takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
+    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as the
+    // marginal tail `−logΦ((LLOQ−f0)/√R̃ⱼⱼ)`, R̃ⱼⱼ = Hⱼ Σ_b Hⱼᵀ + R⁰ⱼ over the stacked
+    // [η, κ] system (#646, the same linearized-marginal moments the quantified rows use).
+    // FOCEI still takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
     // optima, matching NONMEM METHOD=1 LAPLACE with vs without INTER. (Previously a
     // censored subject was silently evaluated with η-interaction even under FOCE, mixing a
     // Sheiner–Beal marginal with a FOCEI censored term.) The censored rows are now routed
@@ -2898,6 +2907,52 @@ mod tests {
             nll_f0 - nll_override > 20.0,
             "override must change the SB marginal (R evaluated at f(η=0), not f0): \
              nll_f0={nll_f0}, nll_override={nll_override}"
+        );
+    }
+
+    /// #646: FOCE (Sheiner–Beal) M3 censored rows must use the linearized-marginal
+    /// variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰`, not the conditional residual `R⁰`. With the
+    /// quantified rows' Jacobian zeroed, the quant SB marginal `R̃ = R` is
+    /// Ω-independent, so the objective can only depend on Ω through the censored
+    /// row's marginal variance. The old conditional censored term (√R⁰) would give
+    /// an identical NLL for any Ω; the marginal term must not.
+    #[test]
+    fn foce_m3_censored_uses_marginal_variance() {
+        let mut subject = make_simple_subject();
+        subject.cens = vec![0, 0, 0, 0, 0, 1]; // last row below-LLOQ
+        subject.observations[5] = 5.0; // LLOQ limit
+        let sigma = vec![3.0]; // additive SD → R⁰ = 9, Ω-independent
+        let error_spec = ErrorSpec::Single(ErrorModel::Additive);
+        let ipreds = vec![50.0, 40.0, 30.0, 45.0, 35.0, 8.0];
+        let eta_hat = DVector::from_vec(vec![0.5]);
+        // Quant rows H=0 (their R̃ = R is Ω-independent); censored row H = 4 ≠ 0.
+        let h_matrix = DMatrix::from_column_slice(6, 1, &[0.0, 0.0, 0.0, 0.0, 0.0, 4.0]);
+        let call = |omega: &OmegaMatrix| {
+            foce_subject_nll_standard(
+                &subject,
+                &ipreds,
+                &eta_hat,
+                &h_matrix,
+                omega,
+                &sigma,
+                &error_spec,
+                &[],
+                BloqMethod::M3,
+                &[],
+                None,
+                None,
+                None,
+            )
+        };
+        let nll_small = call(&make_omega(0.01));
+        let nll_large = call(&make_omega(1.0));
+        assert!(nll_small.is_finite() && nll_large.is_finite());
+        // Marginal variance grows with Ω (H²·Ω = 16·Ω), widening the censored tail,
+        // so the two NLLs must differ well above FP noise. (Old conditional → equal.)
+        assert!(
+            (nll_small - nll_large).abs() > 1e-3,
+            "censored term must depend on Ω via the marginal variance (#646): \
+             nll(Ω=0.01)={nll_small}, nll(Ω=1.0)={nll_large}"
         );
     }
 

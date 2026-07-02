@@ -479,12 +479,37 @@ by the same mechanism, but on the *event-driven* walk.
 The two paths differ in what keeps them analytic. A **modeled-duration / -rate dose**
 stays analytic when composed with an estimated lagtime (the start *and* end
 saltations carry the combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying
-covariates, or multiple doses — only a *steady-state* modeled dose or one under IOV
-falls back to finite differences. The **`zero_order(dur)` forcing** rides the static
-walk, which has a narrower analytic scope: it stays analytic across multiple doses
-and a mixed (zero- + first-order) pathway, but reverts to **finite differences** when
-combined with an estimated lagtime, an EVID 3/4 reset, or time-varying covariates.
+covariates, multiple doses, **IOV**, or a **steady-state** dose (the dual SS
+equilibration threads the modeled-window jet into each cycle's active/quiet split, on
+both the ODE and closed-form paths, #486) — only a rate-defined `RATE=-1` infusion
+under `F ≠ 1` falls back to finite differences. The **`zero_order(dur)` forcing** is analytic across
+multiple doses, a mixed (zero- + first-order) pathway, and an EVID 3/4 reset (#486 —
+the reset case is kind-agnostic, so `zero_order` inherits it too) on the static walk,
+and its moving-boundary window is now also carried on the **event-driven** walk, so it
+stays analytic combined with an estimated **lagtime** or **time-varying covariates**
+(#486): the constant `F·amt·frac/dur` window is delivered per segment there, its
+moving end `d.time + lag + dur` (and, under lagtime, its moving start) injected as the
+same rate-on / rate-off saltations used for infusions. Under a covariate that varies
+*across* the window end the rate-off uses the general `g⁻ − g⁺` saltation (the RHS
+Jacobian jumps across the boundary too, not just the forcing). Because the IOV walk is
+the same event-driven walk, `zero_order`/`mixed` are analytic under **IOV** too (#486 —
+each forcing's rate/window is rebuilt from its dose's own occasion-seeded PK jet); only
+their combination with a **steady-state** dose stays on finite differences (the dual SS
+equilibration does not spread a periodic zero-order window over the cycle).
 See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
+
+The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
+*wider* analytic scope combined with an EVID 3/4 reset or time-varying covariates:
+all four stay analytic there (#486) — the reset case turns off a dose's pre-reset
+tail exactly like the infusion rule, and the TV-cov case hoists the forcing's
+constants fresh per segment on the event-driven walk. Combined with an **estimated
+lagtime**, `igd`/`transit`/`first_order` are *also* analytic (#486): the continuous
+`∂R_in/∂lag` rides the walk's dual time-after-dose, and the forcing's onset at the
+dose's lagged arrival is injected as an exact rate-on saltation — the sign-mirror of
+the `zero_order` rate-off saltation above, generalised from a constant rate to
+`R_in(0⁺)`. `weibull` + lagtime still falls back to finite differences: its onset can
+diverge for shape `β < 1` (an integrable spike, not a finite jump), so no closed-form
+saltation exists there.
 :::
 
 ### Worked examples
@@ -565,9 +590,18 @@ alongside a `first_order` one) keep **exact analytic** (`Dual2`) FOCE/FOCEI
 gradients — including the derivatives with respect to the pathway fraction and the
 zero-order **duration**: the moving-boundary `∂/∂dur` is carried by the rate-off
 saltation at the cutoff
-([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)). As for a plain
-`zero_order` model, this reverts to finite differences only in combination with an
-estimated lagtime, an EVID 3/4 reset, or time-varying covariates.
+([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)). Both families are now
+analytic combined with an EVID 3/4 reset, **time-varying covariates**, *or* an
+estimated **lagtime** (#486): **`parallel`** (two `first_order` terms, no `zero_order`)
+because every forcing feeding the compartment is a smooth density carried on the
+event-driven walk; **`mixed`** because that walk now also carries the `zero_order`
+term's moving-boundary window (delivered as a per-segment constant, with rate-on /
+rate-off saltations at its moving start / end). In the `mixed` case the two forcings
+switch on together at the lagged arrival, so their onset saltations sum on the shared
+compartment. The **IOV** path shares this same event-driven walk, so `zero_order` /
+`mixed` (and `parallel`) are analytic under IOV too (#486); only their combination with
+a **steady-state** dose keeps a model on finite differences (the dual SS equilibration
+does not spread a periodic zero-order window / first-order tail over the cycle).
 
 ### Worked examples
 

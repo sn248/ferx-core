@@ -4166,7 +4166,13 @@ fn fit_inner(
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
             if options.optimizer == Optimizer::Auto {
-                format!("auto ({})", options.optimizer.resolve_auto(model).label())
+                format!(
+                    "auto ({})",
+                    options
+                        .optimizer
+                        .resolve_auto(model, options.interaction)
+                        .label()
+                )
             } else {
                 options.optimizer.label().to_string()
             }
@@ -7007,7 +7013,7 @@ mod iov_integration {
         let opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
         assert_iov_fit_ok(&result);
-        let resolved = Optimizer::Auto.resolve_auto(&model);
+        let resolved = Optimizer::Auto.resolve_auto(&model, false);
         assert_eq!(result.optimizer, format!("auto ({})", resolved.label()));
         assert_eq!(resolved, Optimizer::Bobyqa);
     }
@@ -7130,7 +7136,7 @@ mod iov_integration {
         // seeding built-in BFGS at the optimum converges fine — so it was
         // optimizer basin-capture, not an ODE-IOV gradient defect. See #439/#486.
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&ode),
+            Optimizer::Auto.resolve_auto(&ode, false),
             Optimizer::NloptLbfgs,
             "ODE IOV twin should resolve `auto` to the analytic-gradient L-BFGS"
         );

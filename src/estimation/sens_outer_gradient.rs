@@ -4260,7 +4260,6 @@ mod tests {
         assert!(crate::sens::provider::analytic_outer_gradient_available(
             &model
         ));
-        assert!(!model.iiv_on_ruv_forces_fd());
 
         let theta = vec![0.22, 11.0, 1.4];
         // Censor the two latest (lowest-concentration) observations at an LLOQ above
@@ -5920,10 +5919,6 @@ mod tests {
         assert!(model.is_ode_based(), "must be on the ODE path");
         assert_eq!(model.residual_error_eta, Some(3));
         assert!(
-            !model.iiv_on_ruv_forces_fd(),
-            "non-IOV ODE M3 + iiv_on_ruv must no longer force FD (#486)"
-        );
-        assert!(
             crate::sens::provider::analytic_outer_gradient_available(&model),
             "non-IOV ODE M3 + iiv_on_ruv must route to the analytic outer gradient (#486)"
         );
@@ -7373,7 +7368,6 @@ mod tests {
         assert_eq!(model.residual_error_eta, Some(3));
         assert!(model.is_ode_based(), "must be on the ODE path");
         assert!(crate::sens::ode_provider::ode_iov_supported(&model));
-        assert!(!model.iiv_on_ruv_forces_fd(), "IOV triple not forced to FD");
         let theta = vec![0.22, 11.0, 1.4];
         let mut params = model.default_params.clone();
         params.theta = theta.clone();

@@ -540,6 +540,13 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
+- **A `one_cpt_transit` model with a `TIME`-dependent structural parameter** is now
+  rejected up front (`fit()` returns an error; `predict()`/`simulate()` panic) instead of
+  silently freezing `TIME` at the first record and mis-predicting (#486). This closes the
+  gap in the existing transit guard, which already rejected transit combined with IOV,
+  time-varying covariates, steady-state, or infusion doses — all the same limitation (the
+  transit closed form assumes constant parameters over each absorption window). Use an ODE
+  `transit()` model for a time-dependent disposition.
 - **A `one_cpt_transit` absorption model with time-varying covariates (or a `TIME`
   switch)** no longer produces a silently wrong (all-zero) FOCE/FOCEI gradient (#486).
   Such a subject was routed to the event-driven analytic walk, which cannot

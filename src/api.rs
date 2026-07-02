@@ -1157,6 +1157,21 @@ pub(crate) fn check_transit_support(
                 .to_string(),
         );
     }
+    // A `TIME`-built-in structural parameter makes the disposition switch mid-profile —
+    // the same limitation that rules out time-varying covariates below: the transit closed
+    // form assumes constant parameters over each absorption window, and the predictor can
+    // only evaluate them at the first-record snapshot (it freezes `TIME` at 0), silently
+    // ignoring the switch. Reject it up front (consistent with the TV-covariate guard)
+    // rather than mis-predict; an ODE transit model carries a time-dependent RHS exactly.
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+        return Some(
+            "one_cpt_transit does not support a TIME-dependent structural parameter: the \
+             transit closed form assumes constant parameters over each absorption window, so \
+             the predictor would freeze TIME at the first record and silently ignore the \
+             switch. Use an ODE transit model (transit() forcing in [odes])."
+                .to_string(),
+        );
+    }
     for subject in &population.subjects {
         if subject.has_tv_covariates() {
             return Some(format!(
@@ -8942,6 +8957,53 @@ mod simulate_with_uncertainty_tests {
             analytical_init: Vec::new(),
             ruv_magnitude: None,
         }
+    }
+
+    /// `one_cpt_transit` + a `TIME`-dependent structural parameter must be rejected up front
+    /// (like transit + time-varying covariates / IOV / SS / infusion). The transit closed
+    /// form assumes constant parameters over each absorption window; the predictor can only
+    /// evaluate them at the first-record snapshot, so it would silently freeze `TIME` at 0 and
+    /// ignore the switch. `check_transit_support` must return an error rather than mis-predict.
+    #[test]
+    fn transit_with_time_builtin_is_rejected() {
+        use crate::parser::model_parser::parse_model_string;
+        const TRANSIT_TIME: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVCL_LATE(7.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  if (TIME > 12.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V   = TVV
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+        let model = parse_model_string(TRANSIT_TIME).expect("parse transit+TIME");
+        assert_eq!(model.pk_model, crate::types::PkModel::OneCptTransit);
+        assert!(
+            crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
+            "fixture must use the TIME built-in"
+        );
+        let msg = check_transit_support(&model, &tiny_population())
+            .expect("transit + TIME must be rejected up front");
+        assert!(
+            msg.contains("TIME"),
+            "rejection message must name the TIME limitation: {msg}"
+        );
     }
 
     fn tiny_population() -> Population {

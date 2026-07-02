@@ -3724,6 +3724,21 @@ pub(crate) fn subject_has_oral_infusion(model: &CompiledModel, subject: &Subject
 /// and the two TV-walk triggers cannot drift to different routing decisions (#637 round-2
 /// review #3).
 pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subject) -> bool {
+    // Only models the event-driven walk can state-propagate take that route — mirror
+    // production's `compute_predictions_with_tv`, which gates the event-driven predictor on
+    // `supports_event_driven` and otherwise falls to the t=0 static superposition.
+    // `one_cpt_transit` is analytical (core-supported) but NOT walk-supported: its
+    // continuous-`N` Gamma absorption is a closed-form convolution, not a finite linear
+    // state (`propagate::walk_supports` / `event_driven::supports_event_driven` both omit
+    // it). Routing a transit subject here would hit the walk's unsupported-model
+    // early-return, which yields all-ZERO predictions and sensitivities (a zero `Vec`, not
+    // an error). Declining here keeps transit on the dose-superposition analytic path
+    // (`run_obs`), whose t=0 snapshot reproduces production's transit prediction exactly —
+    // so a transit subject with time-varying covariates / a `TIME` switch stays analytic
+    // (matching production), rather than silently zeroing or dropping to FD.
+    if !crate::pk::event_driven::supports_event_driven(model.pk_model) {
+        return false;
+    }
     subject.has_tv_covariates()
         || subject_has_oral_infusion(model, subject)
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
@@ -7683,6 +7698,84 @@ mod tests {
             fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
+        }
+    }
+
+    const ONECPT_TRANSIT_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+
+    /// Regression: a `one_cpt_transit` model with a time-varying covariate must NOT route to
+    /// the event-driven walk (which cannot state-propagate the continuous-`N` Gamma
+    /// absorption — `walk_supports` / `supports_event_driven` both omit transit — and whose
+    /// unsupported-model early-return yields all-ZERO predictions/sensitivities). Before this
+    /// fix `subject_routes_to_event_walk` returned `true` on `has_tv_covariates()`, so
+    /// `subject_sensitivities` returned `Some` with every `f` and derivative == 0 — a
+    /// silently wrong gradient. `subject_routes_to_event_walk` now mirrors production's
+    /// `compute_predictions_with_tv` dispatch (event-driven only for `supports_event_driven`
+    /// models), so transit stays on the dose-superposition analytic path (`run_obs`), whose
+    /// t=0 snapshot reproduces production's transit prediction exactly. The result is
+    /// analytic (NOT FD, NOT zero) and matches central FD of `compute_predictions_with_tv`.
+    #[test]
+    fn transit_with_tvcov_uses_analytic_superposition() {
+        let m = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse transit");
+        assert_eq!(m.pk_model, PkModel::OneCptTransit);
+        let s = tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 72.0, 80.0, 85.0, 90.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        assert!(s.has_tv_covariates(), "subject must carry TV covariates");
+        // Must NOT route to the walk (transit isn't walk-supported) — stays on superposition,
+        // exactly as production's `compute_predictions_with_tv` does for transit.
+        assert!(
+            !subject_routes_to_event_walk(&m, &s),
+            "transit must not route to the event walk (it can't propagate the transit chain)"
+        );
+        let theta = [5.0, 50.0, 1.0, 3.0];
+        let eta = [0.1, -0.05];
+        let sens = subject_sensitivities(&m, &s, &theta, &eta)
+            .expect("transit + TV-cov is analytic via superposition (was silent zeros)");
+        // Not the old all-zero bug: the analytic values equal production's predictions.
+        let prod = compute_predictions_with_tv(&m, &s, &theta, &eta);
+        assert!(
+            sens.obs.iter().any(|o| o.f.abs() > 1e-6),
+            "predictions must be non-zero"
+        );
+        for (o, &p) in sens.obs.iter().zip(prod.iter()) {
+            approx::assert_relative_eq!(o.f, p, max_relative = 1e-9, epsilon = 1e-12);
+        }
+        // Full analytic gradient/Hessian must match central FD of the production predictor.
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+        // Inner EBE η-gradient is analytic too and tracks the outer.
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("inner analytic");
+        for (o, g) in sens.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
+            for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-11);
+            }
         }
     }
 

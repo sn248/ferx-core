@@ -540,6 +540,15 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
+- **A `one_cpt_transit` absorption model with time-varying covariates (or a `TIME`
+  switch)** no longer produces a silently wrong (all-zero) FOCE/FOCEI gradient (#486).
+  Such a subject was routed to the event-driven analytic walk, which cannot
+  state-propagate the transit chain (its continuous-`N` Gamma absorption is a closed-form
+  convolution, not a finite linear state) and returned zero predictions and sensitivities.
+  The gradient router now mirrors the production predictor's dispatch — event-driven only
+  for models it can propagate, otherwise the static dose-superposition path — so transit
+  stays analytic via superposition and matches the production prediction exactly (verified
+  against finite differences of `compute_predictions_with_tv`).
 - **Finite / modeled-duration infusions combined with a time-varying covariate that
   changes across the infusion's end** now get an exact analytic second-order gradient
   (#486). The rate-off boundary sits between records, so the RHS Jacobian jumps there;

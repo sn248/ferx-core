@@ -3663,6 +3663,13 @@ fn parse_event_model_block(
             // unintended.  Use a per-CMT error model (`DV[CMT=N] ~ ...`) to get unambiguous
             // parse-time validation.
         }
+        ErrorSpec::Selected { .. } => {
+            // A covariate-selected error model (#658) keys its endpoints by the per-row
+            // selector branch, not by CMT, so — like `Single` — it carries no CMT
+            // information to collide against the TTE CMT at parse time.  The data reader's
+            // two-path routing still keeps Gaussian and TTE observations from
+            // double-counting; use a per-CMT error model for parse-time collision checks.
+        }
     }
 
     // ODE-accumulated hazard path (joint PK-TTE, Slice 2.1): `hazard = <expr>` was

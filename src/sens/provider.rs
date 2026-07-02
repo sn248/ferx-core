@@ -475,7 +475,10 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
-        && model.residual_correlations.is_empty()
+        // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
+        // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
+        // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
+        // off-diagonal-R subject bails per-subject to FD via `corr_residual_diag` → `None`.
         && !model.has_tte()
         // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
         // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
@@ -484,12 +487,16 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
         // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with `iiv_on_ruv`
         // (whose residual-eta `c̃`-column coupling `d/R` would need its own direct-θ
         // chain, not yet assembled — see `prepare_stacked`), still routes to FD.
+        // Also combined with a **correlated** residual (`block_sigma`, #627): the dense
+        // assembly does not thread the magnitude's direct-θ channel, so the orthogonal
+        // combination stays on FD even though each is analytic on its own.
         // (An M3-censored row's `−logΦ(z)` direct-θ chain is a *per-subject* gap
         // `prepare_stacked` bails at runtime — see its own doc — not a model-level
         // one, so it is not gated here.)
         && (!model.has_custom_ruv_magnitude()
             || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
-                && model.residual_error_eta.is_none()))
+                && model.residual_error_eta.is_none()
+                && model.residual_correlations.is_empty()))
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))
@@ -4757,6 +4764,15 @@ mod tests {
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
         assert!(analytic_outer_gradient_available(&ruv_m3));
+        // Correlated residual (`block_sigma`) is now analytic on the outer loop (#627):
+        // the dense assembly reduces to the scalar path fed correlation-aware `(r,d,d2)`.
+        // (Previously this predicate short-circuited to FD on any residual correlation.)
+        let block_sigma = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse block_sigma model");
+        assert!(!block_sigma.residual_correlations.is_empty());
+        assert!(analytic_outer_gradient_available(&block_sigma));
     }
 
     /// The `TIME` built-in makes a structural parameter piecewise/time-varying, so

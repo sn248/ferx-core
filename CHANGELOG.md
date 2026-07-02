@@ -30,8 +30,11 @@ section of the SDLC for the versioning policy).
   per-row flag without recoding it into a synthetic `CMT` column. Works on
   analytical **and** ODE models, across FOCE/FOCEI, Gauss-Newton, SAEM, and
   importance sampling. The selector covariate becomes a required data column
-  (`E_MISSING_COVARIATE`). `block_sigma` correlated residuals with a selected
-  error model are rejected with a clear error for now. See
+  (`E_MISSING_COVARIATE`). `block_sigma` correlated residuals are supported
+  together with a selected error model (#669): co-temporal rows resolving to
+  different branches (e.g. a total/unbound assay pair) pick up the cross-branch
+  covariance `ρ·σ_i·σ_j` in the dense residual `R`, exactly as for per-CMT
+  endpoints. See
   [Error model → Covariate-selected error models](https://ferx-nlme.github.io/ferx-core/model-file/error-model.html).
 - **Full `[scaling] y = <expr>` output readouts (Form C) on analytical PK models** (#650).
   A closed-form (`pk one_cpt_iv(...)`, …) model can now replace the built-in

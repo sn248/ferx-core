@@ -287,10 +287,16 @@ Rules and restrictions:
 - **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
   optimizers, SAEM, and importance sampling — every likelihood/gradient path
   dispatches on the selected endpoint.
-- **`block_sigma` is not yet supported** together with a covariate-selected
-  error model: the correlated-residual pairing rule is not yet defined in terms
-  of the selector, so the combination is rejected with a clear error. Use
-  uncorrelated sigmas, or a per-CMT model, for correlated residuals.
+- **`block_sigma` correlated residuals are supported** together with a
+  covariate-selected error model (#669). Each observation resolves to a branch
+  per row, loads that branch's sigmas, and rows sharing a subject time and
+  occasion pick up the `block_sigma` cross covariance in the dense residual `R`
+  — exactly the pairing rule used for per-CMT endpoints. Two co-temporal rows
+  resolving to *different* branches (e.g. a total `FREE=0` and an unbound
+  `FREE=1` measurement of the same sample) get the honest cross-branch
+  covariance `ρ·σ_i·σ_j` from each row's own loadings. The method restrictions
+  on `block_sigma` (see the [Sigma scale](#sigma-scale) section) apply
+  unchanged.
 - **LTBS** (`log(DV) ~ ...` / `log_additive`) is not supported inside a branch.
 - **SDE / `[diffusion]` models are not supported.** The EKF measurement-noise
   path uses a single error model and cannot switch per observation, so the
@@ -389,10 +395,12 @@ $$
 The diagonal sigma SDs are estimated unless marked `FIX`; the off-diagonal
 covariance is always converted to a fixed correlation. A nonzero `block_sigma`
 covariance can connect sigmas that co-load on the same `combined(...)` endpoint,
-or sigmas used by different CMT endpoints measured at the same subject time and
-occasion. In the cross-endpoint case ferx builds a subject-level residual
-covariance matrix, so paired rows such as total/unbound assays receive the
-NONMEM-style covariance term `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
+or sigmas used by different endpoints measured at the same subject time and
+occasion — whether those endpoints are selected by the CMT column (per-CMT) or
+by a covariate `if/else` selector (#669). In the cross-endpoint case ferx builds
+a subject-level residual covariance matrix, so paired rows such as total/unbound
+assays receive the NONMEM-style covariance term
+`f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
 
 Current scope: `block_sigma` is supported for the Gaussian `method = foce`,
 `method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton

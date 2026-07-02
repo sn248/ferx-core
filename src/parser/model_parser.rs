@@ -8515,18 +8515,17 @@ fn validate_residual_correlations(
     }
 
     // Covariate-selected residual error (#658) with block_sigma correlated
-    // residuals: the correlation pairing rule (same-time/occasion rows) is not
-    // yet defined in terms of the selector's per-observation endpoint, so reject
-    // the combination with a clear error rather than pairing ambiguously.
-    if matches!(error_spec, ErrorSpec::Selected { .. }) {
-        return Err(
-            "block_sigma correlated residuals are not yet supported together with a \
-             covariate-selected [error_model] (if/else). Use separate uncorrelated sigmas, \
-             or a per-CMT [error_model], for now (issue #658)."
-                .to_string(),
-        );
-    }
-
+    // residuals (#669): the pairing rule is the same as `PerCmt`. Each
+    // observation resolves to an endpoint per-row via the covariate selector
+    // (`ErrorSpec::obs_keys`), loads that endpoint's sigmas, and rows sharing a
+    // subject time+occasion receive the `block_sigma` cross covariance from
+    // `cross_observation_covariance`. Two paired rows resolving to *different*
+    // branches get the honest cross-branch covariance `rho·σ_i·σ_j` built from
+    // each row's own loadings — exactly the total/unbound cross-endpoint case
+    // the `PerCmt` path already handles. The whole residual runtime is generic
+    // over the endpoint key, so `Selected` needs no special casing here; the
+    // reference-validity check below already dispatches through the shared
+    // `PerCmt | Selected { endpoints: map, .. }` arm.
     let endpoint_loadings: Vec<Vec<usize>> = match error_spec {
         ErrorSpec::Single(_) => vec![error_spec
             .sigma_loadings(0, 1.0, sigma_names.len())
@@ -20919,8 +20918,10 @@ if (WT > 70) {
     }
 
     #[test]
-    fn test_selected_error_model_rejects_block_sigma() {
-        // block_sigma correlated residuals are deferred for the selector form.
+    fn test_selected_error_model_accepts_block_sigma() {
+        // #669: block_sigma correlated residuals now parse together with a
+        // covariate-selected [error_model]. The off-diagonal couples the two
+        // branches' sigmas, and `build_residual_correlations` records it.
         let src = r"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -20945,11 +20946,146 @@ if (WT > 70) {
 [covariates]
   FREE continuous
 ";
+        let model = parse_full_model(src).unwrap().model;
+        assert!(matches!(model.error_spec, ErrorSpec::Selected { .. }));
+        // One off-diagonal correlation between the two branch sigmas (idx 0,1).
+        assert_eq!(model.residual_correlations.len(), 1);
+        let corr = model.residual_correlations[0];
+        let pair = (
+            corr.sigma_i.min(corr.sigma_j),
+            corr.sigma_i.max(corr.sigma_j),
+        );
+        assert_eq!(pair, (0, 1));
+        // rho = cov / (sd_i · sd_j) = 0.005 / sqrt(0.01·0.09).
+        let expected_rho = 0.005 / (0.01f64 * 0.09).sqrt();
+        assert!((corr.rho - expected_rho).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_selected_error_model_rejects_block_sigma_unused_sigma() {
+        // The reference-validity check still runs for Selected: a block_sigma
+        // off-diagonal touching a sigma no branch loads is rejected.
+        let src = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_TOTAL, PROP_UNUSED) = [0.01, 0.005, 0.09]
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
         let err = expect_parse_err(src);
         assert!(
-            err.contains("covariate-selected") && err.contains("block_sigma"),
-            "expected a block_sigma+Selected rejection, got: {err}"
+            err.contains("not used by [error_model]"),
+            "expected an unused-sigma rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_selected_error_block_sigma_cross_branch_covariance() {
+        // #669 end-to-end: two rows at the same subject time+occasion but
+        // different `FREE` flags resolve to different branches (total vs.
+        // unbound). The dense R off-diagonal must carry the block_sigma
+        // cross-branch covariance rho·σ_i·σ_j scaled by each row's proportional
+        // loading (f·σ_i)(f·σ_j) — identical to the total/unbound PerCmt case.
+        let model = parse_full_model(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.01, 0.005, 0.09]
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+",
+        )
+        .unwrap()
+        .model;
+
+        let subject = crate::types::Subject {
+            id: "S1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0, 10.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![
+                HashMap::from([("FREE".to_string(), 0.0)]),
+                HashMap::from([("FREE".to_string(), 1.0)]),
+            ],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        // sigma = [SD_total, SD_unbound] from the block diagonal.
+        let sd_i = 0.01f64.sqrt();
+        let sd_j = 0.09f64.sqrt();
+        let sigma = [sd_i, sd_j];
+        let f = 10.0;
+        let ipreds = [f, f];
+        let keys = model.error_spec.obs_keys(&subject);
+
+        let r = crate::stats::residual_error::compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &ipreds,
+            keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &sigma,
+            &model.residual_correlations,
+        );
+
+        // Diagonal: each row's own proportional variance from its branch sigma.
+        assert!((r[(0, 0)] - (f * sd_i).powi(2)).abs() < 1e-12);
+        assert!((r[(1, 1)] - (f * sd_j).powi(2)).abs() < 1e-12);
+        // Off-diagonal: cross-branch covariance (f·σ_i)(f·σ_j)·rho.
+        let rho = 0.005 / (sd_i * sd_j);
+        let expected_off = f * sd_i * f * sd_j * rho;
+        assert!((r[(0, 1)] - expected_off).abs() < 1e-12);
+        assert!((r[(1, 0)] - expected_off).abs() < 1e-12);
+        // Sanity: symmetric and equals the raw covariance times f².
+        assert!((r[(0, 1)] - f * f * 0.005).abs() < 1e-12);
     }
 
     /// End-to-end dispatch: `obs_keys` resolves each observation's covariate

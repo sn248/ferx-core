@@ -755,11 +755,19 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // `Weibull` + estimated lagtime stays FD on every path (IOV included): its onset diverges
     // for shape `β < 1` (an integrable spike, no finite rate-on saltation), exactly as the
     // non-IOV gate declines it above. Every other kind composes with lagtime under IOV.
+    // Mirror the non-IOV `ode_analytical_supported` lagtime gate's exhaustive *whitelist*
+    // (not a `== Weibull` blacklist), so a future `InputRateKind` variant defaults to the FD
+    // fallback on both paths rather than being silently admitted here (#486 IOV-scope parity).
     if model.has_lagtime()
-        && ode
-            .input_rate
-            .iter()
-            .any(|f| f.kind == crate::pk::absorption::InputRateKind::Weibull)
+        && ode.input_rate.iter().any(|f| {
+            !matches!(
+                f.kind,
+                crate::pk::absorption::InputRateKind::Transit
+                    | crate::pk::absorption::InputRateKind::InverseGaussian
+                    | crate::pk::absorption::InputRateKind::FirstOrder
+                    | crate::pk::absorption::InputRateKind::ZeroOrder
+            )
+        })
     {
         return false;
     }

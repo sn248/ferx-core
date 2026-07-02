@@ -118,7 +118,10 @@ This also covers the dosing forms below (all closed by #486):
 
 - **A modeled-duration/rate dose** (`RATE=-1`/`-2` → `R{cmt}`/`D{cmt}`) combined with SS —
   `equilibrate_ss_state_g` rebuilds the effective rate/window from the resolved PK slot each
-  cycle, the same jet the non-SS event-driven walk uses.
+  cycle, the same jet the non-SS event-driven walk uses. The **closed-form** (analytical
+  1-/2-/3-cpt) path now mirrors this: its `equilibrate_ss_g` threads the modeled-window dual
+  into each cycle's active/quiet split, so a modeled dose × SS is analytic on the analytical
+  models too (#486).
 - **A rate-defined infusion under bioavailability `F ≠ 1`** — NONMEM holds the rate and scales
   the window to `F·amt/rate`; the per-cycle equilibration now injects the same rate-off
   event-time saltation the main walk uses at an ordinary infusion's window end.

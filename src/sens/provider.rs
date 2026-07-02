@@ -308,8 +308,8 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         && scaling_supported(model)
         && init_supported(model)
         && analytic_readout_dual_supported(model)
-        // Every individual-parameter slot must be one we differentiate. A
-        // LAGTIME (slot 8) routes to fall back.
+        // Every individual-parameter slot must be one we differentiate; a slot outside
+        // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) routes to FD.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
 }
 
@@ -945,8 +945,12 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // post-walk step in `run_obs_iov` / `run_obs_iov_eta` (the closed-form twin of the ODE-IOV
     // path, #575/#590); a constant `ScalarScale k` is the trivial case of that quotient — a
     // covariate/η/κ-independent `f/k` applied uniformly to every jet entry (#486 IOV-scope
-    // parity, mirroring the non-IOV `f_scaled = f/k`). LTBS declines below (the in-walk log
-    // can't compose with the post-walk quotient).
+    // parity, mirroring the non-IOV `f_scaled = f/k`). LTBS composes with the OUTER gradient
+    // now (#486): `subject_sensitivities_iov` applies the `ln(f)` jet LAST — after the in-walk
+    // scale quotient — reproducing production's scale-then-log order `ln(f/s)` (`predict_iov`
+    // logs last, after `apply_scaling`). The inner IOV EBE gradient stays on FD for LTBS
+    // (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause), so this gate
+    // admits `log_transform` while only the outer θ/Ω/σ loop serves it.
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
@@ -955,7 +959,8 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
                 && (1..=MAX_SCALE_AXES).contains(&p.n_axes()) => {}
         _ => return false,
     }
-    if model.log_transform || model.has_lagtime() {
+    // `has_lagtime` still declines (the elapsed-time saltation is not carried on this walk).
+    if model.has_lagtime() {
         return false;
     }
     // Initial-compartment amounts (#521) are now differentiable on the IOV event-driven walk
@@ -1095,7 +1100,16 @@ pub fn subject_sensitivities_iov(
             }
         };
     }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    let mut sens = disp!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )?;
+    // LTBS (#486): apply the `ln(f)` jet LAST — after the in-walk scale quotient / Form C
+    // readout / init impulse — so the outer θ/Ω/σ gradient matches production's scale-then-log
+    // `ln(f/s)` (`predict_iov` logs last, after `apply_scaling`). Post-walk on the full stacked
+    // jet, so it is dimension-generic over the κ axes; a no-op when `log_transform` is false.
+    // The inner IOV EBE gradient stays on FD for LTBS (`analytic_inner_common_bail`).
+    apply_ltbs_transform_outer(&mut sens, model.log_transform);
+    Some(sens)
 }
 
 /// Per-event seed sources for the analytical IOV walk — the per-subject gates, the
@@ -2106,9 +2120,10 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // scale program to the dispatch table; `PerCmt` still routes to FD. LTBS is now admitted
     // (#486): `subject_sensitivities_tvcov` applies the `ln(f)` jet transform LAST, after any
     // scale quotient — reproducing production's scale-then-log order `ln(f/s)` exactly (the
-    // whole transform is post-walk on the closed-form path, unlike the ODE/IOV in-walk log).
-    // The inner EBE gradient stays on FD for LTBS (covariance stability,
-    // `analytic_inner_common_bail`), so only the outer θ/Ω/σ gradient is served here.
+    // whole transform is post-walk on the closed-form path, unlike the ODE in-walk log). The
+    // inner EBE gradient is served analytically here too (`subject_eta_grad_tvcov` applies the
+    // same `ln(f)` inner jet LAST, #673); LTBS × IOV is the only combination whose inner stays
+    // on FD (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause).
     if !scaling_supported(model) {
         return false;
     }
@@ -10097,13 +10112,14 @@ mod tests {
             "closed-form IOV + ExpressionScale obs_scale must be on the analytic path (#486)"
         );
         assert!(analytic_outer_gradient_available(&model));
-        // + LTBS still routes to FD (the in-walk log is not composed with the post-walk
-        // quotient on the IOV path).
+        // + LTBS is served on the OUTER gradient now (#486): `subject_sensitivities_iov`
+        // applies the `ln(f)` jet after the in-walk scale quotient, reproducing `ln(f/s)`.
+        // (The inner EBE gradient still declines via `analytic_inner_common_bail`.)
         let mut ltbs = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse");
         ltbs.log_transform = true;
         assert!(
-            !iov_analytical_supported(&ltbs),
-            "ExpressionScale + LTBS under closed-form IOV must fall back to FD"
+            iov_analytical_supported(&ltbs),
+            "ExpressionScale + LTBS under closed-form IOV is served on the outer gradient (#486)"
         );
         // A constant `ScalarScale` under IOV is now analytic too (#486 IOV-scope parity):
         // `f/k` is the trivial covariate/η/κ-independent case of the post-walk quotient,

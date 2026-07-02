@@ -187,12 +187,14 @@ fn censored_marginal_foce_grad(
         cmt: usize,
     }
     let mut cens: Vec<C> = Vec::new();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     for j in 0..subject.observations.len() {
         let cs = subject.cens.get(j).copied().unwrap_or(0);
         if cs == 0 {
             continue;
         }
-        let cmt = subject.obs_cmts[j];
+        let cmt = err_keys[j];
         let f0act = sens0.obs[j].f;
         let r0c = model.error_spec.variance_at(cmt, f0act, sigma);
         if !(r0c.is_finite() && r0c > 0.0) {
@@ -672,6 +674,8 @@ fn prepare_stacked(
     ruv: Option<usize>,
 ) -> Option<Prep> {
     let n_obs = subject.observations.len();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     // A dosing-only subject (dose rows, no DV) contributes no data term to the
     // marginal gradient; with no observations `H̃ = Ω⁻¹` is still PD so the
     // FOCEI blocks (`theta_block`, `mixed_eta_theta`) would proceed and then
@@ -766,7 +770,7 @@ fn prepare_stacked(
         let f = obs.f;
         // obs index → cmt: provider obs are parallel to subject.obs_times.
         let j = et.len();
-        let cmt = subject.obs_cmts[j];
+        let cmt = err_keys[j];
         // `mult_row` is `None` for every observation on a non-magnitude model, so
         // that path keeps the exact legacy `variance_at`/`dvar_df`/`d2var_df2`
         // association bit-for-bit (the `_scaled` variants reassociate the
@@ -990,7 +994,7 @@ fn prepare_stacked(
                 continue;
             }
             let f = obs.f;
-            let cmt = subject.obs_cmts[j];
+            let cmt = err_keys[j];
             let y = subject.observations[j];
             let cens = et[j].cens_sign;
             let a = obs.df_deta.as_slice();
@@ -1347,6 +1351,8 @@ fn sigma_block(
     // (#486 review). `block_sigma` and custom magnitude are mutually exclusive, so
     // at most one of `correlated` / `mult` is active per subject.
     let mult = &prep.mult;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
 
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
@@ -1367,7 +1373,7 @@ fn sigma_block(
         let mut fixed = 0.0;
         let mut m_vec = DVector::<f64>::zeros(n_eta);
         for (j, obs) in sens.obs.iter().enumerate() {
-            let cmt = subject.obs_cmts[j];
+            let cmt = err_keys[j];
             let f = obs.f;
             if prep.et[j].censored {
                 // M3 censored row: data term `−logΦ((y−f)/√v(σ))` plus the `log|H̃|`
@@ -1882,6 +1888,8 @@ pub fn subject_packed_gradient_foce(
         return Some(vec![0.0; x.len()]);
     }
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     // Residual variance R⁰ is frozen at the η=0 (typical-individual) prediction —
     // ferx's no-interaction semantics. One extra provider pass supplies f(η=0)
     // and ∂f(η=0)/∂θ (for ∂R⁰/∂θ); both reuse the analytic closed forms.
@@ -1955,7 +1963,7 @@ pub fn subject_packed_gradient_foce(
             jeta += obs.df_deta[k] * eta_hat[k];
         }
         rho[i] = subject.observations[j] - (obs.f - jeta);
-        let cmt = subject.obs_cmts[j];
+        let cmt = err_keys[j];
         let f0act = sens0.obs[j].f;
         let mult_row: Option<&[f64]> = mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
         // Correlated residual (`block_sigma`, #627): correlation-aware `(R⁰, ∂R⁰/∂f)`.
@@ -2093,7 +2101,7 @@ pub fn subject_packed_gradient_foce(
         sm[k] -= hsig;
         let mut nat = 0.0;
         for (i, &j) in quant.iter().enumerate() {
-            let cmt = subject.obs_cmts[j];
+            let cmt = err_keys[j];
             let f0act = sens0.obs[j].f;
             // Correlation-aware `∂R⁰/∂σ` when block_sigma present (within-obs cross
             // term); otherwise ∂R⁰/∂σ carries the magnitude multiplier (`mult` scales
@@ -2263,6 +2271,8 @@ pub fn subject_eta_dx_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
@@ -2364,7 +2374,7 @@ pub fn subject_eta_dx_iov(
         sm[kk] -= h;
         let mut mvec = DVector::<f64>::zeros(n_st);
         for (j, obs) in sens.obs.iter().enumerate() {
-            let cmt = subject.obs_cmts[j];
+            let cmt = err_keys[j];
             let f = obs.f;
             if prep.et[j].censored {
                 let y = subject.observations[j];
@@ -2456,6 +2466,8 @@ pub fn subject_packed_gradient_foce_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
@@ -2526,7 +2538,7 @@ pub fn subject_packed_gradient_foce_iov(
             jeta += obs.df_deta[kk] * stacked_eta_hat[kk];
         }
         rho[i] = subject.observations[j] - (obs.f - jeta);
-        let cmt = subject.obs_cmts[j];
+        let cmt = err_keys[j];
         let f0act = sens0.obs[j].f;
         let mult_row: Option<&[f64]> = mult.as_ref().and_then(|m| m.get(j)).map(|v| v.as_slice());
         let r = match mult_row {
@@ -2655,7 +2667,7 @@ pub fn subject_packed_gradient_foce_iov(
         sm[kk] -= hsig;
         let mut nat = 0.0;
         for (i, &j) in quant.iter().enumerate() {
-            let cmt = subject.obs_cmts[j];
+            let cmt = err_keys[j];
             let f0act = sens0.obs[j].f;
             // Magnitude-aware ∂R⁰/∂σ (the multiplier scales the σ loading) — #576/#486.
             let mult_row: Option<&[f64]> =
@@ -2740,6 +2752,8 @@ pub fn subject_eta_dx(
     }
     let params = unpack_params(x, template);
     let sens = subject_sensitivities(model, subject, &params.theta, eta_hat)?;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let prep = prepare(model, subject, &params, &sens, eta_hat)?;
     let n_eta = prep.n_eta;
     let n_theta = params.theta.len();
@@ -2836,7 +2850,7 @@ pub fn subject_eta_dx(
         };
         let mut mvec = DVector::<f64>::zeros(n_eta);
         for (j, obs) in sens.obs.iter().enumerate() {
-            let cmt = subject.obs_cmts[j];
+            let cmt = err_keys[j];
             let f = obs.f;
             // M3 censored row EBE-response: structural `dg1·∂f/∂η` plus the censored
             // residual-η × σ cross-term, shared with `sigma_block` via

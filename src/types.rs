@@ -1411,14 +1411,42 @@ impl ErrorModel {
     }
 }
 
+/// Covariate-driven residual-error endpoint selector (issue #658).
+///
+/// Maps one observation's covariate snapshot to a 0-based endpoint key into the
+/// `ErrorSpec::Selected.endpoints` map, resolving a user `if (COV …) { … } else
+/// { … }` in `[error_model]`. The selection depends only on covariates — never
+/// on θ/η or the prediction — so it is constant across the inner EBE loop and
+/// the FOCE/FOCEI outer iterations (the σ-gradient rides the existing per-CMT
+/// σ channel once the endpoint is chosen). The closure mirrors the boxed-closure
+/// pattern used by [`ScaleFn`]; `branch_labels` carries source-order branch
+/// descriptions purely for `Debug`/diagnostics.
+pub struct ErrorSelector {
+    /// Covariate map → 0-based endpoint key. Total: the parser requires a final
+    /// `else`, so every observation resolves to some declared endpoint.
+    pub eval: Box<dyn Fn(&HashMap<String, f64>) -> usize + Send + Sync>,
+    /// Human-readable branch descriptions (source order), for `Debug` output.
+    pub branch_labels: Vec<String>,
+}
+
+impl std::fmt::Debug for ErrorSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ErrorSelector({:?})", self.branch_labels)
+    }
+}
+
 /// Residual error specification for a model.
 ///
 /// `Single` applies one error model to every observation (the default and the
 /// only form analytical-PK models support). `PerCmt` dispatches a distinct
 /// error model per observed compartment — the multi-endpoint / simultaneous
 /// PK-PD case (issue #14). The map key is the 1-based CMT index from the data
-/// file's CMT column, matching `subject.obs_cmts[i]`.
-#[derive(Debug, Clone)]
+/// file's CMT column, matching `subject.obs_cmts[i]`. `Selected` (issue #658)
+/// dispatches on a key resolved per observation from a covariate `if/else`
+/// selector instead of the CMT column; its `endpoints` map is keyed by the
+/// selector's 0-based branch index and is otherwise identical in shape/handling
+/// to `PerCmt` (every downstream method treats the two alike — see the shared
+/// `PerCmt(map) | Selected { endpoints: map, .. }` arms).
 pub enum ErrorSpec {
     /// One error model for all observations.
     Single(ErrorModel),
@@ -1426,11 +1454,70 @@ pub enum ErrorSpec {
     /// indices into the flat global `sigma.values` vector that supply its
     /// sigmas (declaration order in the `[parameters]` block).
     PerCmt(HashMap<usize, EndpointError>),
+    /// Covariate-selected error models (issue #658). `selector` resolves each
+    /// observation's covariate snapshot to a 0-based key into `endpoints`; the
+    /// `EndpointError` values carry the same `error_model` + `sigma_idx` layout
+    /// as `PerCmt`.
+    Selected {
+        selector: ErrorSelector,
+        endpoints: HashMap<usize, EndpointError>,
+    },
+}
+
+impl std::fmt::Debug for ErrorSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorSpec::Single(em) => f.debug_tuple("Single").field(em).finish(),
+            ErrorSpec::PerCmt(map) => f.debug_tuple("PerCmt").field(map).finish(),
+            ErrorSpec::Selected {
+                selector,
+                endpoints,
+            } => f
+                .debug_struct("Selected")
+                .field("selector", selector)
+                .field("endpoints", endpoints)
+                .finish(),
+        }
+    }
 }
 
 impl Default for ErrorSpec {
     fn default() -> Self {
         ErrorSpec::Single(ErrorModel::Additive)
+    }
+}
+
+impl ErrorSpec {
+    /// Per-observation endpoint dispatch keys for `subject`.
+    ///
+    /// For `Single`/`PerCmt` this is exactly the data CMT column
+    /// (`subject.obs_cmts`, borrowed with no allocation). For `Selected` the
+    /// covariate selector is evaluated on each observation's covariate snapshot
+    /// (`subject.obs_cov(j)`, which falls back to the subject-level covariates
+    /// when no per-observation snapshot exists — the per-row Form C semantics).
+    /// The returned keys are what every residual-dispatch method
+    /// (`variance_at`, `sigma_loadings`, `dvar_df`, …) expects as its `cmt`
+    /// argument.
+    pub fn obs_keys<'a>(&self, subject: &'a Subject) -> std::borrow::Cow<'a, [usize]> {
+        match self {
+            ErrorSpec::Selected { selector, .. } => std::borrow::Cow::Owned(
+                (0..subject.obs_cmts.len())
+                    .map(|j| (selector.eval)(subject.obs_cov(j)))
+                    .collect(),
+            ),
+            _ => std::borrow::Cow::Borrowed(&subject.obs_cmts),
+        }
+    }
+
+    /// Endpoint dispatch key for a single observation `j` of `subject`. The
+    /// `O(1)` analogue of [`obs_keys`](Self::obs_keys) for callers that resolve
+    /// one observation at a time (e.g. the per-observation simulation loop),
+    /// avoiding a full key-vector allocation per call for `Selected` specs.
+    pub fn obs_key(&self, subject: &Subject, j: usize) -> usize {
+        match self {
+            ErrorSpec::Selected { selector, .. } => (selector.eval)(subject.obs_cov(j)),
+            _ => subject.obs_cmts[j],
+        }
     }
 }
 
@@ -1564,33 +1651,35 @@ impl ErrorSpec {
                     out
                 }
             },
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => match ep.error_model {
-                    ErrorModel::Additive => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, 1.0)])
-                        .unwrap_or_default(),
-                    ErrorModel::Proportional => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, f)])
-                        .unwrap_or_default(),
-                    ErrorModel::Combined => {
-                        let mut out = Vec::with_capacity(2);
-                        if let Some(&i) = ep.sigma_idx.first() {
-                            out.push((i, f));
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => match ep.error_model {
+                        ErrorModel::Additive => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 1.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Proportional => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, f)])
+                            .unwrap_or_default(),
+                        ErrorModel::Combined => {
+                            let mut out = Vec::with_capacity(2);
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, f));
+                            }
+                            if let Some(&i) = ep.sigma_idx.get(1) {
+                                out.push((i, 1.0));
+                            }
+                            out
                         }
-                        if let Some(&i) = ep.sigma_idx.get(1) {
-                            out.push((i, 1.0));
-                        }
-                        out
-                    }
-                },
-                None => Vec::new(),
-            },
+                    },
+                    None => Vec::new(),
+                }
+            }
         }
     }
 
@@ -1633,33 +1722,35 @@ impl ErrorSpec {
                     out
                 }
             },
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => match ep.error_model {
-                    ErrorModel::Additive => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, 0.0)])
-                        .unwrap_or_default(),
-                    ErrorModel::Proportional => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, 1.0)])
-                        .unwrap_or_default(),
-                    ErrorModel::Combined => {
-                        let mut out = Vec::with_capacity(2);
-                        if let Some(&i) = ep.sigma_idx.first() {
-                            out.push((i, 1.0));
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => match ep.error_model {
+                        ErrorModel::Additive => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 0.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Proportional => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 1.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Combined => {
+                            let mut out = Vec::with_capacity(2);
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, 1.0));
+                            }
+                            if let Some(&i) = ep.sigma_idx.get(1) {
+                                out.push((i, 0.0));
+                            }
+                            out
                         }
-                        if let Some(&i) = ep.sigma_idx.get(1) {
-                            out.push((i, 0.0));
-                        }
-                        out
-                    }
-                },
-                None => Vec::new(),
-            },
+                    },
+                    None => Vec::new(),
+                }
+            }
         }
     }
 
@@ -1751,7 +1842,7 @@ impl ErrorSpec {
                     }
                 }
             }
-            ErrorSpec::PerCmt(map) => {
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
                 for ep in map.values() {
                     let types = ep.error_model.sigma_types();
                     for (k, &idx) in ep.sigma_idx.iter().enumerate() {
@@ -1775,17 +1866,19 @@ impl ErrorSpec {
     pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => (
-                    ep.error_model,
-                    ep.sigma_idx
-                        .first()
-                        .and_then(|&i| sigma.get(i))
-                        .copied()
-                        .unwrap_or(0.0),
-                ),
-                None => return 0.0,
-            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        ep.error_model,
+                        ep.sigma_idx
+                            .first()
+                            .and_then(|&i| sigma.get(i))
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    None => return 0.0,
+                }
+            }
         };
         match em {
             ErrorModel::Additive => 0.0,
@@ -1805,7 +1898,9 @@ impl ErrorSpec {
     fn prop_sigma_slot(&self, cmt: usize) -> Option<usize> {
         match self {
             ErrorSpec::Single(_) => Some(0),
-            ErrorSpec::PerCmt(map) => map.get(&cmt)?.sigma_idx.first().copied(),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                map.get(&cmt)?.sigma_idx.first().copied()
+            }
         }
     }
 
@@ -1838,17 +1933,19 @@ impl ErrorSpec {
     pub fn d2var_df2(&self, cmt: usize, sigma: &[f64]) -> f64 {
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => (
-                    ep.error_model,
-                    ep.sigma_idx
-                        .first()
-                        .and_then(|&i| sigma.get(i))
-                        .copied()
-                        .unwrap_or(0.0),
-                ),
-                None => return 0.0,
-            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        ep.error_model,
+                        ep.sigma_idx
+                            .first()
+                            .and_then(|&i| sigma.get(i))
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    None => return 0.0,
+                }
+            }
         };
         match em {
             ErrorModel::Additive => 0.0,
@@ -1896,14 +1993,16 @@ impl ErrorSpec {
         // observation's endpoint.
         let stype = match self {
             ErrorSpec::Single(em) => em.sigma_types().get(k).copied(),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => ep
-                    .sigma_idx
-                    .iter()
-                    .position(|&i| i == k)
-                    .and_then(|p| ep.error_model.sigma_types().get(p).copied()),
-                None => None,
-            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => ep
+                        .sigma_idx
+                        .iter()
+                        .position(|&i| i == k)
+                        .and_then(|p| ep.error_model.sigma_types().get(p).copied()),
+                    None => None,
+                }
+            }
         };
         match stype {
             Some(SigmaType::Proportional) => 2.0 * sk2 * f * f,
@@ -1932,7 +2031,7 @@ impl ErrorSpec {
     pub fn has_f_dependent_variance(&self) -> bool {
         match self {
             ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
-            ErrorSpec::PerCmt(map) => map
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => map
                 .values()
                 .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
         }
@@ -1945,7 +2044,7 @@ impl ErrorSpec {
         match self {
             ErrorSpec::Single(ErrorModel::Combined) => vec![1],
             ErrorSpec::Single(_) => Vec::new(),
-            ErrorSpec::PerCmt(map) => {
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
                 let mut out = Vec::new();
                 for endpoint in map.values() {
                     if matches!(endpoint.error_model, ErrorModel::Combined) {
@@ -1965,23 +2064,25 @@ impl ErrorSpec {
         use crate::stats::residual_error::residual_variance;
         match self {
             ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => {
-                    // Slice length is tied to the endpoint's error model
-                    // (1 for additive/proportional, 2 for combined); the max
-                    // is 2, so a stack buffer avoids a per-observation alloc.
-                    let n = ep.error_model.n_sigma();
-                    let mut buf = [0.0f64; 2];
-                    for k in 0..n.min(2) {
-                        match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
-                            Some(&v) => buf[k] = v,
-                            None => return f64::NAN, // malformed spec / sigma length
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => {
+                        // Slice length is tied to the endpoint's error model
+                        // (1 for additive/proportional, 2 for combined); the max
+                        // is 2, so a stack buffer avoids a per-observation alloc.
+                        let n = ep.error_model.n_sigma();
+                        let mut buf = [0.0f64; 2];
+                        for k in 0..n.min(2) {
+                            match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
+                                Some(&v) => buf[k] = v,
+                                None => return f64::NAN, // malformed spec / sigma length
+                            }
                         }
+                        residual_variance(ep.error_model, f_pred, &buf[..n.min(2)])
                     }
-                    residual_variance(ep.error_model, f_pred, &buf[..n.min(2)])
+                    None => f64::NAN,
                 }
-                None => f64::NAN,
-            },
+            }
         }
     }
 }
@@ -3136,6 +3237,19 @@ impl CompiledModel {
                 ep.sigma_idx.len() >= ep.error_model.n_sigma()
                     && ep.sigma_idx.iter().all(|&i| i < sigma.len())
             }),
+            // `Selected` dispatches on a covariate-resolved branch key, not `cmt`,
+            // so "residual error for this CMT" isn't meaningful per-CMT. Every
+            // observation resolves to some endpoint (the parser requires a final
+            // `else`), so residual error is defined iff *every* endpoint is
+            // well-formed against `sigma`. (Selected is not combined with the
+            // adaptive-dosing monitor path that consults this guard.)
+            ErrorSpec::Selected { endpoints, .. } => {
+                !endpoints.is_empty()
+                    && endpoints.values().all(|ep| {
+                        ep.sigma_idx.len() >= ep.error_model.n_sigma()
+                            && ep.sigma_idx.iter().all(|&i| i < sigma.len())
+                    })
+            }
         }
     }
 
@@ -3246,7 +3360,8 @@ impl CompiledModel {
                 return (s * s).max(1e-12);
             }
         }
-        self.residual_variance_at_scaled(subject.obs_cmts[j], f_pred, sigma, mult) * ruv_scale
+        self.residual_variance_at_scaled(self.error_spec.obs_key(subject, j), f_pred, sigma, mult)
+            * ruv_scale
     }
 
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.

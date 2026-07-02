@@ -4317,6 +4317,13 @@ fn apply_ltbs_transform_outer(sens: &mut SubjectSens, log_transform: bool) {
 /// quotient (so `g = ln(f/s)` matches production's scale-then-log order). Shared by the
 /// plain (`subject_eta_grad_impl`) and TV-cov (`subject_eta_grad_tvcov_with_schedule`)
 /// inner paths; a no-op when `log_transform` is false.
+///
+/// `#[inline(never)]` keeps this a real, attributable coverage region: the coverage
+/// profile inherits `release` (opt-level 3), so without it this small helper is inlined
+/// into every call site and its body records zero direct executions — reading as
+/// uncovered on Codecov even though the unit test and the LTBS FD-parity tests exercise
+/// both branches.
+#[inline(never)]
 fn apply_ltbs_transform_inner(out: &mut [ObsGrad], log_transform: bool) {
     if !log_transform {
         return;

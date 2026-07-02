@@ -76,7 +76,16 @@ fn scale_obs_sens_full(obs: &mut [ObsSens], k: f64) {
     if k == 1.0 {
         return;
     }
-    let inv = 1.0 / k;
+    // Match `pk::apply_scaling` / `ScalingSpec::build_obs_scale_array`: a non-positive or
+    // non-finite scale is invalid and NaN-outs the prediction (loud-failure semantics).
+    // Multiplying by a NaN reciprocal NaNs out the whole jet (value + every derivative),
+    // keeping the analytic path in lock-step with the production predictor the FD oracle
+    // differentiates — rather than emitting an `inf`/sign-flipped jet for `k <= 0`.
+    let inv = if k.is_finite() && k > 0.0 {
+        1.0 / k
+    } else {
+        f64::NAN
+    };
     for o in obs.iter_mut() {
         o.f *= inv;
         for v in o
@@ -100,7 +109,13 @@ fn scale_obs_sens_grad(obs: &mut [ObsGrad], k: f64) {
     if k == 1.0 {
         return;
     }
-    let inv = 1.0 / k;
+    // Invalid (`k <= 0` / non-finite) scale NaN-outs the jet, matching `pk::apply_scaling`
+    // (see `scale_obs_sens_full`).
+    let inv = if k.is_finite() && k > 0.0 {
+        1.0 / k
+    } else {
+        f64::NAN
+    };
     for o in obs.iter_mut() {
         o.f *= inv;
         o.df_deta.iter_mut().for_each(|x| *x *= inv);
@@ -8699,6 +8714,39 @@ mod tests {
             &iov_subject(),
             &[0.2, 10.0, 1.5],
             &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// An **invalid** constant `ScalarScale` (`k <= 0` or non-finite) must NaN-out the whole
+    /// analytic IOV jet — value AND every derivative, on both the outer and inner walks —
+    /// matching `pk::apply_scaling` / `build_obs_scale_array`, which encode an invalid scale
+    /// as a `NaN` prediction (loud-failure semantics). Guards against the analytic path
+    /// emitting an `inf`/sign-flipped jet that would diverge from the production predictor the
+    /// FD oracle differentiates (Copilot review, #663).
+    #[test]
+    fn iov_scalar_scale_invalid_k_nans_the_jet() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse WARFARIN_IOV");
+        model.scaling = ScalingSpec::ScalarScale(-2.0);
+        assert!(iov_analytical_supported(&model));
+        let theta = [0.2, 10.0, 1.5];
+        let stacked = [0.12, -0.08, 0.20, 0.05, -0.10];
+        let outer =
+            subject_sensitivities_iov(&model, &iov_subject(), &theta, &stacked).expect("supported");
+        assert!(
+            outer.obs.iter().all(|o| o.f.is_nan()
+                && o.df_deta.iter().all(|x| x.is_nan())
+                && o.df_dtheta.iter().all(|x| x.is_nan())
+                && o.d2f_deta2.iter().all(|x| x.is_nan())
+                && o.d2f_deta_dtheta.iter().all(|x| x.is_nan())),
+            "invalid ScalarScale must NaN-out the whole outer jet"
+        );
+        let inner =
+            subject_eta_grad_iov(&model, &iov_subject(), &theta, &stacked).expect("supported");
+        assert!(
+            inner
+                .iter()
+                .all(|o| o.f.is_nan() && o.df_deta.iter().all(|x| x.is_nan())),
+            "invalid ScalarScale must NaN-out the whole inner jet"
         );
     }
 

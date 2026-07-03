@@ -1158,28 +1158,32 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
-/// Features the analytic `one_cpt_transit` model does not support in its first
-/// version (#386): the exponential-tilting closed form is a constant-parameter
-/// bolus superposition, so steady-state doses, IOV, within-subject time-varying
-/// covariates, and infusion doses are rejected up front — otherwise they would
-/// silently mis-predict or hit an `unreachable!` in the superposition dispatch.
-/// `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
-/// [`assert_transit_support`], mirroring [`assert_modeled_doses_supported`].
-/// Returns the first offending feature's message, or `None` when compatible.
+/// Features the analytic transit models (`one_cpt_transit`, `two_cpt_transit`) do
+/// not support in their first version (#386): the exponential-tilting closed form
+/// is a constant-parameter bolus superposition, so steady-state doses, IOV,
+/// within-subject time-varying covariates, and infusion doses are rejected up
+/// front — otherwise they would silently mis-predict or hit an `unreachable!` in
+/// the superposition dispatch. `fit()` surfaces this as an `Err`;
+/// `predict()`/`simulate()` panic via [`assert_transit_support`], mirroring
+/// [`assert_modeled_doses_supported`]. Returns the first offending feature's
+/// message, or `None` when compatible.
 pub(crate) fn check_transit_support(
     model: &CompiledModel,
     population: &Population,
 ) -> Option<String> {
-    if model.pk_model != PkModel::OneCptTransit {
+    if !matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    ) {
         return None;
     }
+    let name = model.pk_model.canonical_name();
     if model.n_kappa > 0 {
-        return Some(
-            "one_cpt_transit does not support IOV (n_kappa > 0): the transit closed form \
+        return Some(format!(
+            "{name} does not support IOV (n_kappa > 0): the transit closed form \
              assumes constant disposition over each absorption window. Use an ODE transit \
              model (transit() forcing in [odes]) for IOV."
-                .to_string(),
-        );
+        ));
     }
     // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
     // transit closed form assumes constant parameters over each absorption window, so it
@@ -1190,14 +1194,12 @@ pub(crate) fn check_transit_support(
     if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
         && model.transit_ode_equivalent.is_none()
     {
-        return Some(
-            "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
-             not support a TIME-dependent structural parameter: the transit closed form \
-             assumes constant parameters over each absorption window, and this form is \
-             outside the automatic ODE-equivalent rewrite. Write the model as an ODE \
-             transit() forcing in [odes] directly."
-                .to_string(),
-        );
+        return Some(format!(
+            "{name} does not support a TIME-dependent structural parameter in this form: \
+             the transit closed form assumes constant parameters over each absorption \
+             window, and this form is outside the automatic ODE-equivalent rewrite. Write \
+             the model as an ODE transit() forcing in [odes] directly."
+        ));
     }
     for subject in &population.subjects {
         // Time-varying covariates make the disposition switch mid-absorption, which the
@@ -1206,18 +1208,26 @@ pub(crate) fn check_transit_support(
         // out-of-scope forms that carry no equivalent.
         if subject.has_tv_covariates() && model.transit_ode_equivalent.is_none() {
             return Some(format!(
-                "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
-                 not support within-subject time-varying covariates (subject {}): the transit \
-                 closed form assumes constant parameters over each absorption window, and this \
-                 form is outside the automatic ODE-equivalent rewrite. Write the model as an \
-                 ODE transit() forcing in [odes] directly.",
+                "{name} does not support within-subject time-varying covariates \
+                 (subject {}): the transit closed form assumes constant parameters over each \
+                 absorption window. Use an ODE transit model.",
+                subject.id
+            ));
+        }
+        if subject.has_resets() {
+            return Some(format!(
+                "{name} does not support system resets (EVID=3/4) (subject {}): resets zero \
+                 compartment amounts mid-profile, which the transit superposition closed form \
+                 cannot express (it silently ignores the reset while the sensitivity path washes \
+                 out pre-reset doses, so fit() and predict() would disagree). Use an ODE transit \
+                 model.",
                 subject.id
             ));
         }
         for dose in &subject.doses {
             if dose.ss {
                 return Some(format!(
-                    "one_cpt_transit does not support steady-state (SS) doses yet (subject \
+                    "{name} does not support steady-state (SS) doses yet (subject \
                      {}): the periodic-sum SS closed form is a follow-up. Use a non-SS \
                      multiple-dose schedule, or an ODE transit model.",
                     subject.id
@@ -1225,7 +1235,7 @@ pub(crate) fn check_transit_support(
             }
             if dose.is_infusion() {
                 return Some(format!(
-                    "one_cpt_transit does not support infusion doses (subject {}): the transit \
+                    "{name} does not support infusion doses (subject {}): the transit \
                      closed form absorbs an instantaneous bolus through the transit chain. Use \
                      an ODE transit model for a zero-order input.",
                     subject.id
@@ -1269,14 +1279,14 @@ pub(crate) fn check_analytic_readout_support(
     None
 }
 
-/// Panic on an unsupported `one_cpt_transit` model/data combination, for the
+/// Panic on an unsupported transit model/data combination, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
 pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
     if let Some(msg) = check_transit_support(model, population) {
         panic!(
-            "predict()/simulate() received a model/data combination one_cpt_transit cannot \
-             honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+            "predict()/simulate() received a model/data combination the transit closed form \
+             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
         );
     }
 }
@@ -1821,6 +1831,55 @@ pub fn check_model_data_warnings(
                         ));
                     }
                 }
+            }
+        }
+    }
+
+    // Analytic transit flip-flop diagnostic (#634 review finding 3). The transit
+    // closed forms converge only when the disposition rate is below the transit
+    // rate `KTR = (n+1)/mtt` (for 2-cpt, the *fast* macro-rate `α`; for 1-cpt,
+    // `ke = CL/V`). Outside that domain the closed form returns an identically-zero
+    // profile — which is parameter-dependent, so `check_transit_support` can't
+    // reject it up front, and with a proportional error model an all-zero IPRED
+    // silently degenerates the likelihood with no other diagnostic. The 2-cpt case
+    // hits this readily (a slow-absorption depot drug with large MTT easily has
+    // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
+    // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
+    // Reported once, naming the first affected subject.
+    if matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    ) {
+        for subject in &population.subjects {
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
+            let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
+            if !(mtt > 0.0 && n >= 0.0 && v1 > 0.0 && cl > 0.0) {
+                continue; // invalid params are a separate (fatal) domain check
+            }
+            let ktr = (n + 1.0) / mtt;
+            let disp_rate = match model.pk_model {
+                PkModel::TwoCptTransit => {
+                    crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, pk.q(), pk.v2()).0
+                }
+                _ => cl / v1,
+            };
+            if disp_rate >= ktr {
+                diags.push(Diagnostic::warning(
+                    "W_TRANSIT_FLIP_FLOP",
+                    format!(
+                        "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
+                         typical values (subject {}): the analytic transit closed form is outside \
+                         its convergence domain and returns an identically-zero concentration \
+                         profile, which silently degenerates the objective (a proportional error \
+                         model collapses `(σ·pred)²` to 0). This is the flip-flop regime — check \
+                         the MTT / CL starting estimates, or use an ODE transit model.",
+                        model.pk_model.canonical_name(),
+                        disp_rate,
+                        ktr,
+                        subject.id
+                    ),
+                ));
+                break;
             }
         }
     }

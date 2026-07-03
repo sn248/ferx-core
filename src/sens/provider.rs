@@ -36,7 +36,7 @@ use super::dual2::Dual2;
 use super::num::PkNum;
 use super::one_cpt::{one_cpt_conc_g, one_cpt_transit_conc_g};
 use super::three_cpt::three_cpt_conc_g;
-use super::two_cpt::two_cpt_conc_g;
+use super::two_cpt::{two_cpt_conc_g, two_cpt_transit_conc_g};
 use crate::types::{
     CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F,
     PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2,
@@ -300,6 +300,7 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
             | PkModel::OneCptTransit
             | PkModel::TwoCptIv
             | PkModel::TwoCptOral
+            | PkModel::TwoCptTransit
             | PkModel::ThreeCptIv
             | PkModel::ThreeCptOral
     ) && model.ode_spec.is_none()
@@ -3217,6 +3218,7 @@ fn subject_eta_grad_impl(
     let two_cpt = matches!(model.pk_model, PkModel::TwoCptIv | PkModel::TwoCptOral);
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
     let transit = matches!(model.pk_model, PkModel::OneCptTransit);
+    let two_cpt_transit = matches!(model.pk_model, PkModel::TwoCptTransit);
 
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
 
@@ -3273,8 +3275,8 @@ fn subject_eta_grad_impl(
         ($($n:literal),+) => {
             match slots.len() {
                 $($n => Some(run_obs_grad::<$n>(
-                    &seed_dim, &pk, oral, two_cpt, three_cpt, transit, subject, &dp_deta, n_eta,
-                    readout,
+                    &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, subject,
+                    &dp_deta, n_eta, readout,
                 )),)+
                 _ => None,
             }
@@ -3349,6 +3351,7 @@ fn run_obs_grad<const N: usize>(
     two_cpt: bool,
     three_cpt: bool,
     transit: bool,
+    two_cpt_transit: bool,
     subject: &Subject,
     dp_deta: &[Vec<f64>],
     n_eta: usize,
@@ -3423,6 +3426,8 @@ fn run_obs_grad<const N: usize>(
             };
             let c = if transit {
                 one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
+            } else if two_cpt_transit {
+                two_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, n_d, mtt_d, f_d)
             } else if three_cpt {
                 three_cpt_conc_g(
                     dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
@@ -4299,6 +4304,7 @@ fn subject_sensitivities_impl(
     let two_cpt = matches!(model.pk_model, PkModel::TwoCptIv | PkModel::TwoCptOral);
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
     let transit = matches!(model.pk_model, PkModel::OneCptTransit);
+    let two_cpt_transit = matches!(model.pk_model, PkModel::TwoCptTransit);
 
     // PK parameter values at (θ, η): pk_s = tv_s·exp(sel·η). pk_param_fn folds η.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
@@ -4378,7 +4384,7 @@ fn subject_sensitivities_impl(
             PkModel::ThreeCptIv => Some(ExKind::ThreeCptIv),
             PkModel::ThreeCptOral => Some(ExKind::ThreeCptOral),
             // Transit has no hand-written explicit kernel; use the generic Dual2 path.
-            PkModel::OneCptTransit => None,
+            PkModel::OneCptTransit | PkModel::TwoCptTransit => None,
         }
     };
 
@@ -4396,8 +4402,8 @@ fn subject_sensitivities_impl(
             match slots.len() {
                 $($n => Some(SubjectSens {
                     obs: run_obs::<$n>(
-                        &seed_dim, &pk, oral, two_cpt, three_cpt, transit, explicit_kind, subject,
-                        &pd, n_eta, n_theta, readout,
+                        &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit,
+                        explicit_kind, subject, &pd, n_eta, n_theta, readout,
                     ),
                 }),)+
                 _ => None,
@@ -4564,6 +4570,7 @@ fn run_obs<const N: usize>(
     two_cpt: bool,
     three_cpt: bool,
     transit: bool,
+    two_cpt_transit: bool,
     explicit_kind: Option<ExKind>,
     subject: &Subject,
     pd: &crate::sens::ode_provider::ParamDerivs,
@@ -4667,6 +4674,8 @@ fn run_obs<const N: usize>(
                 };
                 let c = if transit {
                     one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
+                } else if two_cpt_transit {
+                    two_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, n_d, mtt_d, f_d)
                 } else if three_cpt {
                     three_cpt_conc_g(
                         dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,

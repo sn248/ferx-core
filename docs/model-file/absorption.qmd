@@ -155,17 +155,56 @@ optimiser is kept inside this region automatically.
 
 **Scope (first version).** This analytic model supports single and multiple
 **bolus** doses, bioavailability, lag time, and a `central` initial amount.
-**Steady-state doses, IOV, time-varying covariates, infusions, and a `depot`
-initial amount are rejected** with an actionable message — use the `transit()`
-ODE forcing above for those. The two paths agree to ODE-solver
+**Steady-state doses, IOV, time-varying covariates, infusions, system resets
+(EVID=3/4), and a `depot` initial amount are rejected** with an actionable message
+— use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
+
+The closed form converges only when the disposition rate is below the transit rate
+`KTR = (n+1)/mtt`. Outside that domain (the **flip-flop** regime) it returns an
+identically-zero profile; a `W_TRANSIT_FLIP_FLOP` warning is emitted at the
+typical-value estimates so this fails loud rather than silently degenerating the
+objective — check the MTT / CL starting estimates, or use an ODE transit model.
 
 [`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
 is a complete self-contained analytic transit model:
 
 ```bash
 cargo run --release -- examples/one_cpt_transit.ferx --simulate
+```
+
+## Two-compartment analytic transit — `pk two_cpt_transit(cl, v1, q, v2, n, mtt)`
+
+The same closed form extends to a **two-compartment** disposition:
+
+```
+[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)
+```
+
+The 2-cpt central impulse response is the bi-exponential `cα·e^{−α·t} + cβ·e^{−β·t}`
+at the disposition macro-rates `α ≥ β`; convolving each exponential with the Savic
+transit density gives the two-term tilting form
+
+```
+  C(t) = (F·Dose/V1) · [ cα·M(α)·e^{−α·t}·P(N+1,(KTR−α)·t)
+                       + cβ·M(β)·e^{−β·t}·P(N+1,(KTR−β)·t) ]
+```
+
+with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)` (`cα + cβ = 1`). It carries the same
+**exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V1, Q, V2, N, MTT, F, η}`, and
+with `N = 0` reduces exactly to 2-cpt first-order oral absorption with `ka = 1/MTT`.
+The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identical to
+`one_cpt_transit` (bolus doses, bioavailability, lag time; SS / IOV / time-varying
+covariates / infusions / resets / `depot`-init rejected, and the same flip-flop
+`α ≥ KTR` warning — use an ODE transit model for those).
+
+[`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx)
+is a complete self-contained example:
+
+```bash
+cargo run --release -- examples/two_cpt_transit.ferx --simulate
 ```
 
 ## Worked example

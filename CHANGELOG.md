@@ -19,6 +19,15 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
+  the estimation step's wall-clock time and thread count now live under a new
+  `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
+  file, which also covered model parsing and data loading), alongside a new
+  `environment:` section (OS, CPU architecture, whether running in Docker, OS
+  username, ferx version) for troubleshooting and reproducibility. Both are also carried on
+  `FitResult.environment` and round-trip through `.fitrx` bundles.
+
 ### Added
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx

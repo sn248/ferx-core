@@ -307,7 +307,19 @@ impl DoseEvent {
 /// default rather than being aliased by a structural parameter (issue #122).
 /// The headroom here therefore bounds how many structural parameters an ODE
 /// model can declare.
-pub const MAX_PK_PARAMS: usize = 16;
+///
+/// This must be a compile-time constant because the hand-rolled `Dual2`
+/// analytic sensitivities (`src/sens/provider.rs`) build stack arrays
+/// `[Dual2<M>; MAX_PK_PARAMS]` inside the per-observation loop, and Rust
+/// array lengths must be known at compile time (a `Vec` there would mean a
+/// heap allocation per observation on the FOCE/FOCEI hot path). The cost of
+/// a larger ceiling is stack, on two fronts: `PkParams` holds
+/// `MAX_PK_PARAMS * 8` bytes (~1 KB at 128, negligible), but the `Dual2`
+/// arrays scale with both the slot count and the dual width `M` (capped at
+/// `MAX_SCALE_AXES = 16`) — up to ~279 KB per array at the current ceiling,
+/// constructed per observation on rayon worker threads (~2 MB stacks). See
+/// `tests/large_ode_slot_headroom.rs` for the stack-safety smoke tests.
+pub const MAX_PK_PARAMS: usize = 128;
 
 pub const PK_IDX_CL: usize = 0;
 pub const PK_IDX_V: usize = 1;

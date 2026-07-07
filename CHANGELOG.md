@@ -19,6 +19,15 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`[data]` block column mapping** (#730): map a canonical column role to a
+  differently-named dataset header with `canonical = actual` entries (e.g.
+  `TIME = TAFD`, `DV = CONC`), the ferx equivalent of NONMEM's
+  `$INPUT TIME=TAFD`. Header matching is case-insensitive, mapped headers are
+  excluded from covariate auto-detection, and typos (absent header, duplicate
+  role, duplicate target) fail loudly. See
+  [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
+
 ### Changed
 - **Default thread count capped at 8** (#707): when `threads` is unset (or
   `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R

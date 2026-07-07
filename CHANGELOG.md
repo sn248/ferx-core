@@ -69,6 +69,12 @@ section of the SDLC for the versioning policy).
   simulated or predicted with silently wrong dose delivery. The data-independent
   *structural* rules now fire at parse time (so every entry point rejects them), and
   the typical-value *value* checks are enforced on the `predict`/`simulate` paths too.
+- **Adaptive dosing now rejects models/data it cannot faithfully simulate**, instead
+  of silently returning wrong results (#391): a model with inter-occasion variability
+  (`kappa` / IOV) or a stochastic (`[diffusion]` / SDE) term, or a subject with a
+  time-varying covariate or a system reset (EVID=3/4), now raises a typed error rather
+  than being run with kappas held at zero, covariates frozen at their baseline value,
+  process noise dropped, or the reset ignored.
 
 ## [0.2.0] - 2026-07-03
 

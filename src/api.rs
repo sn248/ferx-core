@@ -1398,43 +1398,62 @@ pub(crate) fn check_transit_support(
     None
 }
 
-/// Fit-boundary validation for RTTE (repeated-event) endpoints. The parser enforces
-/// these for `.ferx` models, but a Rust caller can hand-build a `CompiledModel` /
-/// `Population` that bypasses it, so `fit()` re-checks up front — otherwise each of
-/// these would fold into the clock-forward NLL's `1e20` sentinel and produce a silent
-/// garbage fit instead of a clear error. Rejects, per RTTE cmt:
+/// Fit-boundary validation for RTTE (repeated-event) endpoints, both `clock = forward`
+/// (Andersen–Gill total time) and `clock = reset` (gap time). The parser enforces these
+/// for `.ferx` models, but a Rust caller can hand-build a `CompiledModel` / `Population`
+/// that bypasses it, so `fit()` re-checks up front — otherwise each of these would fold
+/// into the RTTE NLL's `1e20` sentinel and produce a silent garbage fit instead of a
+/// clear error. Rejects, per RTTE cmt:
 ///
-///   * **`clock = reset`** — gap-time RTTE is Slice 3.2; the clock-forward NLL folds
-///     `Repeated { Reset }` into `1e20` for every subject (a flat objective the
-///     optimizer "converges" on). Only the parser guards this for `.ferx`.
 ///   * **interval-censored records** — unsupported for RTTE and folded into `1e20` by
-///     [`crate::survival::rtte_forward_nll_from_curves`]. Interval censoring is a *data*
+///     both [`crate::survival::rtte_forward_nll_from_curves`] and
+///     [`crate::survival::rtte_reset_nll_from_curves`]. Interval censoring is a *data*
 ///     property (a DV=0→DV=2 pair), so the parser cannot see it — it must be caught here.
 ///   * **non-finite `TIME`** — a `NaN`/`inf` time slips past the `time < prev` order
 ///     check (every NaN comparison is false) and poisons `prev`, so reject it explicitly.
-///   * **out-of-order rows** — the clock-forward likelihood integrates the cumulative
-///     hazard **once** across a subject's records, using each record's time as the lower
-///     limit for the next; the telescoping sum is only correct when the rows are
-///     time-sorted, so unsorted rows would give a finite-but-wrong NLL.
+///   * **out-of-order rows** — both RTTE clocks require time-sorted rows: clock-forward
+///     telescopes the cumulative hazard across a subject's records (each record's time is
+///     the lower limit for the next), and clock-reset measures each inter-event gap
+///     `Δ = t − t_prev`; unsorted rows give a finite-but-wrong NLL (forward) or a negative
+///     gap that folds to `1e20` (reset).
+///   * **`entry_time > TIME`** — a left-truncation entry after the record's own time gives
+///     a negative first gap (reset) or `H(entry) > H(TIME)` (forward), both folded to the
+///     sentinel. The datareader skips such rows on load; a hand-built caller bypasses that.
+///
+/// And, for **`clock = reset`** endpoints only (clock-forward telescopes absolute `H` and
+/// is unaffected):
+///
+///   * **mid-stream right-censoring** — a censoring does not reset the renewal clock, so a
+///     `RightCensored` row before a later record would measure the next gap from the censor
+///     rather than the last event (and diverge from the gap-time NONMEM anchor). Gap-time
+///     RTTE supports a censor only as the subject's final record; interrupted-observation
+///     renewal is a later slice.
+///   * **tied event times** — two events at the same `TIME` give a zero gap `Δ = 0`, which
+///     the gap-time hazard cannot represent (`h(0)` folds to the sentinel).
+///   * **left truncation (`entry_time > 0`)** — delayed entry is not yet supported for
+///     gap-time RTTE: the first-gap conditioning convention (renewal clock from entry vs.
+///     clock from 0 conditioned on survival to entry) is unratified and unanchored, and the
+///     two differ for a time-varying hazard. Clock-forward supports it via `H(entry)`.
 ///
 /// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
 fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
     use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
     let mut rtte_cmts: Vec<usize> = Vec::new();
+    // Clock-reset endpoints carry an extra data-shape contract (a censor may only be the
+    // final record, gaps must be strictly positive); track them so those checks stay
+    // scoped to reset and don't reject clock-forward data that telescopes fine.
+    let mut reset_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (cmt, ep) in &model.endpoints {
         if let EndpointLikelihood::Tte {
             recurrence: TteRecurrence::Repeated { clock },
             ..
         } = ep
         {
-            if matches!(clock, RtteClock::Reset) {
-                return Some(format!(
-                    "RTTE endpoint CMT={cmt} uses `clock = reset` (gap-time), which is not yet \
-                     supported (Slice 3.2). Use `clock = forward` (Andersen–Gill total time)."
-                ));
-            }
             rtte_cmts.push(*cmt);
+            if matches!(clock, RtteClock::Reset) {
+                reset_cmts.insert(*cmt);
+            }
         }
     }
     if rtte_cmts.is_empty() {
@@ -1443,11 +1462,15 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
     for subject in &population.subjects {
         for &cmt in &rtte_cmts {
             let mut prev = f64::NEG_INFINITY;
+            // Reset only: whether a right-censored row has already been seen for this
+            // subject+cmt — any record after it is a mid-stream censor (rejected below).
+            let mut seen_censor = false;
             for r in &subject.obs_records {
                 let ObsRecord::Event {
                     time,
                     cmt: c,
                     event_type,
+                    entry_time,
                     ..
                 } = r;
                 if *c != cmt {
@@ -1468,6 +1491,20 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                         subject.id
                     ));
                 }
+                // A left-truncation entry after the record's own event/censoring time gives a
+                // negative first gap (Δ = time − entry < 0 under clock-reset) or a decreasing
+                // cumulative-hazard increment (H(entry) > H(time) under clock-forward), both of
+                // which fold to the silent 1e20 sentinel. The datareader skips such rows on
+                // load; a hand-built `Population` bypasses that, so reject it here — the same
+                // up-front guarantee this function gives for interval/non-finite/out-of-order.
+                if *entry_time > *time {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has entry_time={entry_time} after \
+                         TIME={time}. The left-truncation entry must not exceed the record's \
+                         event/censoring time.",
+                        subject.id
+                    ));
+                }
                 if *time < prev {
                     return Some(format!(
                         "Subject '{}': RTTE endpoint CMT={cmt} has records out of time order \
@@ -1475,6 +1512,60 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                          per subject so the cumulative hazard accumulates correctly.",
                         subject.id
                     ));
+                }
+                // Clock-reset (gap-time) data-shape contract. The renewal clock resets only
+                // at EVENTS and each gap is measured from the previous event, so two shapes
+                // that pass every generic check above are still ill-posed under reset and
+                // would silently fold to the 1e20 sentinel or diverge from the gap-time
+                // definition. Reject them for reset endpoints only — clock-forward telescopes
+                // absolute H across a subject's records and is unaffected by either.
+                if reset_cmts.contains(&cmt) {
+                    // A right-censored row before a later record is a mid-stream censor: a
+                    // censoring does NOT reset the renewal clock, so the following gap would
+                    // be measured from the censor instead of the last event (also diverging
+                    // from the NONMEM gap-time anchor, which advances the clock only on
+                    // events). Interrupted-observation renewal is a later slice; fail loud.
+                    if seen_censor {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
+                             right-censored (DV=0) row before a later record. Gap-time RTTE \
+                             supports right-censoring only as the final record per subject; a \
+                             mid-stream censor would restart the renewal clock. Use \
+                             clock=forward for interrupted-observation data.",
+                            subject.id
+                        ));
+                    }
+                    // Two events at the same TIME give a zero inter-event gap (Δ = 0), which
+                    // the gap-time hazard cannot represent — h(0) folds to the sentinel.
+                    if matches!(event_type, EventType::Exact) && *time == prev {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has two events \
+                             at the same TIME={time} (zero inter-event gap). Repeated events \
+                             must have strictly increasing times so each gap Δ > 0.",
+                            subject.id
+                        ));
+                    }
+                    // Left truncation (delayed entry, entry_time > 0) is not yet supported for
+                    // gap-time RTTE. The first gap's convention is unratified — renewal clock
+                    // restarts at entry (`Δ = time − entry`, H from 0) vs. clock from 0
+                    // conditioned on survival to entry (`H(t) − H(entry)`) — and the two differ
+                    // for a time-varying hazard (they coincide only for the memoryless
+                    // exponential). There is no NONMEM/survreg anchor for either, so fail loud
+                    // rather than silently pick one. Clock-forward *does* support left truncation
+                    // (it conditions via `H(entry)`), so route such data there or set TENTRY=0.
+                    if *entry_time > 0.0 {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
+                             left-truncation entry_time={entry_time} > 0. Delayed entry is not \
+                             yet supported for gap-time RTTE (the first-gap conditioning \
+                             convention is unratified). Use clock=forward, which supports left \
+                             truncation, or set the entry time to 0.",
+                            subject.id
+                        ));
+                    }
+                    if matches!(event_type, EventType::RightCensored) {
+                        seen_censor = true;
+                    }
                 }
                 prev = *time;
             }
@@ -2464,10 +2555,10 @@ pub fn fit(
     if let Some(e) = check_analytic_readout_support(model, population) {
         return Err(e);
     }
-    // RTTE (repeated-event) clock-forward likelihood telescopes the cumulative hazard
-    // across a subject's records in time order and does not support clock=reset /
-    // interval-censored / non-finite times, all of which would otherwise fold into a
-    // silent 1e20 sentinel. Reject a hand-built model/dataset up front.
+    // RTTE (repeated-event) likelihoods — clock-forward telescoping and clock-reset
+    // gap-time — require time-sorted records and do not support interval-censored /
+    // non-finite times, all of which would otherwise fold into a silent 1e20 sentinel.
+    // Reject a hand-built model/dataset up front.
     #[cfg(feature = "survival")]
     if let Some(e) = check_rtte_records(model, population) {
         return Err(e);
@@ -7767,10 +7858,13 @@ fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64 {
 /// **RTTE (`type = rtte`) semantics.** This computes single-event quantities from the
 /// hazard curve, so for a repeated-event endpoint `survival`, `median_survival`,
 /// `mean_survival` and `cif` describe **time to the *first* event**, not the recurrent
-/// process. The recurrent quantity — the expected event count `E[N(t)] = H(t)` — is the
-/// `cum_hazard` field (with `hazard` its rate `h(t)`). A recurrence-aware predictor is a
-/// later slice (3.3); until then read `cum_hazard`/`hazard` for RTTE, not the survival
-/// summaries.
+/// process. For `clock = forward` (Andersen–Gill), the recurrent quantity — the expected
+/// event count `E[N(t)] = H(t)` — is the `cum_hazard` field (with `hazard` its rate
+/// `h(t)`). For `clock = reset` (gap-time / renewal), `cum_hazard` is the cumulative
+/// hazard of a single gap evaluated at *absolute* time and is **not** the renewal mean
+/// `E[N(t)]`, so it is not a meaningful recurrent quantity here. A recurrence-aware
+/// predictor is a later slice (3.3); until then read `cum_hazard`/`hazard` only for
+/// clock-forward RTTE, not the survival summaries and not for clock-reset.
 ///
 /// Returns an empty Vec when the model has no TTE endpoints.
 #[cfg(feature = "survival")]

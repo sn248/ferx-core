@@ -117,14 +117,13 @@ pub fn tte_data_term(
                 } => {
                     rtte_forward_nll_from_curves(records, cumhaz_at, hazard_at, MonoTol::analytic())
                 }
-                // Clock-reset (gap-time) RTTE is Slice 3.2. It is rejected up front — by
-                // the parser for `.ferx` models and by `api::check_rtte_records` for a
-                // hand-built `CompiledModel` — so this arm is unreachable via `fit()`. Kept
-                // as an explicit sentinel (not `unreachable!`) so the dispatch stays total
-                // and `tte_data_term` never panics if called directly with `Reset`.
+                // Clock-reset (gap-time / renewal) RTTE: the hazard clock resets at each
+                // event, so each inter-event gap is an independent contribution evaluated
+                // on its own duration (§3.3). For an analytic family this needs no ODE —
+                // the closures are evaluated at the gap `Δ_k`, not absolute time.
                 TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
-                } => 1e20,
+                } => rtte_reset_nll_from_curves(records, cumhaz_at, hazard_at, MonoTol::analytic()),
             }
         }
         // ODE-accumulated hazards are routed through `tte_endpoint_nll` → `tte_ode_nll`
@@ -335,6 +334,82 @@ pub fn rtte_forward_nll_from_curves(
             // parser); this sentinel is defense-in-depth for a direct caller.
             EventType::IntervalCensored { .. } => return 1e20,
         }
+    }
+
+    if nll.is_finite() {
+        nll
+    } else {
+        1e20
+    }
+}
+
+/// Clock-reset (gap-time / renewal) **recurrent-event** (RTTE) negative log-likelihood
+/// from cumulative-hazard / hazard curves:
+///
+/// ```text
+///   −log L = Σ_k [ H(Δ_k) − log h(Δ_k) ]  +  H(Δ_censor)
+/// ```
+///
+/// The hazard clock **resets to 0 at each event**, so each inter-event gap
+/// `Δ_k = t_k − t_{k−1}` (with `t_0` = the subject's `entry_time`) is an independent
+/// single-event contribution evaluated on its own *duration* — `cumhaz_at`/`hazard_at`
+/// are called at `Δ_k`, not at absolute time. This is the renewal-process form (§3.3);
+/// for a time-homogeneous hazard (exponential) it coincides with the clock-forward
+/// likelihood, and differs once the hazard varies with time (Weibull/Gompertz).
+///
+/// Preconditions match [`rtte_forward_nll_from_curves`]: records nondecreasing in `time`
+/// (enforced at data load), `IntervalCensored` unsupported (folds to the `1e20`
+/// sentinel). Returns the sentinel on a non-positive hazard at an event, a non-monotone
+/// cumulative hazard on a gap, or a non-finite total.
+pub fn rtte_reset_nll_from_curves(
+    records: &[ObsRecord],
+    cumhaz_at: impl Fn(f64) -> f64,
+    hazard_at: impl Fn(f64) -> f64,
+    tol: MonoTol,
+) -> f64 {
+    let mut nll = 0.0_f64;
+    // Start of the current gap: the previous record's time, or the subject's entry on
+    // the first record.
+    let mut prev_time: Option<f64> = None;
+
+    for record in records {
+        let ObsRecord::Event {
+            time,
+            event_type,
+            entry_time,
+            ..
+        } = record;
+
+        let gap = time - prev_time.unwrap_or(*entry_time);
+        // A negative gap means out-of-order records (guarded at data load); the H(Δ) with
+        // Δ<0 is meaningless, so fail closed.
+        if gap < 0.0 {
+            return 1e20;
+        }
+
+        match event_type {
+            EventType::RightCensored => {
+                let h_gap = cumhaz_at(gap); // H(Δ) from a reset clock (lower limit 0)
+                if cumhaz_monotone_violation(h_gap, 0.0, tol) {
+                    return 1e20;
+                }
+                nll += h_gap;
+            }
+            EventType::Exact => {
+                let h_val = hazard_at(gap);
+                if h_val <= 0.0 {
+                    return 1e20;
+                }
+                let h_gap = cumhaz_at(gap);
+                if cumhaz_monotone_violation(h_gap, 0.0, tol) {
+                    return 1e20;
+                }
+                nll += h_gap - h_val.ln();
+            }
+            // RTTE + interval censoring is unsupported (rejected at parse); sentinel.
+            EventType::IntervalCensored { .. } => return 1e20,
+        }
+        prev_time = Some(*time);
     }
 
     if nll.is_finite() {
@@ -1457,12 +1532,58 @@ mod tests {
         assert_abs_diff_eq!(via_dispatch, expected, epsilon = 1e-12);
     }
 
+    // ── RTTE clock-reset (gap time): renewal likelihood ──
+
     #[test]
-    fn tte_data_term_clock_reset_returns_sentinel() {
+    fn rtte_reset_equals_forward_for_exponential() {
+        // A constant hazard is memoryless, so clock-reset (gap time) and clock-forward
+        // (total time) must give the SAME likelihood — the sharpest check that the reset
+        // gap bookkeeping is right.
+        let lambda = 0.05_f64;
+        let records = rtte_constant_hazard_records();
+        let cumhaz_at = |t: f64| lambda * t;
+        let hazard_at = |_t: f64| lambda;
+        let reset = rtte_reset_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        let forward =
+            rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        assert_abs_diff_eq!(reset, forward, epsilon = 1e-12);
+        // And both equal the closed form 30λ − 2·log λ.
+        assert_abs_diff_eq!(reset, 30.0 * lambda - 2.0 * lambda.ln(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn rtte_reset_weibull_gap_time_closed_form() {
+        // Weibull scale=10, shape=2: H(t) = (t/10)^2, h(t) = 0.2·(t/10). Events at 5 and
+        // 10, censor at 30. Clock-RESET evaluates each gap from 0: gaps are 5, 5, 20.
+        //   event  (Δ=5):  H(5)  − log h(5)  = 0.25 − log(0.1)
+        //   event  (Δ=5):  H(5)  − log h(5)  = 0.25 − log(0.1)   (clock reset ⇒ same as above)
+        //   censor (Δ=20): H(20)             = 4.0
+        // A time-varying hazard makes this DIFFER from clock-forward (which would use the
+        // absolute event times), so the two must not coincide here.
+        let records = rtte_constant_hazard_records();
+        let cumhaz_at = |t: f64| (t / 10.0).powi(2);
+        let hazard_at = |t: f64| 0.2 * (t / 10.0);
+
+        let reset = rtte_reset_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        let expected_reset = 2.0 * (0.25 - 0.1_f64.ln()) + 4.0;
+        assert_abs_diff_eq!(reset, expected_reset, epsilon = 1e-12);
+
+        let forward =
+            rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        let expected_forward = 9.0 - 0.1_f64.ln() - 0.2_f64.ln(); // H(30) − log h(5) − log h(10)
+        assert_abs_diff_eq!(forward, expected_forward, epsilon = 1e-12);
+        assert!(
+            (reset - forward).abs() > 1.0,
+            "reset ({reset}) and forward ({forward}) must differ for a time-varying hazard"
+        );
+    }
+
+    #[test]
+    fn tte_data_term_dispatches_rtte_reset() {
         use crate::types::{HazardFamily, RtteClock, TteRecurrence};
-        // `clock = reset` is Slice 3.2; `fit()` rejects it at the boundary
-        // (`api::check_rtte_records`), so this dispatch arm is only reachable by a direct
-        // caller. It must return the `1e20` sentinel — never panic — keeping the match total.
+        // Route a repeated-event subject through `tte_data_term` with `Repeated { Reset }`
+        // and an exponential family; must match the reset curve helper (dispatch wired).
+        let lambda = 0.05_f64;
         let records = rtte_constant_hazard_records();
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
@@ -1470,19 +1591,83 @@ mod tests {
             family: HazardFamily::Exponential,
             param_fn,
         };
-        let nll = tte_data_term(
+        let via_dispatch = tte_data_term(
             &records,
             &hazard,
             TteRecurrence::Repeated {
                 clock: RtteClock::Reset,
             },
-            &[0.05],
+            &[lambda],
             &[0.0],
             &HashMap::new(),
         );
+        // Exponential ⇒ reset == forward == 30λ − 2·log λ.
+        assert_abs_diff_eq!(
+            via_dispatch,
+            30.0 * lambda - 2.0 * lambda.ln(),
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn rtte_reset_folds_unsupported_inputs_to_sentinel() {
+        // Every ill-posed input to the gap-time renewal likelihood must fold into the
+        // 1e20 sentinel (a finite-but-poison objective the optimizer steers away from),
+        // never a finite silently-wrong contribution — matching the forward and
+        // single-event paths. This is the reset counterpart to the forward slice's
+        // `rtte_forward_rejects_non_monotone_hazard`, exercising each guard return in
+        // `rtte_reset_nll_from_curves` (Δ<0, h≤0, non-monotone H on either arm, interval).
+        let exact = |t: f64| ObsRecord::Event {
+            time: t,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        let censor = |t: f64| ObsRecord::Event {
+            time: t,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        let tol = MonoTol::analytic();
+        let lin = |t: f64| 0.1 * t; // proper increasing H(Δ)
+        let good_h = |_t: f64| 0.1_f64;
+        // Decreasing after t = 3, so H(Δ) < 0 on a gap of 5 (non-monotone / negative hazard).
+        let dec = |t: f64| if t < 3.0 { t } else { 1.0 - t };
+
+        // Non-positive hazard at an Exact event → sentinel (Exact arm, h ≤ 0).
         assert_eq!(
-            nll, 1e20,
-            "clock=reset dispatch must fold into the sentinel"
+            rtte_reset_nll_from_curves(&[exact(5.0)], lin, |_t| 0.0, tol),
+            1e20
+        );
+        // Non-monotone cumulative hazard on an Exact gap → sentinel (Exact arm).
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[exact(5.0)], dec, good_h, tol),
+            1e20
+        );
+        // Non-monotone cumulative hazard on a censored gap → sentinel (RightCensored arm).
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[censor(5.0)], dec, good_h, tol),
+            1e20
+        );
+        // Out-of-order records → negative gap → sentinel (Δ < 0 guard).
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[exact(10.0), exact(4.0)], lin, good_h, tol),
+            1e20
+        );
+        // Interval-censored record is unsupported for RTTE → sentinel.
+        let interval = ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::IntervalCensored {
+                left: 3.0,
+                right: 5.0,
+            },
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[interval], lin, good_h, tol),
+            1e20
         );
     }
 

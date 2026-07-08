@@ -261,15 +261,21 @@ mod survival_smoke {
         ));
     }
 
-    /// `clock = reset` (gap time) is Slice 3.2 — rejected with an actionable error.
+    /// `clock = reset` (gap time) parses to a clock-reset RTTE endpoint.
     #[test]
-    fn rtte_clock_reset_is_rejected() {
+    fn rtte_clock_reset_parses() {
+        use ferx_core::types::{RtteClock, TteRecurrence};
         let src = RTTE_EXP_MODEL.replace("type   = rtte", "type   = rtte\n  clock  = reset");
-        let err = parse_model_string(&src).expect_err("clock=reset must be rejected");
-        assert!(
-            err.contains("reset") && err.contains("Slice 3.2"),
-            "error should explain clock=reset is deferred, got: {err}"
-        );
+        let model = parse_model_string(&src).expect("clock=reset must parse");
+        assert!(matches!(
+            model.endpoints.get(&2),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset
+                },
+                ..
+            })
+        ));
     }
 
     /// `clock` without `type = rtte` is meaningless and rejected.
@@ -442,12 +448,14 @@ mod survival_smoke {
         );
     }
 
-    /// A hand-built `Repeated { clock = Reset }` model — which the parser rejects for a
-    /// `.ferx` file, but a Rust caller can construct — must be rejected at the fit
-    /// boundary, not silently folded into the clock-forward `1e20` sentinel (which would
-    /// give a flat objective and a garbage "converged" fit).
+    /// A hand-built `Repeated { clock = Reset }` model fits end-to-end through the
+    /// gap-time renewal likelihood (finite OFV). A `.ferx` file reaches this via
+    /// `clock = reset`; a Rust caller can also construct the endpoint directly. This is
+    /// the fit-boundary counterpart to the clock-forward `rtte_fit_completes_*` test and
+    /// exercises the `check_rtte_records` fall-through for reset endpoints. Tier-2:
+    /// capped at 3 outer iterations, no convergence.
     #[test]
-    fn rtte_clock_reset_hand_built_is_rejected() {
+    fn rtte_clock_reset_hand_built_fits() {
         use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
         let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         // Swap the parsed Repeated{Forward} endpoint on CMT 2 for a Repeated{Reset} one.
@@ -466,11 +474,16 @@ mod survival_smoke {
         );
         let pop = rtte_pop();
         let opts = FitOptions::default();
-        let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("clock=reset must be rejected at the fit boundary");
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("clock=reset RTTE fit must not error");
+        // Assert a real objective, not just `is_finite`: a sentinel-poisoned fit sums the
+        // per-subject `1e20` sentinel to ~n·1e20, which is still finite. A genuine
+        // clock-reset OFV on this small population is O(10²–10³), so `< 1e6` cleanly
+        // separates a real fit from one silently folded to the sentinel.
         assert!(
-            err.contains("reset") && err.contains("CMT=2"),
-            "error should flag clock=reset as unsupported, got: {err}"
+            result.ofv.is_finite() && result.ofv < 1e6,
+            "clock-reset RTTE OFV must be a real objective (finite, < 1e6, not sentinel-poisoned); got {}",
+            result.ofv
         );
     }
 
@@ -534,6 +547,197 @@ mod survival_smoke {
         assert!(
             err.contains("non-finite TIME") && err.contains("CMT=2"),
             "error should flag the non-finite time, got: {err}"
+        );
+    }
+
+    /// A record whose left-truncation entry_time is after its own TIME yields a negative
+    /// first gap (clock-reset) / decreasing cumulative hazard (clock-forward), both of which
+    /// fold to the silent 1e20 sentinel. The datareader skips such rows on load; a hand-built
+    /// `Population` bypasses that, so the fit boundary must reject it with a clear error.
+    #[test]
+    fn rtte_entry_time_after_time_is_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        // First record's entry (12.0) is after its event TIME (5.0).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 12.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("entry_time after TIME must be rejected");
+        assert!(
+            err.contains("entry_time") && err.contains("CMT=2"),
+            "error should flag the entry-after-time record, got: {err}"
+        );
+    }
+
+    /// Clock-reset gap-time RTTE supports a right-censored row only as the subject's final
+    /// record: a mid-stream censor would restart the renewal clock (censoring does not reset
+    /// it), so the next gap would be measured from the censor instead of the last event —
+    /// diverging from the gap-time NONMEM anchor. Reachable via ordinary data (the datareader
+    /// flushes a mid-stream DV=0 as a RightCensored before the next event), so it must be
+    /// rejected at the fit boundary rather than silently mis-measured.
+    #[test]
+    fn rtte_reset_mid_stream_censor_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Right-censored row at t=8 sits BEFORE a later event at t=12 (mid-stream censor).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 8.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 12.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("mid-stream censor under clock=reset must be rejected");
+        assert!(
+            err.contains("right-censored") && err.contains("CMT=2"),
+            "error should flag the mid-stream censor, got: {err}"
+        );
+    }
+
+    /// Two clock-reset events at the same TIME give a zero inter-event gap, which the gap-time
+    /// hazard cannot represent (h(0) folds to the sentinel). The order guard uses strict `<`,
+    /// so equal times pass it — the fit boundary must reject the tie rather than silently
+    /// poison the subject's likelihood.
+    #[test]
+    fn rtte_reset_tied_event_times_are_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Two events at the identical TIME=5 (zero inter-event gap).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("tied event times under clock=reset must be rejected");
+        assert!(
+            err.contains("same TIME") && err.contains("CMT=2"),
+            "error should flag the zero-gap tied events, got: {err}"
+        );
+    }
+
+    /// Left truncation (delayed entry, entry_time > 0) is not yet supported for clock-reset
+    /// RTTE: the first-gap conditioning convention (renewal clock from entry vs. clock from 0
+    /// conditioned on survival to entry) is unratified and unanchored, and the two differ for
+    /// a time-varying hazard. Fail loud rather than silently pick one; clock-forward supports
+    /// left truncation and is the documented route for such data.
+    #[test]
+    fn rtte_reset_left_truncation_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Subject enters the risk set at t=4 (delayed entry, entry_time > 0) on both rows.
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 6.0,
+                event_type: EventType::Exact,
+                entry_time: 4.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 4.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("left-truncated clock=reset must be rejected");
+        assert!(
+            err.contains("left-truncation") && err.contains("CMT=2"),
+            "error should flag the delayed entry, got: {err}"
         );
     }
 

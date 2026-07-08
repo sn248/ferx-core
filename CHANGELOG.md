@@ -48,6 +48,17 @@ section of the SDLC for the versioning policy).
   `FitResult.environment` and round-trip through `.fitrx` bundles.
 
 ### Added
+- **Adaptive (feedback) dosing now supports time-varying covariates** (#700): the
+  reactive driver recomputes each subject's PK per event/segment from the covariate
+  active in that segment (the same NONMEM end-of-interval convention `predict()` /
+  `simulate()` use), instead of freezing it at the `t=0` snapshot. A covariate that
+  changes over the horizon — e.g. declining renal function driving clearance under
+  TDM titration — now correctly drives the predictions, the monitored signal, and
+  every dose decision, and the frozen-replay verifier validates the per-event
+  bookkeeping. Models whose PK reads the `TIME` built-in are covered too (previously
+  also silently frozen at `TIME=0`). The `auc_target_attainment` metric is not yet
+  available for time-varying-covariate subjects and is rejected with a typed error
+  rather than reported from a frozen snapshot.
 - **`estimation:` block in `{model}-fit.yaml` now splits wall time by stage** (#713):
   a `{method}_wall_time_secs` entry (e.g. `focei_wall_time_secs`, `imp_wall_time_secs`)
   is reported for each stage of `method`/`methods`, plus a `covariance_wall_time_secs`

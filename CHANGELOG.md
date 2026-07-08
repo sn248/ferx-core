@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
+  bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
+  table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,
+  runtime, subject/observation/parameter counts, and THETA/OMEGA/SIGMA
+  estimates. A single bundle still prints the detailed `psn::sumo`-style report.
 - **Standalone covariance step** (#738): `run_covariance()` runs the FD-Hessian
   covariance step against an existing fit without re-fitting, mirroring
   `run_sir()`. It re-reads the model/data from the fit's recorded paths (with

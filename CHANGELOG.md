@@ -202,6 +202,12 @@ section of the SDLC for the versioning policy).
   from `ferx check` or at fit time. Such an out-of-order reference is now rejected loudly,
   naming the offending variable; reorder the block so each name is declared before it is
   used. This mirrors the existing `[odes]` undefined-reference guard (#314).
+- **`ADDL` on a coded `RATE=-1`/`-2` dose no longer collapses to boluses** (#722):
+  additional doses expanded from a modeled-rate (`RATE=-1`/`R{cmt}`) or
+  modeled-duration (`RATE=-2`/`D{cmt}`) record now stay modeled infusions like
+  the first dose, instead of silently becoming instantaneous boluses. Previously
+  a regimen such as `AMT=100, RATE=-2, D1=2, ADDL=5, II=24` fitted (and predicted/
+  simulated) as one modeled infusion followed by five boluses, with no warning.
 - **`SS=2` steady-state dose records are now rejected instead of silently run as
   `SS=1`** (#729): NONMEM `SS=2` (superimpose the steady state of a regimen on top
   of the compartment's existing amounts, without resetting) was collapsed to the

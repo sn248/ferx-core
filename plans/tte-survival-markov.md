@@ -1310,22 +1310,57 @@ r      = R_OVERDISPERSION
 ```
 
 **CTMM / mCTMM / DTMM:**
+
+Two equivalent spellings. **Option A (recommended, per #759)** — declare states bound to their
+DV integer code and list each allowed transition by label; ferx builds the generator `Q`, fills
+the row-sum-zero diagonal automatically, and (for `type=ctmm`) forms `P(Δt)` via the §8.7 matrix
+exponential (drug-driven `Q(t)` → §3.4 matrix ODE, Phase 6):
+
 ```
 [markov_model]
+type   = ctmm                     ; ctmm | mctmm | dtmm
+cmt    = 5
+states = [awake=0, asleep=1]      ; label = DV integer code (explicit; never positional)
+transition awake  -> asleep = LAMBDA_AS * exp(ETA_AS)   ; intensity q_ij >= 0, any DSL expr
+transition asleep -> awake  = LAMBDA_SA
+init   = [1, 0]                   ; optional starting occupancy (default: observed first state)
+```
+
+- Diagonal `q_ii = −Σ_{j≠i} q_ij` is filled by ferx; the user never writes it.
+- Intensities reuse the individual-parameter grammar (θ, η, covariates, time, PK states), so a
+  time-varying `Q(t)` is free (routes to the Phase 6 matrix-ODE path).
+- Labels are for readability + output tables only; the DV column stays numeric (§8.1). The reader
+  matches DV to the declared code and adds `log P_{that state}(Δt)`. Validate/error on: a DV value
+  with no matching state code, and duplicate codes.
+- `mctmm`: replace the transition list with a single `tau = TAU_EQUIL` (mean equilibration time
+  `1/q`; §3.4). `dtmm`: give transition probabilities directly, e.g.
+  `transition awake -> asleep = logistic(ALPHA_AS + BETA * Cc)` (no generator, no diagonal).
+
+**Option B (matrix spelling)** — for dense/fully-connected chains, name each non-zero rate by
+state index (diagonal still auto-filled). Terser for small `K` but silently order-sensitive for
+sparse chains, so Option A is preferred:
+
+```
+[markov_model]
+type     = ctmm
 cmt      = 5
-type     = ctmm       ; ctmm, mctmm, dtmm
 n_states = 3
-; For ctmm — specify each non-zero rate:
 q12 = LAMBDA12 * exp(ETA_12)
 q21 = LAMBDA21
-q13 = 0
 q23 = LAMBDA23
 q32 = LAMBDA32
-; For mctmm — single parameter:
-; tau = TAU_EQUIL    ; mean equilibration time = 1/q
-; For dtmm — transition probabilities:
-; p12 = logistic(ALPHA12 + BETA * Cc)
+; tau = TAU_EQUIL                        ; mctmm
+; p12 = logistic(ALPHA12 + BETA * Cc)    ; dtmm
 ```
+
+> **Design note (re: #759).** #759 frames CTMM as integrating the occupancy ODE `dP/dt = QᵀP`
+> on the existing `[odes]` engine. ferx does that **only for the time-inhomogeneous** (drug-driven
+> `Q(t)`) case — Phase 6. For the **time-homogeneous** case ferx uses the **matrix exponential**
+> `P(Δt) = expm(QΔt)` with **exact Van Loan (1978) gradients** (§3.4, §8.7), *not* the probability
+> ODE: cleaner and exactly differentiable. Comparator likewise differs — CTMM/mCTMM anchor to R
+> `msm`, not NONMEM (whose EVID=3 CTMM mechanism ferx rejects, §3.4); only DTMM anchors to NONMEM
+> (§7.8). The categorical observation likelihood these consume is Phase 4 (§2, §3.5), tracked
+> separately as the #759 companion issue.
 
 **Custom log-likelihood (escape hatch):**
 ```

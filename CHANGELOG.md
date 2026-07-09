@@ -216,6 +216,14 @@ section of the SDLC for the versioning policy).
   simulated with the wrong (reset) initial conditions and no warning. The data
   reader now accepts only `SS=0`/`SS=1` and rejects `SS=2` (and any other code)
   with a clear message. Full `SS=2` support is tracked in #694.
+- **An *unmapped* per-compartment `F{cmt}`/`ALAG{cmt}` on an analytical `pk` model is now a clear
+  error** (#725): these are ODE-only dose attributes. Naming an analytical individual parameter
+  `F1`/`ALAG1` (or the `LAGTIME1` alias) *without* binding it to the model's single dose route used
+  to drop its value into an unused slot — so effective bioavailability stayed 1 / lag stayed 0 with
+  no effect (a footgun when porting a NONMEM `$PK` that sets `F1`/`ALAG1`). The parser now rejects
+  that silent no-op, pointing at the bare `f=`/`lagtime=` mapping (e.g. `f=F1`) or an `ode(...)`
+  model. A parameter that *is* correctly mapped (`pk(..., f=F1)`) is unaffected — its value was, and
+  remains, applied as bioavailability/lag.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point

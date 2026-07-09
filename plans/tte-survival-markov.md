@@ -3004,6 +3004,10 @@ parallel. The one deliberate structural move: carve **Phase 4.0** (the thin disc
 *plumbing*, above) out of the front of Phase 4 so the Markov track depends on that small slice — not
 on the whole categorical phase.
 
+![TTE/Markov plan track map — the built generalized-NLL trunk feeds five weakly-coupled tracks; Phase 4.0 is the pivot that unlocks Tracks C and D.](assets/tte-track-map.svg)
+
+*(Text version of the same map:)*
+
 ```
 [Generalized-NLL trunk]  — BUILT (Phase 1, §2)
   |

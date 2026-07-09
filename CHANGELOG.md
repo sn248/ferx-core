@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Declare IOV occasions in the model** (#756): a new `iov_occasion` key in
+  `[fit_options]` derives the occasion partition from each subject's timeline
+  instead of requiring a precomputed dataset column. `iov_occasion = dose`
+  starts a new occasion at each administration; `iov_occasion = time(24, 48)`
+  splits by time-window breakpoints. When both `iov_occasion` and `iov_column`
+  are set, the model-side rule wins (with a warning). Both rules bucket
+  observations and doses on the same internal event clock (correct for
+  reset-stacked crossover subjects), co-timed doses share one occasion, a
+  degenerate single-occasion partition errors instead of silently
+  under-identifying kappa, and the derived `OCC` column is written to `sdtab`
+  (#757). A `time(...)` breakpoint list must contain only interior boundaries
+  (the first occasion starts at `-∞`, the last runs to `+∞`); a leading `0`
+  (the `c(0, 24, 48)` habit) is rejected with a message pointing at the correct
+  `time(24, 48)` form. See the
+  [IOV documentation](https://ferx-nlme.github.io/ferx-core/model-file/iov.html).
 - **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
   bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
   table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,

@@ -2167,6 +2167,11 @@ treated as bugs:
 
 ## 12. Implementation Phases
 
+> **Tracks:** the phases below group into five parallel workstreams (A survival · B SAEM ·
+> C categorical · D Markov · E custom-LL) off the shared trunk — see the track map (§19). Track
+> labels are on each phase header, and **Phase 4.0** (the thin discrete-state slice) is the pivot
+> that lets Tracks C and D proceed in parallel.
+
 ### Phase 1 — Parametric TTE, standalone, Laplace
 
 **Scope:** Exponential, Weibull, and Gompertz; fixed and random hazard parameters; FOCEI
@@ -2506,7 +2511,7 @@ from `tests/reference/pktte_joint/expected.md` plus the `$SIM` cross-tool anchor
 - Docs: `docs/estimation/rtte.qmd` with estimation method guidance
 - Tests: Tier 3 SAEM convergence; **Tier 3 SSE** (simulate RTTE → fit → recover)
 
-### Phase 3b — SAEM proposal option (can happen alongside Phase 3)
+### Phase 3b — SAEM proposal option (can happen alongside Phase 3) · Track B
 
 **Scope:** Add `saem_proposal = auto | laplace | random_walk` to `[fit_options]`.
 `auto` is the new default; existing behaviour (`random_walk`) remains available.
@@ -2524,7 +2529,35 @@ not an approximation. Low regression risk: `random_walk` path is unchanged code.
 - Benchmark: convergence iterations (warfarin SAEM + RTTE dataset) for all three modes
 - Docs: `docs/model-file/fit-options.qmd` — `saem_proposal` entry with guidance table
 
-### Phase 4 — Categorical and Count Models
+### Phase 4.0 — Discrete-state observation plumbing (thin shared slice) · shared foundation (unlocks Tracks C + D)
+
+**Tracking:** front slice of #760. **The pivot that lets the categorical track (C) and the Markov
+track (D) proceed in parallel** — see the track map (§19).
+
+Today `types.rs` carries only `ObsRecord::Event`, `EndpointLikelihood::{Gaussian,Tte}`, and
+`SimOutcome::{Continuous,Event}` (the discrete/count variants are commented out, "deferred to
+Phase 4/5"). The Markov phases are nominally blocked on *all* of Phase 4, but they consume only the
+discrete-state *plumbing*, not the ordinal/Poisson/NB *distributions*. Carve that plumbing out as
+its own small slice:
+
+- `ObsRecord::DiscreteState { time, state, cmt }` and `ObsRecord::Count { time, count, cmt }` (the
+  §8.1 variants). The datareader routes integer-DV rows on a declared discrete/count CMT into them
+  (two-pass read: parse the `[..._model]` blocks first, then dispatch each row by its CMT, §8.1). A
+  non-integer DV on such a CMT is a hard error (mirror the TTE rule from #192).
+- `SimOutcome::Category { state }` and `SimOutcome::Count { count }` (added unconditionally, §8.8.1)
+  plus the `Prediction::CatProbs { probs }` output shape.
+- **No likelihood math here** — only the record types, the reader routing, and the output shapes.
+
+**What consumes it.** Track C (binary/ordinal/Poisson/NB data terms, §3.5) and Track D
+(DTMM/mCTMM/CTMM state observations, §3.4). CTMM (4c/5/6) needs *only* this slice plus its own
+matrix-exp NLL — it does **not** need the categorical distributions; only DTMM (4b) additionally
+reuses Track C's categorical-logit primitive.
+
+**Deliverables:** the `types.rs` variants above; `io/datareader.rs` integer-DV state/count routing
++ non-integer guard; a Tier-2 test that a `DiscreteState`-CMT dataset reads into `obs_records`; no
+estimator change (no endpoint math yet). **Files:** `src/types.rs`, `src/io/datareader.rs`.
+
+### Phase 4 — Categorical and Count Models · Track C
 
 **Tracking:** #760 — the categorical / discrete-state observation likelihood (companion of #759; the shared primitive Phases 4b–6 consume).
 
@@ -2554,7 +2587,7 @@ not an approximation. Low regression risk: `random_walk` path is unchanged code.
 **Files:** `src/types.rs`, `src/stats/likelihood.rs`, `src/parser/model_parser.rs`,
 `src/io/datareader.rs`, new `src/categorical/mod.rs`.
 
-### Phase 4b — DTMM
+### Phase 4b — DTMM · Track D
 
 **Tracking:** #759 covers the Markov phases (4b DTMM, 4c mCTMM, 5 & 6 CTMM) — see §8.4 for the
 DSL and the matrix-exp-vs-ODE design note.
@@ -2562,12 +2595,12 @@ DSL and the matrix-exp-vs-ODE design note.
 Direct transition probability parameterization; no matrix exponential; vs. NONMEM
 Bergstrand 2025 supplementary code.
 
-### Phase 4c — mCTMM (minimal CTMM)
+### Phase 4c — mCTMM (minimal CTMM) · Track D
 
 Single-parameter CTMM (`τ = 1/q`, proportional odds steady-state). Stepping stone to
 full CTMM. Validates state-observation data reader and CTMM NLL before matrix expm.
 
-### Phase 5 — Time-homogeneous CTMM
+### Phase 5 — Time-homogeneous CTMM · Track D
 
 **Scope:** Full Q matrix; Padé matrix exponential; Van Loan gradient.
 
@@ -2584,26 +2617,86 @@ full CTMM. Validates state-observation data reader and CTMM NLL before matrix ex
 
 Gate: `#[cfg(feature = "markov")]` initially.
 
-### Phase 6 — Time-inhomogeneous CTMM (drug-driven Q)
+### Phase 6 — Time-inhomogeneous CTMM (drug-driven Q) · Track D
 
 **Scope:** Q(t) = f(C(t)); matrix ODE; joint PK-CTMM.
 
 - `ctmm_inhomogeneous_transition` using existing RK45
 - `q12 = f(Cc)` DSL expression
 
-### Phase 7 — HMM (Hidden Markov Models)
+### Phase 7 — HMM (Hidden Markov Models) · Track D (tail)
 
 **Scope:** Latent (unobserved) state sequence; forward algorithm for marginal likelihood.
 
-**Note:** HMM requires marginalization over hidden states — incompatible with single-EBE
-BFGS. The inner step becomes EM over hidden states (E-step: forward-backward; M-step:
-gradient over θ given expected state occupancies). This is a distinct estimation sub-path.
+**The received view — and why it needs a spike first.** Earlier drafts asserted HMM "requires EM
+over hidden states, incompatible with single-EBE BFGS." That may overstate the cost: the latent
+*discrete* path `z₁..z_T` marginalizes **analytically** via the forward recursion — unlike the
+*continuous* η, which needs Laplace. Two framings, and a spike should pick between them before any
+Phase-7 build:
 
-**Prerequisite:** Phase 5 (CTMM infrastructure) + careful design of inner optimizer dispatch.
+- **Option 1 (least invasive).** Define `individual_nll(η) = −log forward_likelihood(y | η, θ)`,
+  with the forward algorithm (log-sum-exp) marginalizing `z` *inside* the data-term evaluation. The
+  existing inner BFGS-over-η and the FD-Hessian outer path are then **unchanged** — HMM becomes
+  "just another `data_term`," and standard FOCEI/SAEM applies. Hypothesis: this suffices for the
+  marginal likelihood.
+- **Option 2 (full EM).** A separate forward-backward E-step + expected-count M-step. Genuinely
+  needed only for **Viterbi state decoding / diagnostics**, which can be a *post-hoc* pass on the
+  fitted model — not part of estimation.
 
-### Phase 8 — Custom `[ll_model]` escape hatch
+**Prerequisite spike** (throwaway branch, ~1–2 days, mostly zero-dependency):
+1. `forward_loglik(π, P(η,θ), emissions)` with log-sum-exp; Tier-1 unit test vs. brute-force state
+   enumeration on a 2-state, T=4 case (match 1e-10). This is the `hmm_log_likelihood` stubbed in
+   §8.7 → lands in `src/markov/mod.rs`.
+2. Wire it as a `Custom` data term (Phase 8) for one **fixed-effects** (`n_eta = 0`) HMM; confirm
+   the outer optimizer recovers known transition/emission params on simulated data.
+3. **Decision note:** does Option 1 hold (HMM = a data term + a post-hoc Viterbi), or is a distinct
+   inner sub-path genuinely required? If Option 1 holds, HMM downgrades from "High-risk / distinct
+   sub-path" (§17) to "medium / another `data_term`."
 
-User-specified log-likelihood expression; covers distributions not in built-in list.
+**Real prerequisites (why HMM stays tail-end):** Phase 5 (the CTMM `P`-matrix machinery) for the
+transition model + Phase 4.0 (discrete-state plumbing) for the data. The forward *primitive*,
+however, is zero-dependency and can be spiked at any time — its outcome may rewrite the §17 risk line.
+
+### Phase 8 — Custom `[ll_model]` escape hatch · Track E (independent leaf)
+
+User-specified log-likelihood expression; covers distributions not in the built-in list. **Needs
+only the generalized-NLL trunk (§2, built) + ferx's existing expression evaluator — no dependency on
+the categorical or Markov tracks, so it can land any time** (track map, §19).
+
+**Surface:**
+
+```
+[ll_model]
+cmt  = 6
+form = ll            ; ll = log-likelihood (F_FLAG=1) | m2ll = −2·log-likelihood (F_FLAG=2)
+ll   = -lambda + DV*log(lambda) - lgamma(DV + 1)
+```
+
+- **Namespace:** `DV`, `TIME`, every `[individual_parameters]` name, θ/η, covariates, and ODE/PK
+  state outputs — the same evaluator `[error_model]` and the hazard expressions use — plus math
+  builtins (`lgamma`, `log`, `exp`, …).
+- **Scale reconciliation:** the internal data term is on the `−log L` (nll) scale. `form = ll` ⇒
+  `data_term = −Σⱼ ℓⱼ`; `form = m2ll` (NONMEM convention) ⇒ `data_term = ½·Σⱼ value`. Both land on
+  the same internal scale, keeping OFVs comparable within the model.
+
+**Wiring** (small — parser + one dispatch arm; the Laplace path is reused unchanged):
+
+| Layer | Change |
+|---|---|
+| `types.rs` | `EndpointLikelihood::Custom { ll_fn, form }` (the §8.2 variant) |
+| `parser/model_parser.rs` | `parse_ll_model_block` → compile `ll` to a closure over the obs namespace; validate `cmt`, non-empty `ll`, referenced names exist |
+| `io/datareader.rs` | scalar-DV rows on that CMT reuse the existing `Continuous { value }` `ObsRecord` (routing is by declared endpoint, §8.1) — **no new `ObsRecord` variant** |
+| `stats/likelihood.rs` | `Custom` arm → evaluate the closure per record, sum, apply `form` scaling |
+| outer Laplace (§8.6) | **free** — `data_term_hessian_fd` is already generic |
+
+**Scope boundary (v1):** per-observation, *factorizable* likelihoods only (Poisson, beta, t, …).
+Cross-record couplings (RTTE's `Σ log h − H`, HMM's forward recursion) need a subject-level hook and
+are out of scope for v1. **No `simulate()`** by default (an arbitrary `ll` has no generative law) —
+fit/predict only; document the limitation.
+
+**Validation:** Tier-1 — a custom-Poisson `[ll_model]` reproduces the analytic Poisson data term to
+1e-10; Tier-2 — parse + `fit()` in ≤3 iters; once Phase 4 lands, cross-check vs. the built-in
+Poisson. **Files:** the four above + new `docs/model-file/ll-model.qmd`.
 
 ---
 
@@ -2863,6 +2956,9 @@ for TTE/categorical is **default-on**.
 
 ## 18. Milestone Order
 
+*(Linear order; for the parallel-workstream / track view — which tracks build simultaneously — see
+the track map, §19.)*
+
 1. **Phase 1** ✅ — Parametric TTE, Laplace (incl. left truncation / delayed entry)  
    All new infrastructure. Lowest risk. Validates FD Hessian + log-det term. (#190/#192/#206/#441/#442)
 
@@ -2872,8 +2968,8 @@ for TTE/categorical is **default-on**.
 3. **Phase 2** ✅ — Joint PK-TTE, ODE hazard accumulator (Slice 2.1 fit path #564/#567; Slice 2.2 simulation + 2.3 docs #595)  
    Most clinically demanded. Extends Phase 1 via ODE.
 
-4. **Phase 3** — RTTE + **Phase 3b** SAEM proposal option ← **NEXT**  
-   RTTE validates non-Gaussian SAEM. `saem_proposal` option improves all SAEM globally.
+4. **Phase 3** ✅ — RTTE (clock-forward + clock-reset; fit + analytic simulation) — 3.1 #718 / 3.2 #720 / 3.3 sim #761  
+   **Phase 3.4** (RTTE docs polish) + **Phase 3b** (`saem_proposal = auto`, improves all SAEM globally) ← **NEXT**.
 
 5. **Phase 4** — Binary + Ordinal + Poisson + NB  
    Validates generalized NLL for well-understood distributions. Low risk.
@@ -2895,3 +2991,49 @@ for TTE/categorical is **default-on**.
 
 11. **Phase 8** — Custom `[ll_model]` escape hatch  
     Arbitrary user-defined log-likelihood.
+
+---
+
+## 19. Track map — building the phases as independent workstreams
+
+Everything past Phase 1 hangs off **one shared trunk** that is already built (§2): the generalized
+per-subject NLL dispatch (`EndpointLikelihood` routing), the FD-Hessian + `½ log|det|` Laplace
+correction, the `ObsRecord`/`SimOutcome` shapes, and the `n_eta = 0` mode. Because the trunk exists,
+the remaining work fans out into five weakly-coupled **tracks** that can largely be built in
+parallel. The one deliberate structural move: carve **Phase 4.0** (the thin discrete-state
+*plumbing*, above) out of the front of Phase 4 so the Markov track depends on that small slice — not
+on the whole categorical phase.
+
+```
+[Generalized-NLL trunk]  — BUILT (Phase 1, §2)
+  |
+  |-- A. Survival hardening ........ independent (Track A)
+  |-- B. SAEM engine (Phase 3b) .... independent (Track B)
+  |-- E. Custom [ll_model] (Ph 8) .. independent (Track E)
+  |-- matrix-exp module (§8.7) ..... zero-dep, start now
+  |-- Phase 4.0 discrete-state slice   <-- the pivot
+        |
+        |-- C. Categorical & count (Phase 4) ... Track C
+        `-- D. Markov / CTMM (4b/4c/5/6) ....... Track D  (+ matrix-exp; 4b also <- C's logit)
+               |
+               `-- Phase 7 HMM ................. Track D (tail)
+```
+
+| Track | Phases / issues | Depends on | Start today? | Gate |
+|---|---|---|---|---|
+| **Trunk** (built) | §2 dispatch, FD-Hessian + log-det, `SimOutcome` | — | ✅ done | `survival` → default |
+| **A · Survival hardening** | #741, #763, #762, #740, #626, #764, Phase 3.4 docs; Phase 2 deferred (IntervalCensored+ODE, left-trunc+ODE); ferx-r `predict_survival` + e2e + ferx-r#210 | trunk | ✅ yes | `survival` |
+| **B · SAEM engine** | Phase 3b `saem_proposal = auto` | trunk | ✅ yes | none |
+| **E · Custom likelihood** | Phase 8 `[ll_model]` | trunk | ✅ yes | none |
+| **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ yes (thin) | (part of Phase 4) |
+| **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan (§8.7) | none | ✅ yes | `markov` |
+| **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 | after 4.0 | none |
+| **D · Markov / CTMM** | Phases 4b/4c/5/6 / #759 | 4.0 (+ matrix-exp; 4b also on C's logit) | after 4.0 | `markov` |
+| **Phase 7 · HMM** | Phase 7 (Track D tail) | D (Phase 5) + inner-EM spike | tail | `markov` |
+
+**Sequencing.** Start in parallel with zero coordination: **A, B, E, the matrix-exp module, and the
+4.0 slice** — five workstreams, no shared files of consequence. Once 4.0 lands (small), **C and the
+CTMM chain (4c → 5 → 6) proceed in parallel**; only **4b DTMM** waits on C's categorical-logit
+primitive. HMM is last (needs Phase 5), but its forward primitive can be spiked at any time (Phase
+7). This is the parallel-workstream view of the linear §18 milestone order — the two are consistent:
+§18 is the safe serial order, §19 is where the parallelism is.

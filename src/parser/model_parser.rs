@@ -979,6 +979,23 @@ pub fn parse_model_string(content: &str) -> Result<CompiledModel, String> {
     Ok(parsed.model)
 }
 
+/// Register covariate names as required data columns: push each name not
+/// already present, then re-sort. Shared by the `[scaling]`, error-model
+/// selector, and `[initial_conditions]` blocks so all three declare their
+/// covariates identically — the divergence that let an unregistered init
+/// covariate silently evaluate to 0 (issue #765).
+fn register_referenced_covariates(
+    referenced: &mut Vec<String>,
+    covs: impl IntoIterator<Item = String>,
+) {
+    for cov in covs {
+        if !referenced.contains(&cov) {
+            referenced.push(cov);
+        }
+    }
+    referenced.sort();
+}
+
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let mut extracted = extract_blocks(content)?;
@@ -2348,24 +2365,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
 
-        for cov in scaling_covariates {
-            if !model.referenced_covariates.contains(&cov) {
-                model.referenced_covariates.push(cov);
-            }
-        }
-        model.referenced_covariates.sort();
+        register_referenced_covariates(&mut model.referenced_covariates, scaling_covariates);
         model.scaling = scaling;
     }
 
     // Covariate-selected [error_model] (issue #658): the selector's covariates
     // are required data columns, so register them like scaling covariates.
     if !selector_covariates.is_empty() {
-        for cov in &selector_covariates {
-            if !model.referenced_covariates.contains(cov) {
-                model.referenced_covariates.push(cov.clone());
-            }
-        }
-        model.referenced_covariates.sort();
+        register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
     }
 
     // ── [initial_conditions] block (issue #521) ──
@@ -2374,7 +2381,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // init impulses layered onto the dose-driven prediction by
     // `pk::add_analytical_init`.
     if let Some(ic_lines) = blocks.get("initial_conditions") {
-        model.analytical_init = parse_initial_conditions_block(
+        let (analytical_init, init_covariates) = parse_initial_conditions_block(
             ic_lines,
             model.pk_model,
             model.ode_spec.is_some(),
@@ -2384,6 +2391,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.pk_indices,
             &model.kappa_names,
         )?;
+        model.analytical_init = analytical_init;
+        // Register init-expression covariates as required data columns, mirroring
+        // the scaling (`scaling_covariates`) and error-selector blocks above. Without
+        // this, a `[covariates]`-declared model never reads the column, and a miscased
+        // or absent init covariate silently evaluates to 0 (issue #765).
+        register_referenced_covariates(&mut model.referenced_covariates, init_covariates);
     }
 
     // ODE validation: the `NEEDS_FORM_C = usize::MAX` sentinel from
@@ -5784,6 +5797,13 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
 /// Mirrors the Form-B `obs_scale` expression closure in [`build_obs_scale_spec`]:
 /// individual-parameter names resolve from the subject-static `pk_params`, so
 /// `init(central) = CONC0 * V` reads `V` from its PK slot.
+///
+/// The third tuple element is the covariate names the expression references (an
+/// identifier that is not a theta/eta/individual parameter parses as a
+/// `Covariate` leaf). The caller registers these in
+/// `CompiledModel.referenced_covariates` so they become required data columns —
+/// otherwise a miscased or absent init covariate silently evaluates to `0` and
+/// the baseline vanishes with no diagnostic (issue #765).
 #[allow(clippy::type_complexity)]
 fn build_init_amount_fn(
     value: &str,
@@ -5792,7 +5812,7 @@ fn build_init_amount_fn(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     kappa_names: &[String],
-) -> Result<(ScaleFn, Option<ScaleDerivProgram>), String> {
+) -> Result<(ScaleFn, Option<ScaleDerivProgram>, Vec<String>), String> {
     // Build the differentiable `A₀` program from a (possibly resolved) expression
     // AST. Shares the `obs_scale` lowering (`compile_scale_deriv_program`) so the
     // init impulse and the scale divisor differentiate on the same ABI; this lets
@@ -5808,7 +5828,7 @@ fn build_init_amount_fn(
         let deriv = build_deriv(&Expression::Literal(k));
         let scale_fn: ScaleFn =
             Box::new(move |_: &[f64], _: &[f64], _: &HashMap<String, f64>, _: &PkParams| k);
-        return Ok((scale_fn, Some(deriv)));
+        return Ok((scale_fn, Some(deriv), Vec::new()));
     }
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr = parse_scalar_expression(value, ctx)
@@ -5830,6 +5850,13 @@ fn build_init_amount_fn(
         ));
     }
     let deriv = build_deriv(&expr);
+    // Covariate leaves (identifiers not resolved as theta/eta/individual param)
+    // must become required data columns — see the fn doc (issue #765).
+    let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_covariates(&expr, &mut cov_set);
+    // Order is irrelevant: the caller pools these into a HashSet and the final
+    // `register_referenced_covariates` re-sorts, so don't sort here.
+    let covariates_ref: Vec<String> = cov_set.into_iter().collect();
     let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
         .iter()
         .enumerate()
@@ -5851,7 +5878,7 @@ fn build_init_amount_fn(
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
     );
-    Ok((scale_fn, Some(deriv)))
+    Ok((scale_fn, Some(deriv), covariates_ref))
 }
 
 /// Parse the `[initial_conditions]` block (issue #521) into the analytical
@@ -5867,7 +5894,7 @@ fn parse_initial_conditions_block(
     indiv_var_names: &[String],
     pk_indices: &[usize],
     kappa_names: &[String],
-) -> Result<Vec<crate::types::AnalyticalInit>, String> {
+) -> Result<(Vec<crate::types::AnalyticalInit>, Vec<String>), String> {
     if is_ode {
         return Err(
             "[initial_conditions]: this block is for analytical PK models; for an \
@@ -5877,6 +5904,9 @@ fn parse_initial_conditions_block(
     }
     let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut out = Vec::new();
+    // Covariate names referenced across all init expressions; the caller
+    // registers these as required data columns (issue #765).
+    let mut cov_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in lines {
         let (name, expr) = parse_init_line(line).ok_or_else(|| {
             format!(
@@ -5891,7 +5921,7 @@ fn parse_initial_conditions_block(
                 name
             ));
         }
-        let (amount_fn, amount_deriv) = build_init_amount_fn(
+        let (amount_fn, amount_deriv, covariates_ref) = build_init_amount_fn(
             &expr,
             theta_names,
             eta_names,
@@ -5899,13 +5929,16 @@ fn parse_initial_conditions_block(
             pk_indices,
             kappa_names,
         )?;
+        cov_refs.extend(covariates_ref);
         out.push(crate::types::AnalyticalInit {
             cmt,
             amount_fn,
             amount_deriv,
         });
     }
-    Ok(out)
+    // Return unsorted: the caller re-sorts via `register_referenced_covariates`.
+    let init_covariates: Vec<String> = cov_refs.into_iter().collect();
+    Ok((out, init_covariates))
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
@@ -24104,6 +24137,82 @@ if (WT > 70) {
         let cov = HashMap::new();
         let y = out_fn(&state, &pk, &[], &[], &cov);
         assert!((y - 2.0).abs() < 1e-12, "expected 100/50 = 2, got {}", y);
+    }
+
+    /// A covariate referenced only inside an `[initial_conditions]` expression
+    /// must be registered in `referenced_covariates` so it becomes a required
+    /// data column. Without this, a `[covariates]`-declared model never reads
+    /// the column and a miscased/absent init covariate silently evaluates to 0
+    /// (issue #765).
+    #[test]
+    fn test_initial_conditions_covariate_is_registered() {
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[initial_conditions]
+  init(central) = CONC0 * V
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let model = parse_model_string(content).expect("model parses");
+        assert_eq!(model.analytical_init.len(), 1, "init block parsed");
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == "CONC0"),
+            "init covariate CONC0 must be registered, got: {:?}",
+            model.referenced_covariates
+        );
+    }
+
+    /// An `[initial_conditions]` expression built only from parameters (no free
+    /// identifier) registers no covariate — `V` is an individual parameter, not
+    /// a data column, so it must not leak into `referenced_covariates` (#765).
+    #[test]
+    fn test_initial_conditions_param_only_registers_no_covariate() {
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[initial_conditions]
+  init(central) = 0.5 * V
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let model = parse_model_string(content).expect("model parses");
+        assert_eq!(model.analytical_init.len(), 1, "init block parsed");
+        assert!(
+            model.referenced_covariates.is_empty(),
+            "a param-only init must register no covariate, got: {:?}",
+            model.referenced_covariates
+        );
     }
 
     #[test]

@@ -48,6 +48,17 @@ cargo clippy
 
 The binary is called `ferx` and outputs `{model}-fit.yaml` (estimates) and `{model}-sdtab.csv` (per-subject diagnostics).
 
+### Feature flags
+
+The default build is lean; heavier subsystems are behind Cargo features (see `[features]` in `Cargo.toml`):
+
+- `nn` — neural-network covariate models (DCM) and low-dim Neural ODEs (`src/nn/`).
+- `survival` — TTE / survival / categorical (Markov) non-Gaussian endpoints (`src/survival/`). Default-off during Phase 1 development.
+- `slow-tests` — opts the Tier-3 convergence tests into `cargo test` (see below).
+- `ci` — retained as a no-op (the Enzyme autodiff path it once gated was retired in favour of `sens/`).
+
+Build or test a gated subsystem with `cargo build --features nn,survival` etc. Feature-gated code is not compiled in the default coverage build, so it reads as "missed" — that is a measurement gap, not an ignore target (#293).
+
 ## Tests
 
 There are three tiers of tests. Put a new test in the lowest tier whose constraints it fits.
@@ -68,6 +79,8 @@ fn test_my_new_estimator() { ... }
 ```
 
 These run nightly via `slow-tests.yml` and on any push to `main` that touches estimation code. Fast-failing tests (those that call `fit()` but expect an immediate `Err`) do not need gating.
+
+**Running specific tests.** `cargo test --lib NAME` runs unit tests whose name contains `NAME`; `cargo test --test FILE_STEM` runs a single Tier-2/3 file in `tests/` (e.g. `--test warfarin_fit`). Add `--features slow-tests` to include gated convergence tests, and `-- --nocapture` to see `println!` output.
 
 **Every new feature requires a test** at the appropriate tier. When adding a new parser pattern, fit option, estimator, or any public behaviour, add a corresponding test before considering the change done. Bug fixes should add a regression test that fails without the fix.
 
@@ -111,6 +124,21 @@ An alternative estimation method using the BHHH (Berndt-Hall-Hall-Hausman) appro
 
 Set via `[fit_options]` in the model file or `EstimationMethod::FoceGn` / `FoceGnHybrid` in code.
 
+### Other Estimators and Method Chaining
+
+Beyond FOCE/FOCEI and Gauss-Newton, the engine ships several estimators, selected by `method` in `[fit_options]`:
+
+- **SAEM** (`estimation/saem.rs`, `saem_conddist.rs`): Stochastic Approximation EM — MCMC E-step over the conditional distribution of the etas plus an SA M-step. Robust for high-dimensional / poorly-identified omega.
+- **Importance Sampling** (`estimation/importance_sampling.rs`, `impmap.rs`): `method = imp`, an unbiased OFV estimator typically chained *after* another method for final objective-function evaluation.
+- **Bayes / HMC** (`estimation/bayes.rs`, `hmc.rs`): full-Bayesian sampling; consumes the same `sens/` analytic gradients as FOCE.
+- **Uncertainty** (`estimation/run_covariance.rs`, `run_sir.rs`, `sir.rs`, `uncertainty_samples.rs`): the covariance step and Sampling-Importance-Resampling for parameter uncertainty.
+
+**Methods chain.** `method = saem, focei, imp` runs stages sequentially, each warm-starting the next; `FitResult.method_chain` records the sequence. This is why estimator code paths must accept an incoming estimate rather than assume a cold start.
+
+### Simulation and Adaptive (Feedback) Dosing
+
+`api.rs:simulate()` and `src/sim/` implement forward simulation. `src/sim/adaptive.rs` + `adaptive_control.rs` (epic #391) add **feedback dosing**: a controller reads simulated state to choose the next dose (e.g. vancomycin AUC-target TDM). This family is validated against **mrgsolve**, not NONMEM (see the Tests exception note above and `src/ode/predictions.rs::ode_predictions_adaptive*`).
+
 ### Model Pipeline
 
 ```
@@ -135,8 +163,11 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `estimation/parameterization.rs` | Pack/unpack optimizer vector (log-theta, Cholesky-omega, log-sigma) |
 | `stats/likelihood.rs` | Individual, FOCE, and FOCEI negative log-likelihood computations |
 | `stats/residual_error.rs` | Additive, proportional, combined error models; IWRES/CWRES |
-| `sens/` | Hand-rolled `Dual2` analytic sensitivities (`∂f/∂η`, `∂f/∂θ`) over the `PkNum` trait — the exact gradients FOCE/FOCEI/HMC use |
+| `sens/` | Hand-rolled `Dual2` analytic sensitivities (`∂f/∂η`, `∂f/∂θ`) over the `PkNum` trait — the exact gradients FOCE/FOCEI/HMC use; `sens/ode_provider.rs` is the ODE sensitivity path (`solve_ode_g`) |
+| `sim/` | Forward simulation and adaptive/feedback dosing controllers (epic #391) |
+| `survival/`, `nn/`, `frem/` | Specialized endpoints: TTE-Markov (behind `survival`), DCM/Neural-ODE (behind `nn`), and FREM full random-effects covariate modeling (always compiled) |
 | `io/datareader.rs` | NONMEM-format CSV reader (ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS) |
+| `nonmem_anchor/` | NONMEM control streams + matching `.ferx`/CSV pairs used to anchor numerical validation (see `nonmem_anchor/RUN.md`) |
 
 ### Model File Format (.ferx)
 

@@ -60,6 +60,21 @@ const NONFINITE_ERR_SHRINK_FACTOR: f64 = 0.2;
 /// `rhs(u, params, t) -> du/dt`  where u and du are `&[f64]` of length n_states.
 pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 
+/// ODE integration method selector for [`OdeSolverOptions`].
+///
+/// Defaults to [`Rk45`](OdeMethod::Rk45) so existing fits stay byte-for-byte
+/// unchanged. [`Rosenbrock23`](OdeMethod::Rosenbrock23) is the opt-in stiff
+/// integrator (Shampine–Reichelt `ode23s`), selected via
+/// `[fit_options] ode_solver = rosenbrock` — see `plans/stiff-rosenbrock-solver.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OdeMethod {
+    /// Explicit adaptive Dormand–Prince RK45 (the historical default).
+    #[default]
+    Rk45,
+    /// Opt-in L-stable, linearly-implicit Rosenbrock23 for stiff systems.
+    Rosenbrock23,
+}
+
 /// ODE solver options
 #[derive(Debug, Clone, Copy)]
 pub struct OdeSolverOptions {
@@ -68,6 +83,9 @@ pub struct OdeSolverOptions {
     pub max_steps: usize,
     pub initial_dt: f64,
     pub min_dt: f64,
+    /// Integrator to use. Defaults to [`OdeMethod::Rk45`]; the tolerances and
+    /// step-count budget above apply to whichever method is selected.
+    pub method: OdeMethod,
 }
 
 impl Default for OdeSolverOptions {
@@ -78,6 +96,7 @@ impl Default for OdeSolverOptions {
             max_steps: 10000,
             initial_dt: 0.1,
             min_dt: 1e-12,
+            method: OdeMethod::Rk45,
         }
     }
 }
@@ -202,6 +221,14 @@ pub(crate) fn solve_ode_dense(
     opts: &OdeSolverOptions,
     mut stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPoint>, Vec<SolPoint>) {
+    // Method dispatch. The Rk45 arm falls through to the historical body below;
+    // Rosenbrock23 (the opt-in stiff path) lands in issue #1 step 3.
+    match opts.method {
+        OdeMethod::Rk45 => {}
+        OdeMethod::Rosenbrock23 => {
+            todo!("Rosenbrock23 stiff solver: implemented in issue #1 step 3")
+        }
+    }
     let n = u0.len();
     let (t0, tf) = t_span;
 
@@ -671,6 +698,14 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
     opts: &OdeSolverOptions,
     mut stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPointG<T>> {
+    // Method dispatch. The Rk45 arm falls through to the historical body below;
+    // Rosenbrock23 (the opt-in stiff path) lands in issue #1 step 3.
+    match opts.method {
+        OdeMethod::Rk45 => {}
+        OdeMethod::Rosenbrock23 => {
+            todo!("Rosenbrock23 stiff solver: implemented in issue #1 step 3")
+        }
+    }
     let n = u0.len();
     let (t0, tf) = t_span;
     let zero = T::from_f64(0.0);
@@ -852,6 +887,14 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn default_ode_method_is_rk45() {
+        // The stiff Rosenbrock path is strictly opt-in: default options must
+        // select RK45 so every existing fit is byte-for-byte unchanged (issue #1).
+        assert_eq!(OdeSolverOptions::default().method, OdeMethod::Rk45);
+        assert_eq!(OdeMethod::default(), OdeMethod::Rk45);
+    }
 
     #[test]
     fn test_exponential_decay() {
@@ -1354,6 +1397,7 @@ mod tests {
             max_steps: 10_000,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..Default::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_with_stats(
@@ -1391,6 +1435,7 @@ mod tests {
             max_steps: 200,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..Default::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_with_stats(
@@ -1426,6 +1471,7 @@ mod tests {
             max_steps: 200,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..Default::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_g_with_stats(
@@ -1456,6 +1502,7 @@ mod tests {
             max_steps: 10_000,
             abstol: 1e-12,
             reltol: 1e-12,
+            ..Default::default()
         };
         let mut stats = OdeSolverStats::default();
         let result = solve_ode_g_with_stats(
